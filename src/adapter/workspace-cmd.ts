@@ -44,6 +44,10 @@ export interface ReasoningCommand {
   name?: string;
 }
 
+export interface StatusCommand {
+  kind: "status";
+}
+
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^\/(?:workspace|ws)\s+(.+)$/i);
@@ -230,6 +234,14 @@ export function parseReasoningCommand(text: string): ReasoningCommand | null {
   }
 }
 
+export function parseStatusCommand(text: string): StatusCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/status") {
+    return { kind: "status" };
+  }
+  return null;
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ id: string; name: string; cwd: string }>,
   activeId: string | null,
@@ -278,13 +290,62 @@ export function formatSessionList(
   return lines.join("\n");
 }
 
-export function formatSessionStatus(
-  sessionName: string,
-  sessionId: string,
-  workspaceName: string,
-  workspaceId: string,
-): string {
-  return `💬 Current session:\n  ${sessionName} (${sessionId})\n  Workspace: ${workspaceName} (${workspaceId})`;
+export function formatStatus(opts: {
+  session: { title?: string; id: string; cwd: string } | null;
+  workspace: string;
+  agent: string;
+  model: string;
+  reasoning: string;
+  contextUsage: { used: number; size: number } | null;
+}): string {
+  const lines: string[] = ["📊 Status:"];
+
+  // Session
+  if (opts.session) {
+    lines.push(`  💬 Session: ${opts.session.title ?? "(untitled)"}`);
+    lines.push(`     ID: ${opts.session.id}`);
+  } else {
+    lines.push(`  💬 Session: (none)`);
+  }
+
+  // Workspace
+  lines.push(`  📂 Workspace: ${opts.workspace}`);
+
+  // Agent
+  lines.push(`  🤖 Agent: ${opts.agent}`);
+
+  // Model
+  lines.push(`  📱 Model: ${opts.model}`);
+
+  // Reasoning
+  lines.push(`  🧠 Reasoning: ${opts.reasoning}`);
+
+  // Context usage
+  if (opts.contextUsage && opts.contextUsage.size > 0) {
+    const pct = Math.min(Math.round((opts.contextUsage.used / opts.contextUsage.size) * 100), 100);
+    const bar = formatProgressBar(pct);
+    lines.push(`  🔥 Context: ${formatNumber(opts.contextUsage.used)} / ${formatNumber(opts.contextUsage.size)} (${pct}%)`);
+    lines.push(`     ${bar}`);
+  } else if (opts.contextUsage) {
+    // Have totalTokens but no context window size yet
+    lines.push(`  🔥 Total Tokens: ${formatNumber(opts.contextUsage.used)}`);
+  } else {
+    lines.push(`  🔥 Context: (not available)`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatProgressBar(pct: number): string {
+  const total = 20;
+  const filled = Math.round((pct / 100) * total);
+  const empty = total - filled;
+  return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
+}
+
+function formatNumber(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
 }
 
 /**
@@ -334,6 +395,9 @@ export function formatHelp(): string {
     "  /reasoning switch <level>  Switch reasoning level",
     "  /reasoning status        Show current reasoning level",
     "",
+    "── Status ──",
+    "  /status                  Show session, workspace, agent, model, context usage",
+    "",
     "── Help ──",
     "  /help                    Show this help message",
   ].join("\n");
@@ -374,6 +438,9 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "  /reasoning list          List reasoning levels",
     "  /reasoning switch <level>  Switch reasoning level",
     "  /reasoning status        Show current reasoning level",
+    "",
+    "── Status ──",
+    "  /status                  Show session, workspace, agent, model, context usage",
     "",
     "  /help                    Show this help message",
   ];

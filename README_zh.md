@@ -108,6 +108,12 @@ wbo --agent opencode
 | `/reasoning switch <level>` | 切换推理级别 |
 | `/reasoning status` | 显示当前推理级别 |
 
+### 状态（`/status`）
+
+| 命令 | 说明 |
+|------|------|
+| `/status` | 查看当前会话、工作区、Agent、模型、推理级别和上下文使用情况 |
+
 ## 环境要求
 
 - Node.js 20+

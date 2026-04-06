@@ -40,6 +40,10 @@ export interface UserSession {
   lastQueriedModels?: Map<string, acp.ModelInfo[]>;
   /** Track which provider was last queried for index-based switching */
   lastQueriedProvider?: string;
+  /** Cumulative total tokens from all prompt turns */
+  totalTokens?: number;
+  /** Current context window size from usage_update */
+  contextWindowSize?: number;
   queue: PendingMessage[];
   processing: boolean;
   lastActivity: number;
@@ -64,6 +68,8 @@ export interface SessionManagerOpts {
   getExistingSessionId?: (userId: string) => string | undefined;
   /** Called after agent starts with the actual session ID */
   onSessionReady?: (userId: string, sessionId: string) => void;
+  /** Called when usage_update is received from agent */
+  onUsageUpdate?: (userId: string, usage: { size: number; used: number }) => void;
 }
 
 export class SessionManager {
@@ -491,6 +497,19 @@ export class SessionManager {
     return this.sessions.get(userId)?.configOptions;
   }
 
+  /**
+   * Get context window usage for a user.
+   * Returns totalTokens (cumulative across all turns) and context window size.
+   */
+  getContextUsage(userId: string): { totalTokens: number; contextSize: number } | null {
+    const session = this.sessions.get(userId);
+    if (!session) return null;
+    const totalTokens = session.totalTokens;
+    if (!totalTokens && totalTokens !== 0) return null;
+    const contextSize = session.contextWindowSize ?? 0;
+    return { totalTokens, contextSize };
+  }
+
   private async createInitialSession(userId: string, contextToken: string): Promise<UserSession> {
     const cwd = this.opts.resolveCwd(userId);
     const existingSessionId = this.opts.getExistingSessionId?.(userId);
@@ -503,6 +522,10 @@ export class SessionManager {
       sendTyping: () => this.opts.sendTyping(userId, contextToken),
       onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
       onMediaFlush: (blocks) => this.opts.onMediaReply(userId, contextToken, blocks),
+      onUsageUpdate: (usage) => {
+        const session = this.sessions.get(userId);
+        if (session) session.contextWindowSize = usage.size;
+      },
       log: (msg) => this.opts.log(`[${userId}] ${msg}`),
       showThoughts: this.opts.showThoughts,
     });
@@ -573,6 +596,13 @@ export class SessionManager {
             sessionId: session.activeSessionId,
             prompt: pending.prompt,
           });
+
+          // Capture usage from prompt response
+          if (result.usage) {
+            session.totalTokens = result.usage.totalTokens;
+            session.lastActivity = Date.now();
+            this.opts.log(`[${session.userId}] Usage: totalTokens=${result.usage.totalTokens}`);
+          }
 
           let replyText = await session.client.flush();
 

@@ -28,9 +28,11 @@ import {
   parseAgentCommand,
   parseModelCommand,
   parseReasoningCommand,
+  parseStatusCommand,
   parseHelpCommand,
   formatHelp,
   formatHelpWithNativeCommands,
+  formatStatus,
 } from "./adapter/workspace-cmd.js";
 import { listBuiltInAgents, type WeChatOpencodeConfig } from "./config.js";
 import type { ModelInfo } from "@agentclientprotocol/sdk";
@@ -332,6 +334,14 @@ export class WeChatOpencodeBridge {
       if (rCmd) {
         this.handleReasoningCommand(userId, contextToken, rCmd).catch((err) => {
           this.log(`Reasoning command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const stCmd = parseStatusCommand(textContent);
+      if (stCmd) {
+        this.handleStatusCommand(userId, contextToken, stCmd).catch((err) => {
+          this.log(`Status command error: ${String(err)}`);
         });
         return;
       }
@@ -846,6 +856,62 @@ export class WeChatOpencodeBridge {
     }
   }
 
+  // ─── Status command (/status) ───
+
+  private async handleStatusCommand(
+    userId: string,
+    contextToken: string,
+    _cmd: ReturnType<typeof parseStatusCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    const state = this.getUserState(userId);
+    const cwd = state?.cwd ?? this.config.agent.cwd;
+
+    // Session info
+    let sessionInfo: { title?: string; id: string; cwd: string } | null = null;
+    if (state?.sessionId) {
+      const allSessions = listSessions();
+      const current = allSessions.find((s) => s.id === state.sessionId);
+      if (current) {
+        sessionInfo = { title: current.title, id: current.id, cwd: current.directory };
+      } else {
+        sessionInfo = { id: state.sessionId, cwd };
+      }
+    }
+
+    // Agent
+    const currentMode = this.sessionManager.getActiveMode(userId);
+    const agentName = (() => {
+      if (!currentMode) return "(未设置)";
+      const modes = this.sessionManager.getAvailableModes(userId);
+      const matching = modes?.find((m) => m.id === currentMode);
+      return matching?.name ?? currentMode;
+    })();
+
+    // Model
+    const currentModel = this.sessionManager.getCurrentModel(userId) ?? "(未设置)";
+
+    // Reasoning
+    const currentReasoning = this.sessionManager.getCurrentReasoning(userId) ?? "(未设置)";
+
+    // Context usage
+    const contextUsage = this.sessionManager.getContextUsage(userId);
+
+    const statusText = formatStatus({
+      session: sessionInfo,
+      workspace: cwd,
+      agent: agentName,
+      model: currentModel,
+      reasoning: currentReasoning,
+      contextUsage: contextUsage
+        ? { used: contextUsage.totalTokens, size: contextUsage.contextSize }
+        : null,
+    });
+
+    await this.sendReply(userId, contextToken, statusText);
+  }
+
   // ─── Helpers ───
 
   /**
@@ -863,8 +929,8 @@ export class WeChatOpencodeBridge {
 
     const cmdName = match[1].toLowerCase();
 
-    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?
-    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?"];
+    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status
+    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status"];
     if (bridgeCommands.includes(cmdName)) return null;
 
     return `⚠️ 指令 "/${match[1]}" 不是 Bridge 内置指令，已转交 Agent 处理。`;

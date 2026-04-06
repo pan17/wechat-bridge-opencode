@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-06
+
+### Added
+- `/status` — 一键查看当前会话、工作区、Agent、Model、推理级别和上下文使用情况（含进度条）
+- 通过 ACP `usage_update` 和 `PromptResponse.usage` 实时追踪上下文窗口大小和累计总 token 数
+
 ## [0.1.9] - 2026-04-03
 
 ### Added

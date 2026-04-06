@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-opencode` v0.1.9 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-opencode` v0.2.0 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -177,6 +177,11 @@ src/weixin/
 | `/reasoning list` | List available reasoning levels |
 | `/reasoning switch <level>` | Switch reasoning level |
 | `/reasoning status` | Show current reasoning level |
+
+### Status (/status)
+| Command | Description |
+|---------|-------------|
+| `/status` | Show current session, workspace, agent, model, reasoning, context usage |
 
 ### Help
 | Command | Description |

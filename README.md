@@ -107,6 +107,12 @@ First run will:
 | `/reasoning switch <level>` | Switch reasoning level |
 | `/reasoning status` | Show current reasoning level |
 
+### Status (`/status`)
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Show session, workspace, agent, model, reasoning, context usage |
+
 ## Requirements
 
 - Node.js 20+

@@ -27,6 +27,7 @@ export interface WeChatAcpClientOpts {
   onThoughtFlush: (text: string) => Promise<void>;
   onMediaFlush: (blocks: MediaContent[]) => Promise<void>;
   onCommandsUpdate?: (commands: acp.AvailableCommand[]) => void;
+  onUsageUpdate?: (usage: { size: number; used: number }) => void;
   log: (msg: string) => void;
   showThoughts: boolean;
 }
@@ -39,6 +40,8 @@ export class WeChatAcpClient implements acp.Client {
   private lastTypingAt = 0;
   private replaying = false;
   private availableCommands: acp.AvailableCommand[] = [];
+  private currentUsage: acp.UsageUpdate | null = null;
+  private cumulativeUsage: acp.Usage | null = null;
   private static readonly TYPING_INTERVAL_MS = 5_000;
 
   constructor(opts: WeChatAcpClientOpts) {
@@ -208,6 +211,17 @@ export class WeChatAcpClient implements acp.Client {
         this.opts.onCommandsUpdate?.(this.availableCommands);
         break;
       }
+
+      case "usage_update": {
+        const usageUpdate = update as acp.UsageUpdate & { sessionUpdate: "usage_update" };
+        this.currentUsage = usageUpdate;
+        this.opts.log(`[usage_update] context: ${usageUpdate.used}/${usageUpdate.size}`);
+        if (usageUpdate.cost) {
+          this.opts.log(`[usage_update] cost: ${usageUpdate.cost.amount} ${usageUpdate.cost.currency}`);
+        }
+        this.opts.onUsageUpdate?.({ size: usageUpdate.size, used: usageUpdate.used });
+        break;
+      }
     }
   }
 
@@ -248,6 +262,15 @@ export class WeChatAcpClient implements acp.Client {
   /** Get the latest available commands from the agent. */
   getAvailableCommands(): acp.AvailableCommand[] {
     return this.availableCommands;
+  }
+
+  /** Get the latest context window usage. */
+  getUsage(): { contextUsed: number; contextSize: number } | null {
+    if (!this.currentUsage) return null;
+    return {
+      contextUsed: this.currentUsage.used,
+      contextSize: this.currentUsage.size,
+    };
   }
 
   /** Flush media blocks via callback and reset. */
