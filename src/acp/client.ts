@@ -158,7 +158,12 @@ export class WeChatAcpClient implements acp.Client {
         this.hadToolCall = true;
         await this.maybeFlushThoughts();
         if (this.opts.showTools) {
-          this.toolCallText.push(`🔧 ${update.title}`);
+          // Send tool name immediately instead of accumulating to the end
+          try {
+            await this.opts.onThoughtFlush(`🔧 ${update.title}`);
+          } catch {
+            // best effort
+          }
         }
         this.opts.log(`[tool] ${update.title} (${update.status})`);
         await this.maybeSendTyping();
@@ -282,11 +287,7 @@ export class WeChatAcpClient implements acp.Client {
       this.mediaBlocks = [];
     }
 
-    // Flush tool call text
-    const toolText = this.toolCallText.join("\n");
-    this.toolCallText = [];
-
-    return toolText ? `${toolText}\n${text}` : text;
+    return text;
   }
 
   /** Check if there's any buffered content waiting to be flushed. */

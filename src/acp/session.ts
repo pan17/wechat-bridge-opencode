@@ -664,15 +664,15 @@ export class SessionManager {
 
           let replyText = await session.client.flush();
 
-          // Poll for trailing chunks that arrive after end_turn (common with tool calls
-          // or fast model responses). Up to 6 attempts, 500ms apart (3s total max).
+          // Poll for trailing chunks that arrive after end_turn.
+          // Always wait at least once, then continue if more chunks arrive.
           for (let i = 0; i < 6; i++) {
-            if (!session.client.hasTrailingContent()) break;
             await new Promise((r) => setTimeout(r, 500));
             const trailing = await session.client.flush();
             if (trailing.trim()) {
               replyText = replyText ? `${replyText}\n${trailing}` : trailing;
             }
+            if (!session.client.hasTrailingContent()) break;
           }
           session.client.resetToolCallFlag();
 
