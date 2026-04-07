@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-04-08
+
+### Fixed
+- 修复 agent 回复 chunk 延迟到达导致最终回复丢失的问题（轮询机制从单次 500ms 改为 6 次 × 500ms，最长等待 3 秒）
+
 ## [0.2.3] - 2026-04-07
 
 ### Fixed

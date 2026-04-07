@@ -664,11 +664,17 @@ export class SessionManager {
 
           let replyText = await session.client.flush();
 
-          // First prompt after agent spawn: chunks may arrive slightly after end_turn
-          if (!replyText.trim()) {
+          // Poll for trailing chunks that arrive after end_turn (common with tool calls
+          // or fast model responses). Up to 6 attempts, 500ms apart (3s total max).
+          for (let i = 0; i < 6; i++) {
+            if (!session.client.hasTrailingContent()) break;
             await new Promise((r) => setTimeout(r, 500));
-            replyText = await session.client.flush();
+            const trailing = await session.client.flush();
+            if (trailing.trim()) {
+              replyText = replyText ? `${replyText}\n${trailing}` : trailing;
+            }
           }
+          session.client.resetToolCallFlag();
 
           if (result.stopReason === "cancelled") {
             replyText += "\n[cancelled]";

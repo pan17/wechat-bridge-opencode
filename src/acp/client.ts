@@ -45,6 +45,7 @@ export class WeChatAcpClient implements acp.Client {
   private availableCommands: acp.AvailableCommand[] = [];
   private currentUsage: acp.UsageUpdate | null = null;
   private cumulativeUsage: acp.Usage | null = null;
+  private hadToolCall = false;
   private static readonly TYPING_INTERVAL_MS = 5_000;
 
   constructor(opts: WeChatAcpClientOpts) {
@@ -64,6 +65,16 @@ export class WeChatAcpClient implements acp.Client {
    */
   getShowFlags(): { showThoughts: boolean; showTools: boolean } {
     return { showThoughts: this.opts.showThoughts, showTools: this.opts.showTools };
+  }
+
+  /** Check if any tool call was received during this prompt cycle. */
+  hasToolCall(): boolean {
+    return this.hadToolCall;
+  }
+
+  /** Reset tool call flag after a prompt cycle completes. */
+  resetToolCallFlag(): void {
+    this.hadToolCall = false;
   }
 
   updateCallbacks(callbacks: {
@@ -144,6 +155,7 @@ export class WeChatAcpClient implements acp.Client {
         break;
 
       case "tool_call":
+        this.hadToolCall = true;
         await this.maybeFlushThoughts();
         if (this.opts.showTools) {
           this.toolCallText.push(`🔧 ${update.title}`);
@@ -275,6 +287,11 @@ export class WeChatAcpClient implements acp.Client {
     this.toolCallText = [];
 
     return toolText ? `${toolText}\n${text}` : text;
+  }
+
+  /** Check if there's any buffered content waiting to be flushed. */
+  hasTrailingContent(): boolean {
+    return this.chunks.length > 0 || this.thoughtChunks.length > 0 || this.toolCallText.length > 0;
   }
 
   /** Get the latest available commands from the agent. */
