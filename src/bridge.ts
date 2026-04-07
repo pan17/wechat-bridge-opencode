@@ -113,7 +113,11 @@ export class WeChatOpencodeBridge {
       },
       onSessionReady: (userId, sessionId) => {
         const state = this.userStates.get(userId);
-        if (state && state.sessionId !== sessionId) {
+        if (!state) {
+          // New user — create state on first session ready
+          this.setUserState(userId, sessionId, this.config.agent.cwd);
+        } else if (state.sessionId !== sessionId) {
+          // Existing user — only write when sessionId changes
           this.setUserState(userId, sessionId, state.cwd);
         }
       },

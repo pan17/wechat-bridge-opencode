@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-04-07
+
+### Fixed
+- 新用户首次发消息时 `.wechat-bridge-state.json` 未创建，导致 `send-wechat` 工具报错 "No active WeChat session found"
+
 ## [0.2.2] - 2026-04-07
 
 ### Fixed

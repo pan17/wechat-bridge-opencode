@@ -1,150 +1,151 @@
 # WeChat OpenCode
 
-[🇨🇳 中文](README_zh.md) | [🇬🇧 English](README.md)
+[中文](README.md) | [English](README_zh.md)
 
-Bridge WeChat direct messages to OpenCode, with full bidirectional support for text, images, files, audio, and video.
+将微信私聊消息桥接到 OpenCode，支持文本、图片、文件、音视频的双向传输。
 
-<img src="./resources/发送.jpg" alt="Send" width="49%" /> <img src="./resources/接收.jpg" alt="Receive" width="49%" />
+<img src="./resources/发送.jpg" alt="发送" width="49%" /> <img src="./resources/接收.jpg" alt="接收" width="49%" />
 
-## Features
+## 功能
 
-- **Text** — Send/receive messages between WeChat and OpenCode
-- **Images** — Send/receive images with WeChat CDN support
-- **Files** — Send/receive files of any type
-- **Audio/Video** — Full audio and video message support
-- **QR Login** — Terminal QR code rendering for WeChat login
-- **One Session Per User** — Dedicated ACP session for each WeChat user
-- **Daemon Mode** — Run in background with `--daemon`
-- **send-wechat Tool** — Agents can send files/images back to WeChat
+- **文本消息** — 微信与 OpenCode 之间的双向文本传输
+- **图片传输** — 支持发送/接收图片，支持微信 CDN 下载
+- **文件传输** — 支持任意类型文件收发
+- **音视频传输** — 完整的音频和视频消息支持
+- **二维码登录** — 终端渲染二维码，扫码登录微信
+- **独立会话** — 每个微信用户拥有独立 ACP 会话
+- **后台模式** — 使用 `--daemon` 参数后台运行
+- **send-wechat 工具** — Agent 可直接发送文件/图片到微信
 
-## Install
+## 安装
 
-### Method 1: One-click run (Recommended)
-No installation required, `npx` will download and run automatically:
+### 方式一：一键运行（推荐）
+无需安装，`npx` 会自动下载并运行：
 ```bash
 npx wechat-bridge-opencode --agent opencode
 ```
 
-### Method 2: Global install
+### 方式二：全局安装
 ```bash
 npm install -g wechat-bridge-opencode
 ```
-After installation, use the shorthand command:
+安装完成后，可使用简写命令：
 ```bash
 wbo --agent opencode
 ```
 
-## Usage
+## 使用
 ```bash
 cd /path/to/your/project
 wbo --agent opencode
-# or use npx directly:
+# 或直接使用 npx：
 # npx wechat-bridge-opencode --agent opencode
 ```
 
-First run will:
-1. Show QR code in terminal
-2. Save login token to `~/.wechat-bridge-opencode`
-3. Start polling WeChat DMs
+首次运行会：
+1. 终端显示二维码
+2. 扫码登录微信
+3. 保存登录令牌到 `~/.wechat-bridge-opencode`
+4. 开始轮询微信私信
 
-## Options
+## 选项
 
-| Flag | Description |
-|------|-------------|
-| `--agent <preset\|cmd>` | Built-in preset or raw command |
-| `--cwd <dir>` | Working directory |
-| `--login` | Force re-login |
-| `--daemon` | Run in background |
-| `--config <file>` | JSON config file |
-| `--idle-timeout <min>` | Session idle timeout (default: 1440, 0 = unlimited) |
-| `--max-sessions <count>` | Max concurrent sessions (default: 10) |
+| 参数 | 说明 |
+|------|------|
+| `--agent <预设\|命令>` | 内置预设或自定义命令 |
+| `--cwd <目录>` | 工作目录 |
+| `--login` | 强制重新登录 |
+| `--daemon` | 后台运行 |
+| `--config <文件>` | JSON 配置文件 |
+| `--idle-timeout <分钟>` | 会话空闲超时（默认 1440，0 = 无限） |
+| `--max-sessions <数量>` | 最大并发会话数（默认 10） |
 
-## WeChat Commands
+## 微信命令
 
-### Workspace (`/workspace` or `/ws`)
+### 工作区（`/workspace` 或 `/ws`）
 
-| Command | Description |
-|---------|-------------|
-| `/workspace list` | List all directories |
-| `/workspace switch <n\|path>` | Switch by index or path (loads most recent session) |
-| `/workspace add /path [name]` | Add directory |
-| `/workspace status` | Show current directory |
+| 命令 | 说明 |
+|------|------|
+| `/workspace list` | 列出所有目录 |
+| `/workspace switch <n\|路径>` | 按序号或路径切换（自动加载最近会话） |
+| `/workspace add /路径 [名称]` | 添加目录 |
+| `/workspace status` | 显示当前目录 |
 
-### Session (`/session` or `/s`)
+### 会话（`/session` 或 `/s`）
 
-| Command | Description |
-|---------|-------------|
-| `/session list` | List recent 10 sessions |
-| `/session list --cwd` | List sessions in current workspace |
-| `/session list <path\|n>` | List sessions by workspace path or index |
-| `/session switch <n\|slug>` | Switch by index or slug/title |
-| `/session new` | New session (clear context) |
-| `/session status` | Show current session |
+| 命令 | 说明 |
+|------|------|
+| `/session list` | 列出最近 10 个会话 |
+| `/session list --cwd` | 列出当前工作区下的会话 |
+| `/session list <路径\|n>` | 按工作区路径或索引筛选会话 |
+| `/session switch <n\|slug>` | 按序号或 slug/标题切换 |
+| `/session new` | 新会话（清除上下文） |
+| `/session status` | 显示当前会话 |
 
-### Agent (`/agent` or `/a`)
+### Agent（`/agent` 或 `/a`）
 
-| Command | Description |
-|---------|-------------|
-| `/agent list` | List available agent modes with index and current marker |
-| `/agent switch <name\|n>` | Switch mode by name or index |
-| `/agent status` | Show current agent mode |
+| 命令 | 说明 |
+|------|------|
+| `/agent list` | 列出可用 Agent 模式，带序号和当前标记 |
+| `/agent switch <名称\|n>` | 按名称或序号切换 Agent 模式 |
+| `/agent status` | 显示当前 Agent 模式 |
 
-### Model (`/model`)
+### Model（`/model`）
 
-| Command | Description |
-|---------|-------------|
-| `/model list` | List all providers with model counts |
-| `/model list <provider>` | List models for a specific provider (with index) |
-| `/model switch <provider/model\|n>` | Switch model by full name or index (last queried provider) |
-| `/model status` | Show current model |
+| 命令 | 说明 |
+|------|------|
+| `/model list` | 列出所有模型提供商及其模型数量 |
+| `/model list <provider>` | 列出指定提供商下的模型（带序号） |
+| `/model switch <provider/model\|n>` | 按完整模型名或序号切换模型（最后查询的提供商） |
+| `/model status` | 显示当前模型 |
 
-### Reasoning (`/reasoning`)
+### Reasoning（`/reasoning`）
 
-| Command | Description |
-|---------|-------------|
-| `/reasoning list` | List available reasoning levels |
-| `/reasoning switch <level>` | Switch reasoning level |
-| `/reasoning status` | Show current reasoning level |
+| 命令 | 说明 |
+|------|------|
+| `/reasoning list` | 列出可用推理级别 |
+| `/reasoning switch <level>` | 切换推理级别 |
+| `/reasoning status` | 显示当前推理级别 |
 
-### Status (`/status`)
+### 状态（`/status`）
 
-| Command | Description |
-|---------|-------------|
-| `/status` | Show session, workspace, agent, model, reasoning, context usage |
+| 命令 | 说明 |
+|------|------|
+| `/status` | 查看当前会话、工作区、Agent、模型、推理级别和上下文使用情况 |
 
-### Thinking (`/thinking`)
+### 思考（`/thinking`）
 
-| Command | Description |
-|---------|-------------|
-| `/thinking on` | Enable thinking & tool display |
-| `/thinking off` | Disable thinking & tool display |
-| `/thinking status` | Show current thinking & tool display settings |
+| 命令 | 说明 |
+|------|------|
+| `/thinking on` | 开启思考与工具调用显示 |
+| `/thinking off` | 关闭思考与工具调用显示 |
+| `/thinking status` | 查看当前显示设置 |
 
-## Requirements
+## 环境要求
 
 - Node.js 20+
-- WeChat iLink bot API access
-- [OpenCode](https://github.com/anomalyco/opencode) installed locally or via npx
+- 微信 iLink 机器人 API 访问权限
+- [OpenCode](https://github.com/anomalyco/opencode) 本地安装或通过 npx 运行
 
-## Storage
+## 数据存储
 
-Runtime data stored in `~/.wechat-bridge-opencode`:
-- Login token
-- Auth tokens
-- Temp files (downloaded media)
-- Daemon PID / log
-- Bridge state (`.wechat-bridge-state.json`)
+运行时数据存储在 `~/.wechat-bridge-opencode`：
+- 登录令牌
+- 认证令牌
+- 临时文件（下载的媒体）
+- 守护进程 PID / 日志
+- 桥接状态（`.wechat-bridge-state.json`）
 
-## Notes
+## 注意事项
 
-- Direct messages only (group chats ignored)
-- Permission requests are auto-approved
-- `send-wechat` tool auto-installed to `~/.config/opencode/tools/send-wechat.ts`
+- 仅支持私信（群聊会被忽略）
+- 权限请求自动批准
+- `send-wechat` 工具自动安装到 `~/.config/opencode/tools/send-wechat.ts`
 
-## Acknowledgment
+## 致谢
 
-This project is based on [wechat-acp](https://github.com/formulahendry/wechat-acp) by [formulahendry](https://github.com/formulahendry). Thanks for the original work!
+本项目基于 [wechat-acp](https://github.com/formulahendry/wechat-acp)（作者 [formulahendry](https://github.com/formulahendry)）二次开发，感谢原作者的贡献！
 
-## License
+## 许可证
 
 MIT
