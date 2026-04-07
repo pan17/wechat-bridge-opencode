@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-04-07
+
+### Fixed
+- `/session new` 后 `send-wechat` 发送文件失败的问题（state 文件中的 sessionId 过期导致 404）
+- 同一用户被重复创建多个 agent 进程的竞态条件（并发消息到达时的 TOCTOU 问题）
+- `/session new` 不应 resume 旧会话，而是全新开始
+- 刚 spawn 的 agent 被额外创建一个冗余 ACP session
+- 首次对话回复丢失（agent 刚启动时回复 chunks 异步到达时序问题）
+- 首次对话 agent 未完全初始化就发送 prompt 导致 0 tokens 响应
+
 ## [0.2.1] - 2026-04-07
 
 ### Added

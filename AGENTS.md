@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-opencode` v0.2.1 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-opencode` v0.2.2 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)

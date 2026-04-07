@@ -215,13 +215,24 @@ export class WeChatOpencodeBridge {
 
         if (sessionId) {
           const userInfo = this.sessionManager!.getUserBySessionId(sessionId);
-          if (!userInfo) {
+          if (userInfo) {
+            targetUserId = userInfo.userId;
+            contextToken = userInfo.contextToken;
+          } else if (directUserId) {
+            // sessionId may be stale (e.g. user did /session new). Fall back to userId.
+            const session = this.sessionManager!.getSession(directUserId);
+            if (!session) {
+              res.writeHead(404, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "User session not found. Has this user sent a message recently?" }));
+              return;
+            }
+            targetUserId = directUserId;
+            contextToken = session.contextToken;
+          } else {
             res.writeHead(404, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Session not found" }));
             return;
           }
-          targetUserId = userInfo.userId;
-          contextToken = userInfo.contextToken;
         } else if (directUserId) {
           const session = this.sessionManager!.getSession(directUserId);
           if (!session) {

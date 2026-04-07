@@ -75,6 +75,7 @@ export interface SessionManagerOpts {
 
 export class SessionManager {
   private sessions = new Map<string, UserSession>();
+  private pendingSessions = new Map<string, Promise<UserSession>>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private opts: SessionManagerOpts;
   private aborted = false;
@@ -108,8 +109,7 @@ export class SessionManager {
         this.evictOldest();
       }
 
-      session = await this.createInitialSession(userId, message.contextToken);
-      this.sessions.set(userId, session);
+      ({ session } = await this.getOrCreateSession(userId, message.contextToken));
     }
 
     session.contextToken = message.contextToken;
@@ -121,6 +121,36 @@ export class SessionManager {
       this.processQueue(session).catch((err) => {
         this.opts.log(`[${userId}] queue processing error: ${String(err)}`);
       });
+    }
+  }
+
+  /**
+   * Get existing session or create a new one with deduplication.
+   * Returns { session, isNew } so callers know if the agent was just spawned.
+   * All entry points (enqueue, createNewSession, etc.) should use this.
+   */
+  private async getOrCreateSession(userId: string, contextToken: string, skipResume?: boolean): Promise<{ session: UserSession; isNew: boolean }> {
+    // Fast path: already exists
+    const existing = this.sessions.get(userId);
+    if (existing) return { session: existing, isNew: false };
+
+    // Pending lock: wait for in-flight creation
+    const pending = this.pendingSessions.get(userId);
+    if (pending) {
+      const session = await pending;
+      return { session, isNew: false };
+    }
+
+    // Create and track
+    const sessionPromise = this.createInitialSession(userId, contextToken, skipResume);
+    this.pendingSessions.set(userId, sessionPromise);
+
+    try {
+      const session = await sessionPromise;
+      this.sessions.set(userId, session);
+      return { session, isNew: true };
+    } finally {
+      this.pendingSessions.delete(userId);
     }
   }
 
@@ -154,12 +184,7 @@ export class SessionManager {
    * NO kill/respawn of the agent process.
    */
   async switchWorkspace(userId: string, contextToken: string, cwd: string, existingSessionId?: string): Promise<void> {
-    let session = this.sessions.get(userId);
-    if (!session) {
-      // No process yet — create initial session first
-      session = await this.createInitialSession(userId, contextToken);
-      this.sessions.set(userId, session);
-    }
+    const { session } = await this.getOrCreateSession(userId, contextToken);
 
     if (existingSessionId) {
       // Load existing session for this cwd
@@ -200,12 +225,7 @@ export class SessionManager {
    * Switch to an existing ACP session, replaying its conversation history.
    */
   async switchSession(userId: string, contextToken: string, sessionId: string, cwd: string): Promise<void> {
-    let session = this.sessions.get(userId);
-    if (!session) {
-      // No process yet — create initial session first
-      session = await this.createInitialSession(userId, contextToken);
-      this.sessions.set(userId, session);
-    }
+    const { session } = await this.getOrCreateSession(userId, contextToken);
 
     this.opts.log(`[${userId}] Loading session ${sessionId} (cwd: ${cwd})`);
 
@@ -236,11 +256,15 @@ export class SessionManager {
    * Create a new ACP session, returns the new session ID.
    */
   async createNewSession(userId: string, contextToken: string, cwd: string): Promise<string> {
-    let session = this.sessions.get(userId);
-    if (!session) {
-      // No process yet — create initial session first
-      session = await this.createInitialSession(userId, contextToken);
-      this.sessions.set(userId, session);
+    const { session, isNew } = await this.getOrCreateSession(userId, contextToken, true);
+
+    // If agent was just spawned, it already has a fresh initial session — no need to create another
+    if (isNew) {
+      this.opts.log(`[${userId}] Agent freshly spawned, using initial session (cwd: ${cwd})`);
+      session.contextToken = contextToken;
+      session.lastActivity = Date.now();
+      this.opts.onSessionReady?.(userId, session.activeSessionId);
+      return session.activeSessionId;
     }
 
     this.opts.log(`[${userId}] Creating new ACP session (cwd: ${cwd})`);
@@ -255,6 +279,9 @@ export class SessionManager {
     this.applyLoadSessionState(session, result);
     session.contextToken = contextToken;
     session.lastActivity = Date.now();
+
+    // Notify bridge of the new session ID so state file stays in sync
+    this.opts.onSessionReady?.(userId, result.sessionId);
 
     return result.sessionId;
   }
@@ -530,9 +557,9 @@ export class SessionManager {
     return session.client.getShowFlags();
   }
 
-  private async createInitialSession(userId: string, contextToken: string): Promise<UserSession> {
+  private async createInitialSession(userId: string, contextToken: string, skipResume?: boolean): Promise<UserSession> {
     const cwd = this.opts.resolveCwd(userId);
-    const existingSessionId = this.opts.getExistingSessionId?.(userId);
+    const existingSessionId = skipResume ? undefined : this.opts.getExistingSessionId?.(userId);
 
     this.opts.log(
       `Creating initial session for ${userId} (cwd: ${cwd}${existingSessionId ? `, resume: ${existingSessionId}` : ""})`,
@@ -596,10 +623,20 @@ export class SessionManager {
     };
   }
 
+  /** Warm-up delay for freshly spawned agents before first prompt. */
+  private static readonly AGENT_WARMUP_MS = 2000;
+
   private async processQueue(session: UserSession): Promise<void> {
     try {
       while (session.queue.length > 0 && !this.aborted) {
         const pending = session.queue.shift()!;
+
+        // If agent was just spawned, give it a moment to fully initialize
+        if (Date.now() - session.createdAt < SessionManager.AGENT_WARMUP_MS) {
+          const delay = SessionManager.AGENT_WARMUP_MS - (Date.now() - session.createdAt);
+          this.opts.log(`[${session.userId}] Agent freshly spawned, waiting ${delay}ms before first prompt...`);
+          await new Promise((r) => setTimeout(r, delay));
+        }
 
         session.client.updateCallbacks({
           sendTyping: () => this.opts.sendTyping(session.userId, pending.contextToken),
@@ -626,6 +663,12 @@ export class SessionManager {
           }
 
           let replyText = await session.client.flush();
+
+          // First prompt after agent spawn: chunks may arrive slightly after end_turn
+          if (!replyText.trim()) {
+            await new Promise((r) => setTimeout(r, 500));
+            replyText = await session.client.flush();
+          }
 
           if (result.stopReason === "cancelled") {
             replyText += "\n[cancelled]";
