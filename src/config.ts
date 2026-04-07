@@ -44,6 +44,7 @@ export interface WeChatOpencodeConfig {
     cwd: string;
     env?: Record<string, string>;
     showThoughts: boolean;
+    showTools: boolean;
   };
   agents: Record<string, AgentPreset>;
   session: {
@@ -81,7 +82,8 @@ export function defaultConfig(): WeChatOpencodeConfig {
       command: "",
       args: [],
       cwd: process.cwd(),
-      showThoughts: false,
+      showThoughts: true,
+      showTools: true,
     },
     agents: { ...BUILT_IN_AGENTS },
     session: {

@@ -29,6 +29,7 @@ import {
   parseModelCommand,
   parseReasoningCommand,
   parseStatusCommand,
+  parseThinkingCommand,
   parseHelpCommand,
   formatHelp,
   formatHelpWithNativeCommands,
@@ -100,6 +101,7 @@ export class WeChatOpencodeBridge {
       idleTimeoutMs: this.config.session.idleTimeoutMs,
       maxConcurrentUsers: this.config.session.maxConcurrentUsers,
       showThoughts: this.config.agent.showThoughts,
+      showTools: this.config.agent.showTools,
       log: this.log,
       onReply: (userId, contextToken, text) => this.sendReply(userId, contextToken, text),
       onMediaReply: (userId, contextToken, blocks) => this.sendMediaReply(userId, contextToken, blocks),
@@ -342,6 +344,14 @@ export class WeChatOpencodeBridge {
       if (stCmd) {
         this.handleStatusCommand(userId, contextToken, stCmd).catch((err) => {
           this.log(`Status command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const thCmd = parseThinkingCommand(textContent);
+      if (thCmd) {
+        this.handleThinkingCommand(userId, contextToken, thCmd).catch((err) => {
+          this.log(`Thinking command error: ${String(err)}`);
         });
         return;
       }
@@ -912,6 +922,60 @@ export class WeChatOpencodeBridge {
     await this.sendReply(userId, contextToken, statusText);
   }
 
+  // ─── Thinking command (/thinking) ───
+
+  private async handleThinkingCommand(
+    userId: string,
+    contextToken: string,
+    cmd: ReturnType<typeof parseThinkingCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    switch (cmd!.kind) {
+      case "status": {
+        const flags = this.sessionManager.getShowFlags(userId);
+        if (!flags) {
+          await this.sendReply(userId, contextToken, "🧠 Thinking: (no active session)");
+          return;
+        }
+        const thoughtStatus = flags.showThoughts ? "✅ 开启" : "❌ 关闭";
+        const toolStatus = flags.showTools ? "✅ 开启" : "❌ 关闭";
+        await this.sendReply(userId, contextToken, `🧠 思考与工具:\n  💭 思考: ${thoughtStatus}\n  🔧 工具: ${toolStatus}`);
+        break;
+      }
+
+      case "on": {
+        if (cmd!.target === "tools") {
+          this.sessionManager.setShowFlags(userId, { showTools: true });
+          await this.sendReply(userId, contextToken, "✅ 工具调用显示已开启");
+        } else if (cmd!.target === "thoughts") {
+          this.sessionManager.setShowFlags(userId, { showThoughts: true });
+          await this.sendReply(userId, contextToken, "✅ 思考过程显示已开启");
+        } else {
+          // No target specified: enable both
+          this.sessionManager.setShowFlags(userId, { showThoughts: true, showTools: true });
+          await this.sendReply(userId, contextToken, "✅ 思考与工具调用显示已开启");
+        }
+        break;
+      }
+
+      case "off": {
+        if (cmd!.target === "tools") {
+          this.sessionManager.setShowFlags(userId, { showTools: false });
+          await this.sendReply(userId, contextToken, "❌ 工具调用显示已关闭");
+        } else if (cmd!.target === "thoughts") {
+          this.sessionManager.setShowFlags(userId, { showThoughts: false });
+          await this.sendReply(userId, contextToken, "❌ 思考过程显示已关闭");
+        } else {
+          // No target specified: disable both
+          this.sessionManager.setShowFlags(userId, { showThoughts: false, showTools: false });
+          await this.sendReply(userId, contextToken, "❌ 思考与工具调用显示已关闭");
+        }
+        break;
+      }
+    }
+  }
+
   // ─── Helpers ───
 
   /**
@@ -929,8 +993,8 @@ export class WeChatOpencodeBridge {
 
     const cmdName = match[1].toLowerCase();
 
-    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status
-    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status"];
+    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status, thinking
+    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking"];
     if (bridgeCommands.includes(cmdName)) return null;
 
     return `⚠️ 指令 "/${match[1]}" 不是 Bridge 内置指令，已转交 Agent 处理。`;

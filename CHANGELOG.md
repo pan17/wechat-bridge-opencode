@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-07
+
+### Added
+- `/thinking on|off|status` — 运行时切换思考过程和工具调用显示（替代 `--show-thoughts` 参数）
+- 工具调用显示功能（`showTools`），开启后在回复中显示 Agent 使用的工具列表
+
+### Changed
+- 思考过程和工具调用显示默认开启（此前 `--show-thoughts` 默认关闭）
+- 微信命令按功能分类显示（Bridge Commands / Agent Commands）
+
+### Removed
+- `--show-thoughts` CLI 参数（已合并到 `/thinking` 命令）
+- Agent 发送的 diff 内容不再转发到微信
+
 ## [0.2.0] - 2026-04-06
 
 ### Added

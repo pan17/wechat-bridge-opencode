@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-opencode` v0.2.0 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-opencode` v0.2.1 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -182,6 +182,13 @@ src/weixin/
 | Command | Description |
 |---------|-------------|
 | `/status` | Show current session, workspace, agent, model, reasoning, context usage |
+
+### Thinking (/thinking)
+| Command | Description |
+|---------|-------------|
+| `/thinking on` | Enable thinking & tool display |
+| `/thinking off` | Disable thinking & tool display |
+| `/thinking status` | Show current thinking & tool display settings |
 
 ### Help
 | Command | Description |

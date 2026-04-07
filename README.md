@@ -58,7 +58,6 @@ First run will:
 | `--config <file>` | JSON config file |
 | `--idle-timeout <min>` | Session idle timeout (default: 1440, 0 = unlimited) |
 | `--max-sessions <count>` | Max concurrent sessions (default: 10) |
-| `--show-thoughts` | Forward agent thinking to WeChat |
 
 ## WeChat Commands
 
@@ -112,6 +111,14 @@ First run will:
 | Command | Description |
 |---------|-------------|
 | `/status` | Show session, workspace, agent, model, reasoning, context usage |
+
+### Thinking (`/thinking`)
+
+| Command | Description |
+|---------|-------------|
+| `/thinking on` | Enable thinking & tool display |
+| `/thinking off` | Disable thinking & tool display |
+| `/thinking status` | Show current thinking & tool display settings |
 
 ## Requirements
 

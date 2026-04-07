@@ -49,7 +49,6 @@ Options:
   --idle-timeout <m>  Session idle timeout in minutes (default: 1440)
                       Use 0 to disable idle cleanup
   --max-sessions <n>  Max concurrent user sessions (default: 10)
-  --show-thoughts     Forward agent thinking to WeChat (default: off)
   -v, --verbose       Verbose logging
   -h, --help          Show this help
 `);
@@ -64,14 +63,12 @@ function parseArgs(argv: string[]): {
   configFile?: string;
   idleTimeout?: number;
   maxSessions?: number;
-  showThoughts: boolean;
   verbose: boolean;
   help: boolean;
 } {
   const result = {
     forceLogin: false,
     daemon: false,
-    showThoughts: false,
     verbose: false,
     help: false,
   } as ReturnType<typeof parseArgs>;
@@ -108,9 +105,6 @@ function parseArgs(argv: string[]): {
         break;
       case "--max-sessions":
         result.maxSessions = parseInt(args[++i], 10);
-        break;
-      case "--show-thoughts":
-        result.showThoughts = true;
         break;
       case "-v":
       case "--verbose":
@@ -283,7 +277,6 @@ async function main(): Promise<void> {
     config.session.idleTimeoutMs = args.idleTimeout * 60_000;
   }
   if (args.maxSessions) config.session.maxConcurrentUsers = args.maxSessions;
-  if (args.showThoughts) config.agent.showThoughts = true;
   config.daemon.enabled = args.daemon;
 
   // Handle daemon mode

@@ -58,6 +58,7 @@ export interface SessionManagerOpts {
   idleTimeoutMs: number;
   maxConcurrentUsers: number;
   showThoughts: boolean;
+  showTools: boolean;
   log: (msg: string) => void;
   onReply: (userId: string, contextToken: string, text: string) => Promise<void>;
   onMediaReply: (userId: string, contextToken: string, blocks: MediaContent[]) => Promise<void>;
@@ -510,6 +511,25 @@ export class SessionManager {
     return { totalTokens, contextSize };
   }
 
+  /**
+   * Update showThoughts and showTools flags at runtime.
+   */
+  setShowFlags(userId: string, flags: { showThoughts?: boolean; showTools?: boolean }): void {
+    const session = this.sessions.get(userId);
+    if (session) {
+      session.client.setShowFlags(flags);
+    }
+  }
+
+  /**
+   * Get current show flags for a user.
+   */
+  getShowFlags(userId: string): { showThoughts: boolean; showTools: boolean } | null {
+    const session = this.sessions.get(userId);
+    if (!session) return null;
+    return session.client.getShowFlags();
+  }
+
   private async createInitialSession(userId: string, contextToken: string): Promise<UserSession> {
     const cwd = this.opts.resolveCwd(userId);
     const existingSessionId = this.opts.getExistingSessionId?.(userId);
@@ -528,6 +548,7 @@ export class SessionManager {
       },
       log: (msg) => this.opts.log(`[${userId}] ${msg}`),
       showThoughts: this.opts.showThoughts,
+      showTools: this.opts.showTools,
     });
 
     const agentInfo = await spawnAgent({

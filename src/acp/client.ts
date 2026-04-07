@@ -28,13 +28,16 @@ export interface WeChatAcpClientOpts {
   onMediaFlush: (blocks: MediaContent[]) => Promise<void>;
   onCommandsUpdate?: (commands: acp.AvailableCommand[]) => void;
   onUsageUpdate?: (usage: { size: number; used: number }) => void;
+  onToolCall?: (text: string) => Promise<void>;
   log: (msg: string) => void;
   showThoughts: boolean;
+  showTools: boolean;
 }
 
 export class WeChatAcpClient implements acp.Client {
   private chunks: string[] = [];
   private thoughtChunks: string[] = [];
+  private toolCallText: string[] = [];
   private mediaBlocks: MediaContent[] = [];
   private opts: WeChatAcpClientOpts;
   private lastTypingAt = 0;
@@ -48,10 +51,27 @@ export class WeChatAcpClient implements acp.Client {
     this.opts = opts;
   }
 
+  /**
+   * Update runtime flags for showing thoughts and tool calls.
+   */
+  setShowFlags(flags: { showThoughts?: boolean; showTools?: boolean }): void {
+    if (flags.showThoughts !== undefined) this.opts.showThoughts = flags.showThoughts;
+    if (flags.showTools !== undefined) this.opts.showTools = flags.showTools;
+  }
+
+  /**
+   * Get current show flags.
+   */
+  getShowFlags(): { showThoughts: boolean; showTools: boolean } {
+    return { showThoughts: this.opts.showThoughts, showTools: this.opts.showTools };
+  }
+
   updateCallbacks(callbacks: {
     sendTyping: () => Promise<void>;
     onThoughtFlush: (text: string) => Promise<void>;
     onMediaFlush: (blocks: MediaContent[]) => Promise<void>;
+    showThoughts?: boolean;
+    showTools?: boolean;
   }): void {
     this.opts = {
       ...this.opts,
@@ -59,6 +79,8 @@ export class WeChatAcpClient implements acp.Client {
       onThoughtFlush: callbacks.onThoughtFlush,
       onMediaFlush: callbacks.onMediaFlush,
     };
+    if (callbacks.showThoughts !== undefined) this.opts.showThoughts = callbacks.showThoughts;
+    if (callbacks.showTools !== undefined) this.opts.showTools = callbacks.showTools;
   }
 
   setReplaying(value: boolean): void {
@@ -123,6 +145,9 @@ export class WeChatAcpClient implements acp.Client {
 
       case "tool_call":
         await this.maybeFlushThoughts();
+        if (this.opts.showTools) {
+          this.toolCallText.push(`🔧 ${update.title}`);
+        }
         this.opts.log(`[tool] ${update.title} (${update.status})`);
         await this.maybeSendTyping();
         break;
@@ -141,18 +166,7 @@ export class WeChatAcpClient implements acp.Client {
       case "tool_call_update":
         if (update.status === "completed" && update.content) {
           for (const c of update.content) {
-            if (c.type === "diff") {
-              const diff = c as acp.Diff;
-              const header = `--- ${diff.path}`;
-              const lines: string[] = [header];
-              if (diff.oldText != null) {
-                for (const l of diff.oldText.split("\n")) lines.push(`- ${l}`);
-              }
-              if (diff.newText != null) {
-                for (const l of diff.newText.split("\n")) lines.push(`+ ${l}`);
-              }
-              this.chunks.push("\n```diff\n" + lines.join("\n") + "\n```\n");
-            } else if (c.type === "content") {
+            if (c.type === "content") {
               // Tool result content block - could be text, image, or resource
               const content = (c as { content: acp.ContentBlock }).content;
               if (content.type === "image") {
@@ -256,7 +270,11 @@ export class WeChatAcpClient implements acp.Client {
       this.mediaBlocks = [];
     }
 
-    return text;
+    // Flush tool call text
+    const toolText = this.toolCallText.join("\n");
+    this.toolCallText = [];
+
+    return toolText ? `${toolText}\n${text}` : text;
   }
 
   /** Get the latest available commands from the agent. */

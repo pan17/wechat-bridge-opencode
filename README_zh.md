@@ -59,7 +59,6 @@ wbo --agent opencode
 | `--config <文件>` | JSON 配置文件 |
 | `--idle-timeout <分钟>` | 会话空闲超时（默认 1440，0 = 无限） |
 | `--max-sessions <数量>` | 最大并发会话数（默认 10） |
-| `--show-thoughts` | 将 Agent 思考过程转发到微信 |
 
 ## 微信命令
 
@@ -113,6 +112,14 @@ wbo --agent opencode
 | 命令 | 说明 |
 |------|------|
 | `/status` | 查看当前会话、工作区、Agent、模型、推理级别和上下文使用情况 |
+
+### 思考（`/thinking`）
+
+| 命令 | 说明 |
+|------|------|
+| `/thinking on` | 开启思考与工具调用显示 |
+| `/thinking off` | 关闭思考与工具调用显示 |
+| `/thinking status` | 查看当前显示设置 |
 
 ## 环境要求
 

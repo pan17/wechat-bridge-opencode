@@ -48,6 +48,11 @@ export interface StatusCommand {
   kind: "status";
 }
 
+export interface ThinkingCommand {
+  kind: "status" | "on" | "off";
+  target?: "thoughts" | "tools";
+}
+
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^\/(?:workspace|ws)\s+(.+)$/i);
@@ -242,6 +247,29 @@ export function parseStatusCommand(text: string): StatusCommand | null {
   return null;
 }
 
+export function parseThinkingCommand(text: string): ThinkingCommand | null {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^\/thinking\s+(.+)$/i);
+  if (!match) return null;
+
+  const args = match[1].trim().split(/\s+/);
+  const subcommand = args[0]?.toLowerCase();
+
+  switch (subcommand) {
+    case "on":
+    case "enable":
+      return { kind: "on", target: args[1]?.toLowerCase() as "thoughts" | "tools" | undefined };
+    case "off":
+    case "disable":
+      return { kind: "off", target: args[1]?.toLowerCase() as "thoughts" | "tools" | undefined };
+    case "status":
+    case "current":
+      return { kind: "status" };
+    default:
+      return null;
+  }
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ id: string; name: string; cwd: string }>,
   activeId: string | null,
@@ -398,6 +426,11 @@ export function formatHelp(): string {
     "── Status ──",
     "  /status                  Show session, workspace, agent, model, context usage",
     "",
+    "── Thinking ──",
+    "  /thinking on             Enable thinking & tool display",
+    "  /thinking off            Disable thinking & tool display",
+    "  /thinking status         Show current thinking & tool display settings",
+    "",
     "── Help ──",
     "  /help                    Show this help message",
   ].join("\n");
@@ -441,6 +474,11 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "",
     "── Status ──",
     "  /status                  Show session, workspace, agent, model, context usage",
+    "",
+    "── Thinking ──",
+    "  /thinking on             Enable thinking & tool display",
+    "  /thinking off            Disable thinking & tool display",
+    "  /thinking status         Show current thinking & tool display settings",
     "",
     "  /help                    Show this help message",
   ];
