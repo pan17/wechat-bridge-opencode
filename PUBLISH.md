@@ -72,7 +72,7 @@ CHANGELOG.md 是 GitHub Release Notes 的数据源，以下情况**需要更新*
 ```
 
 ### 3. 提交代码并推送 Tag
-
+注意，执行下列步骤前需要发送消息(已完成以上检查和修改)获取用户确认，然后才能执行。
 ```bash
 git add -A
 git commit -m "release: v0.1.7"
@@ -92,15 +92,3 @@ git push origin main --tags
 > **前置条件**：在仓库 Settings → Secrets and variables → Actions 中配置 `NPM` secret，值为 npm 的 Automation Token。
 
 ---
-
-## 完整命令示例
-
-```bash
-# 1. 改 package.json version 为 0.1.7
-
-# 2. 提交并推送（npm 发布和 GitHub Release 会自动完成）
-git add -A
-git commit -m "release: v0.1.7"
-git tag v0.1.7
-git push origin main --tags
-```
