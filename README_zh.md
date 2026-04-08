@@ -57,7 +57,6 @@ First run will:
 | `--daemon` | Run in background |
 | `--config <file>` | JSON config file |
 | `--idle-timeout <min>` | Session idle timeout (default: 1440, 0 = unlimited) |
-| `--max-sessions <count>` | Max concurrent sessions (default: 10) |
 
 ## WeChat Commands
 
@@ -116,7 +115,7 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/thinking on` | Enable thinking & tool display |
+| `/thinking on` | Enable thinking & tool display (temporarily disabled) |
 | `/thinking off` | Disable thinking & tool display |
 | `/thinking status` | Show current thinking & tool display settings |
 

@@ -49,7 +49,6 @@ export interface WeChatOpencodeConfig {
   agents: Record<string, AgentPreset>;
   session: {
     idleTimeoutMs: number;
-    maxConcurrentUsers: number;
   };
   daemon: {
     enabled: boolean;
@@ -82,13 +81,12 @@ export function defaultConfig(): WeChatOpencodeConfig {
       command: "",
       args: [],
       cwd: process.cwd(),
-      showThoughts: true,
-      showTools: true,
+      showThoughts: false,
+      showTools: false,
     },
     agents: { ...BUILT_IN_AGENTS },
     session: {
       idleTimeoutMs: 1440 * 60_000, // 24 hours
-      maxConcurrentUsers: 10,
     },
     daemon: {
       enabled: false,

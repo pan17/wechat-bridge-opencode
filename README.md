@@ -58,7 +58,6 @@ wbo --agent opencode
 | `--daemon` | 后台运行 |
 | `--config <文件>` | JSON 配置文件 |
 | `--idle-timeout <分钟>` | 会话空闲超时（默认 1440，0 = 无限） |
-| `--max-sessions <数量>` | 最大并发会话数（默认 10） |
 
 ## 微信命令
 
@@ -117,7 +116,7 @@ wbo --agent opencode
 
 | 命令 | 说明 |
 |------|------|
-| `/thinking on` | 开启思考与工具调用显示 |
+| `/thinking on` | 开启思考与工具调用显示（暂时禁用） |
 | `/thinking off` | 关闭思考与工具调用显示 |
 | `/thinking status` | 查看当前显示设置 |
 

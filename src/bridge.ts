@@ -99,7 +99,6 @@ export class WeChatOpencodeBridge {
       agentArgs: this.config.agent.args,
       agentEnv: this.config.agent.env,
       idleTimeoutMs: this.config.session.idleTimeoutMs,
-      maxConcurrentUsers: this.config.session.maxConcurrentUsers,
       showThoughts: this.config.agent.showThoughts,
       showTools: this.config.agent.showTools,
       log: this.log,
@@ -960,17 +959,8 @@ export class WeChatOpencodeBridge {
       }
 
       case "on": {
-        if (cmd!.target === "tools") {
-          this.sessionManager.setShowFlags(userId, { showTools: true });
-          await this.sendReply(userId, contextToken, "✅ 工具调用显示已开启");
-        } else if (cmd!.target === "thoughts") {
-          this.sessionManager.setShowFlags(userId, { showThoughts: true });
-          await this.sendReply(userId, contextToken, "✅ 思考过程显示已开启");
-        } else {
-          // No target specified: enable both
-          this.sessionManager.setShowFlags(userId, { showThoughts: true, showTools: true });
-          await this.sendReply(userId, contextToken, "✅ 思考与工具调用显示已开启");
-        }
+        // Feature temporarily disabled in this version
+        await this.sendReply(userId, contextToken, "⏸️ 思考与工具显示功能已暂时关闭，未来版本可能重新启用。");
         break;
       }
 

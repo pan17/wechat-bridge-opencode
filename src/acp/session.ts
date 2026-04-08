@@ -56,7 +56,6 @@ export interface SessionManagerOpts {
   agentArgs: string[];
   agentEnv?: Record<string, string>;
   idleTimeoutMs: number;
-  maxConcurrentUsers: number;
   showThoughts: boolean;
   showTools: boolean;
   log: (msg: string) => void;
@@ -105,10 +104,6 @@ export class SessionManager {
     let session = this.sessions.get(userId);
 
     if (!session) {
-      if (this.sessions.size >= this.opts.maxConcurrentUsers) {
-        this.evictOldest();
-      }
-
       ({ session } = await this.getOrCreateSession(userId, message.contextToken));
     }
 

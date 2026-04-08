@@ -48,7 +48,6 @@ Options:
   --config <file>     Config file path (JSON)
   --idle-timeout <m>  Session idle timeout in minutes (default: 1440)
                       Use 0 to disable idle cleanup
-  --max-sessions <n>  Max concurrent user sessions (default: 10)
   -v, --verbose       Verbose logging
   -h, --help          Show this help
 `);
@@ -62,7 +61,6 @@ function parseArgs(argv: string[]): {
   daemon: boolean;
   configFile?: string;
   idleTimeout?: number;
-  maxSessions?: number;
   verbose: boolean;
   help: boolean;
 } {
@@ -102,9 +100,6 @@ function parseArgs(argv: string[]): {
         break;
       case "--idle-timeout":
         result.idleTimeout = parseInt(args[++i], 10);
-        break;
-      case "--max-sessions":
-        result.maxSessions = parseInt(args[++i], 10);
         break;
       case "-v":
       case "--verbose":
@@ -276,7 +271,6 @@ async function main(): Promise<void> {
     }
     config.session.idleTimeoutMs = args.idleTimeout * 60_000;
   }
-  if (args.maxSessions) config.session.maxConcurrentUsers = args.maxSessions;
   config.daemon.enabled = args.daemon;
 
   // Handle daemon mode

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-04-08
+
+### Removed
+- `--max-sessions` CLI 参数（会话并发数限制功能移除）
+
+### Changed
+- 思考与工具显示功能默认关闭（`showThoughts` / `showTools` 默认为 `false`）
+- `/thinking on` 命令暂时禁用，回复"功能已暂时关闭，未来版本可能重新启用"
+- `/help` 命令说明全部中文化
+
 ## [0.2.5] - 2026-04-08
 
 ### Fixed
