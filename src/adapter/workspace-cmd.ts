@@ -57,6 +57,18 @@ export interface StopCommand {
   kind: "stop";
 }
 
+export interface VersionCommand {
+  kind: "version";
+}
+
+export interface UpgradeCommand {
+  kind: "upgrade";
+}
+
+export interface RestartCommand {
+  kind: "restart";
+}
+
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^\/(?:workspace|ws)\s+(.+)$/i);
@@ -282,6 +294,30 @@ export function parseStopCommand(text: string): StopCommand | null {
   return null;
 }
 
+export function parseVersionCommand(text: string): VersionCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/version") {
+    return { kind: "version" };
+  }
+  return null;
+}
+
+export function parseUpgradeCommand(text: string): UpgradeCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/upgrade") {
+    return { kind: "upgrade" };
+  }
+  return null;
+}
+
+export function parseRestartCommand(text: string): RestartCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/restart") {
+    return { kind: "restart" };
+  }
+  return null;
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ id: string; name: string; cwd: string }>,
   activeId: string | null,
@@ -421,7 +457,6 @@ export function formatHelp(): string {
     "  /session status          显示当前会话",
     "  （简写: /s ...）",
     "",
-    "── Agent / Model / Reasoning ──",
     "  /agent list              列出可用的 Agent 模式（Build、Plan 等）",
     "  /agent switch <id>       切换 Agent 模式",
     "  /agent status            显示当前 Agent 模式",
@@ -440,13 +475,17 @@ export function formatHelp(): string {
     "",
     "── 停止 ──",
     "  /stop                    停止正在运行的 Agent（相当于按 ESC）",
+    "  /restart                 重启 Agent（保留当前状态）",
+    "  /upgrade                 更新 OpenCode 后重启",
+    "",
+    "── 版本 ──",
+    "  /version                 查看当前版本和最新版本",
     "",
     "── 思考 ──",
     "  /thinking on             开启思考与工具显示（暂时禁用）",
     "  /thinking off            关闭思考与工具显示",
     "  /thinking status         查看当前思考与工具显示设置",
     "",
-    "── 帮助 ──",
     "  /help                    显示本帮助信息",
   ].join("\n");
 }
@@ -492,22 +531,19 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "",
     "── 停止 ──",
     "  /stop                    停止正在运行的 Agent（相当于按 ESC）",
+    "  /restart                 重启 Agent（保留当前状态）",
+    "  /upgrade                 更新 OpenCode 后重启",
+    "",
+    "── 版本 ──",
+    "  /version                 查看当前版本和最新版本",
     "",
     "── 思考 ──",
     "  /thinking on             开启思考与工具显示（暂时禁用）",
     "  /thinking off            关闭思考与工具显示",
     "  /thinking status         查看当前思考与工具显示设置",
     "",
+    "── 帮助 ──",
     "  /help                    显示本帮助信息",
   ];
-
-  if (nativeCommands.length > 0) {
-    lines.push("");
-    lines.push("── OpenCode Agent 命令 ──");
-    for (const cmd of nativeCommands) {
-      lines.push(`  /${cmd.name}`);
-    }
-  }
-
   return lines.join("\n");
 }

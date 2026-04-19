@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-04-19
+
+### Added
+- `/version` — 查看 OpenCode 当前版本和最新版本
+- `/restart` — 重启 Agent 进程（保留当前 mode/model/reasoning 状态）
+- `/upgrade` — 更新 OpenCode 后自动重启 Agent
+
+### Fixed
+- 修复 `/version` 命令在 Windows 上的版本检测问题
+
 ## [0.2.7] - 2026-04-19
 
 ### Added

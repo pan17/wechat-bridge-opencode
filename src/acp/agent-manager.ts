@@ -2,7 +2,7 @@
  * Spawn and manage ACP agent subprocesses.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, exec, type ChildProcess } from "node:child_process";
 import { Writable, Readable } from "node:stream";
 import path from "node:path";
 import os from "node:os";
@@ -237,3 +237,117 @@ export function killAgent(proc: ChildProcess): void {
     }, 5_000).unref();
   }
 }
+
+/**
+ * Get the currently installed OpenCode version by running `opencode -v`.
+ */
+export async function getInstalledVersion(_command: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const cmd = "opencode -v";
+    exec(cmd, { timeout: 10000 }, (err: Error | null, stdout: string, stderr: string) => {
+      if (err) {
+        resolve(null);
+        return;
+      }
+      const output = (stdout + stderr).trim();
+      // Match version like "1.14.18"
+      const match = output.match(/^(\d+\.\d+\.\d+[^\s]*)$/);
+      resolve(match ? match[1] : null);
+    });
+  });
+}
+
+/**
+ * Get the latest available OpenCode version from npm registry.
+ */
+export async function getLatestVersion(_command: string): Promise<{ installed: string | null; latest: string | null }> {
+  return new Promise((resolve) => {
+    // Query npm registry for the latest opencode-ai version
+    const isWindows = process.platform === "win32";
+    const proc = isWindows
+      ? spawn("cmd.exe", ["/c", "npm.cmd", "view", "opencode-ai", "version", "--json"], { stdio: ["pipe", "pipe", "pipe"] })
+      : spawn("npm", ["view", "opencode-ai", "version", "--json"], { shell: true, stdio: ["pipe", "pipe", "pipe"] });
+
+    let output = "";
+    proc.stdout?.on("data", (chunk) => { output += chunk.toString(); });
+    proc.stderr?.on("data", (chunk) => { output += chunk.toString(); });
+
+    proc.on("close", () => {
+      try {
+        // npm view --json returns quoted string like "\"1.14.18\""
+        const parsed = JSON.parse(output.trim());
+        let latest = typeof parsed === "string" ? parsed : null;
+        if (latest) latest = latest.replace(/"/g, "").trim();
+        resolve({ installed: null, latest });
+      } catch {
+        // Fallback: try to find version in raw output and strip quotes
+        const stripped = output.replace(/"/g, "").trim();
+        const match = stripped.match(/(\d+\.\d+\.\d+[^\s]*)/);
+        resolve({ installed: null, latest: match ? match[1] : null });
+      }
+    });
+    proc.on("error", () => resolve({ installed: null, latest: null }));
+
+    setTimeout(() => {
+      proc.kill();
+      resolve({ installed: null, latest: null });
+    }, 15000);
+  });
+}
+
+/**
+ * Upgrade OpenCode by running `opencode upgrade`.
+ * Returns the new version if successful.
+ */
+export async function upgradeOpenCode(command: string): Promise<{ success: boolean; newVersion?: string; installedBefore?: string; error?: string }> {
+  return new Promise((resolve) => {
+    // On Windows, use cmd.exe /c
+    const isWindows = process.platform === "win32";
+    const proc = isWindows
+      ? spawn("cmd.exe", ["/c", command, "upgrade"], { stdio: ["pipe", "pipe", "pipe"] })
+      : spawn(command, ["upgrade"], { shell: true, stdio: ["pipe", "pipe", "pipe"] });
+
+    let output = "";
+    proc.stdout?.on("data", (chunk) => { output += chunk.toString(); });
+    proc.stderr?.on("data", (chunk) => { output += chunk.toString(); });
+
+    // Set a timeout - upgrade might wait for input if it prompts (3 minutes)
+    const timeout = setTimeout(() => {
+      proc.kill();
+      // If it timed out but we got version info, still consider it a partial success
+      const fromMatch = output.match(/From\s+(\S+)\s+→\s+(\S+)/);
+      if (fromMatch) {
+        resolve({ success: true, newVersion: fromMatch[2], installedBefore: fromMatch[1] });
+      } else {
+        resolve({ success: false, error: "升级超时（3分钟）: " + output.slice(0, 200) });
+      }
+    }, 180000);
+
+    proc.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code === 0 || output.includes("Upgrade complete") || output.includes("skipped")) {
+        // Parse "From X → Y"
+        const fromMatch = output.match(/From\s+(\S+)\s+→\s+(\S+)/);
+        // Parse "skipped: X is already installed"
+        const skippedMatch = output.match(/skipped:\s*(\S+)\s+is already installed/i);
+        if (skippedMatch) {
+          resolve({ success: true, newVersion: skippedMatch[1], installedBefore: skippedMatch[1] });
+        } else if (fromMatch) {
+          resolve({ success: true, newVersion: fromMatch[2], installedBefore: fromMatch[1] });
+        } else {
+          // Try to extract any version
+          const match = output.match(/(\d+\.\d+\.\d+[^\s]*)/);
+          resolve({ success: true, newVersion: match ? match[1] : undefined });
+        }
+      } else {
+        resolve({ success: false, error: output.slice(0, 500) });
+      }
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: String(err) });
+    });
+  });
+}
+
+

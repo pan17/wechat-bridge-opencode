@@ -109,7 +109,21 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show session, workspace, agent, model, reasoning, context usage |
+| `/status` | Show current session, workspace, agent, model, reasoning, context usage |
+
+### Stop (`/stop`)
+
+| Command | Description |
+|---------|-------------|
+| `/stop` | Stop the running agent (equivalent to pressing ESC) |
+| `/restart` | Restart agent (preserve current state) |
+| `/upgrade` | Update OpenCode then restart |
+
+### Version (`/version`)
+
+| Command | Description |
+|---------|-------------|
+| `/version` | Show current version and latest version |
 
 ### Thinking (`/thinking`)
 

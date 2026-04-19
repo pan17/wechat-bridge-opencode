@@ -591,6 +591,119 @@ export class SessionManager {
   }
 
   /**
+   * Restart the agent process for a user, preserving mode/model/cwd state.
+   * Steps:
+   * 1. Cancel any ongoing prompt
+   * 2. Save current state (mode, model, reasoning, cwd)
+   * 3. Kill old agent process
+   * 4. Spawn new agent
+   * 5. Restore mode/model/reasoning
+   */
+  async restartAgent(userId: string, contextToken: string): Promise<void> {
+    const session = this.sessions.get(userId);
+    if (!session) {
+      this.opts.log(`[${userId}] No session to restart`);
+      return;
+    }
+
+    // Save current state
+    const savedMode = session.currentMode;
+    const savedModel = session.currentModelId;
+    const savedReasoning = session.currentThoughtLevel;
+    const cwd = this.opts.resolveCwd(userId);
+    const existingSessionId = this.opts.getExistingSessionId?.(userId);
+
+    this.opts.log(`[${userId}] Restarting agent (mode=${savedMode}, model=${savedModel}, cwd=${cwd})`);
+
+    // Cancel any ongoing prompt
+    try {
+      await session.connection.cancel({ sessionId: session.activeSessionId });
+    } catch {
+      // Ignore cancel errors
+    }
+
+    // Kill old process
+    killAgent(session.process);
+
+    // Small delay to ensure process cleanup
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Create new client and agent
+    const client = new WeChatAcpClient({
+      sendTyping: () => this.opts.sendTyping(userId, contextToken),
+      onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
+      onMediaFlush: (blocks) => this.opts.onMediaReply(userId, contextToken, blocks),
+      onUsageUpdate: (usage) => {
+        const s = this.sessions.get(userId);
+        if (s) s.contextWindowSize = usage.size;
+      },
+      log: (msg) => this.opts.log(`[${userId}] ${msg}`),
+      showThoughts: this.opts.showThoughts,
+      showTools: this.opts.showTools,
+    });
+
+    const agentInfo = await spawnAgent({
+      command: this.opts.agentCommand,
+      args: this.opts.agentArgs,
+      cwd,
+      env: this.opts.agentEnv,
+      client,
+      log: (msg) => this.opts.log(`[${userId}] ${msg}`),
+      existingSessionId,
+    });
+
+    // Update session with new process/connection
+    session.process = agentInfo.process;
+    session.connection = agentInfo.connection;
+    session.activeSessionId = agentInfo.sessionId;
+    session.capabilities = agentInfo.capabilities;
+    session.availableModes = agentInfo.availableModes;
+    session.availableModels = agentInfo.availableModels;
+    session.configOptions = agentInfo.configOptions;
+
+    // Set up process exit handler
+    agentInfo.process.on("exit", () => {
+      const s = this.sessions.get(userId);
+      if (s && s.process === agentInfo.process) {
+        this.opts.log(`Agent process for ${userId} exited, removing session`);
+        this.sessions.delete(userId);
+      }
+    });
+
+    // Notify bridge of the new session ID
+    this.opts.onSessionReady?.(userId, agentInfo.sessionId);
+
+    // Restore saved state
+    if (savedMode) {
+      this.opts.log(`[${userId}] Restoring agent mode: ${savedMode}`);
+      await session.connection.setSessionMode({ sessionId: agentInfo.sessionId, modeId: savedMode });
+      session.currentMode = savedMode;
+    }
+    if (savedModel) {
+      this.opts.log(`[${userId}] Restoring model: ${savedModel}`);
+      await session.connection.unstable_setSessionModel({ sessionId: agentInfo.sessionId, modelId: savedModel });
+      session.currentModelId = savedModel;
+    }
+    if (savedReasoning) {
+      this.opts.log(`[${userId}] Restoring reasoning: ${savedReasoning}`);
+      try {
+        await session.connection.setSessionConfigOption({
+          sessionId: agentInfo.sessionId,
+          configId: savedReasoning,
+          type: "select",
+          value: savedReasoning,
+        });
+        session.currentThoughtLevel = savedReasoning;
+      } catch (err) {
+        this.opts.log(`[${userId}] Failed to restore reasoning: ${String(err)}`);
+      }
+    }
+
+    session.lastActivity = Date.now();
+    this.opts.log(`[${userId}] Agent restarted successfully`);
+  }
+
+  /**
    * Get current show flags for a user.
    */
   getShowFlags(userId: string): { showThoughts: boolean; showTools: boolean } | null {

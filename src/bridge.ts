@@ -18,6 +18,7 @@ import type { WeixinMessage } from "./weixin/types.js";
 import { SessionManager } from "./acp/session.js";
 // Fallback only — prefer sessionManager.listAgentSessions()
 import { listSessions } from "./acp/opencode-sessions.js";
+import { getInstalledVersion, getLatestVersion, upgradeOpenCode } from "./acp/agent-manager.js";
 import { WeChatAcpClient } from "./acp/client.js";
 import type { MediaContent } from "./acp/client.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
@@ -31,6 +32,9 @@ import {
   parseStatusCommand,
   parseThinkingCommand,
   parseStopCommand,
+  parseVersionCommand,
+  parseUpgradeCommand,
+  parseRestartCommand,
   parseHelpCommand,
   formatHelp,
   formatHelpWithNativeCommands,
@@ -47,6 +51,9 @@ interface UserState {
   userId: string;
   sessionId: string;       // OpenCode session ID (for resume)
   cwd: string;
+  currentMode?: string;     // Saved agent mode
+  currentModelId?: string;  // Saved model
+  currentReasoning?: string; // Saved reasoning level
 }
 
 export class WeChatOpencodeBridge {
@@ -375,6 +382,30 @@ export class WeChatOpencodeBridge {
       if (stopCmd) {
         this.handleStopCommand(userId, contextToken, stopCmd).catch((err) => {
           this.log(`Stop command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const versionCmd = parseVersionCommand(textContent);
+      if (versionCmd) {
+        this.handleVersionCommand(userId, contextToken, versionCmd).catch((err) => {
+          this.log(`Version command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const upgradeCmd = parseUpgradeCommand(textContent);
+      if (upgradeCmd) {
+        this.handleUpgradeCommand(userId, contextToken, upgradeCmd).catch((err) => {
+          this.log(`Upgrade command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const restartCmd = parseRestartCommand(textContent);
+      if (restartCmd) {
+        this.handleRestartCommand(userId, contextToken, restartCmd).catch((err) => {
+          this.log(`Restart command error: ${String(err)}`);
         });
         return;
       }
@@ -1022,6 +1053,102 @@ export class WeChatOpencodeBridge {
     }
   }
 
+  // ─── Version command (/version) ───
+
+  private async handleVersionCommand(
+    userId: string,
+    contextToken: string,
+    _cmd: ReturnType<typeof parseVersionCommand>,
+  ): Promise<void> {
+    await this.sendReply(userId, contextToken, "🔍 正在查询版本信息...");
+
+    // Get installed version
+    const installed = await getInstalledVersion("opencode");
+    // Get latest version by running upgrade
+    const { installed: latestInstalled, latest } = await getLatestVersion("opencode");
+
+    const installedVer = installed ?? "(未知)";
+    const latestVer = latest ?? latestInstalled ?? "(未知)";
+
+    let msg = `📦 OpenCode 版本信息\n`;
+    msg += `  当前版本: ${installedVer}\n`;
+    msg += `  最新版本: ${latestVer}\n`;
+
+    if (latest && installed && latest !== installed) {
+      msg += `\n  🆕 有可用更新！发送 /upgrade 更新`;
+    } else if (latest && installed === latest) {
+      msg += `\n  ✅ 已是最新版本`;
+    } else {
+      msg += `\n  💡 发送 /upgrade 检查更新`;
+    }
+
+    await this.sendReply(userId, contextToken, msg);
+  }
+
+  // ─── Upgrade command (/upgrade) ───
+
+  private async handleUpgradeCommand(
+    userId: string,
+    contextToken: string,
+    _cmd: ReturnType<typeof parseUpgradeCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    await this.sendReply(userId, contextToken, "⬆️ 正在更新 OpenCode，请稍候...");
+
+    const result = await upgradeOpenCode("opencode");
+
+    if (!result.success) {
+      await this.sendReply(userId, contextToken, `⚠️ 更新失败: ${result.error ?? "未知错误"}`);
+      return;
+    }
+
+    const oldVer = result.installedBefore ?? "未知版本";
+    const newVer = result.newVersion ?? "新版本";
+    await this.sendReply(userId, contextToken, `✅ 更新完成！版本: ${oldVer} → ${newVer}`);
+
+    // Only restart agent if there was an active session
+    const session = this.sessionManager.getSession(userId);
+    if (session) {
+      await this.sendReply(userId, contextToken, "🔄 正在重启 Agent...");
+      try {
+        await this.sessionManager.restartAgent(userId, contextToken);
+        await this.sendReply(userId, contextToken, "✅ Agent 已重启并恢复之前的状态");
+      } catch (err) {
+        this.log(`[${userId}] Restart after upgrade error: ${String(err)}`);
+        await this.sendReply(userId, contextToken, `⚠️ Agent 重启失败: ${String(err)}`);
+      }
+    } else {
+      await this.sendReply(userId, contextToken, "ℹ️ 无运行中的 Agent，更新完成但无需重启");
+    }
+  }
+
+  // ─── Restart command (/restart) ───
+
+  private async handleRestartCommand(
+    userId: string,
+    contextToken: string,
+    _cmd: ReturnType<typeof parseRestartCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    const session = this.sessionManager.getSession(userId);
+    if (!session) {
+      await this.sendReply(userId, contextToken, "⚠️ 没有正在运行的 Agent会话");
+      return;
+    }
+
+    await this.sendReply(userId, contextToken, "🔄 正在重启 Agent...");
+
+    try {
+      await this.sessionManager.restartAgent(userId, contextToken);
+      await this.sendReply(userId, contextToken, "✅ Agent 已重启并恢复之前的状态");
+    } catch (err) {
+      this.log(`[${userId}] Restart error: ${String(err)}`);
+      await this.sendReply(userId, contextToken, `⚠️ Agent 重启失败: ${String(err)}`);
+    }
+  }
+
   // ─── Helpers ───
 
   /**
@@ -1039,8 +1166,8 @@ export class WeChatOpencodeBridge {
 
     const cmdName = match[1].toLowerCase();
 
-    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status, thinking, stop
-    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking", "stop"];
+    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status, thinking, stop, version, upgrade, restart
+    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking", "stop", "version", "upgrade", "restart"];
     if (bridgeCommands.includes(cmdName)) return null;
 
     return `⚠️ 指令 "/${match[1]}" 不是 Bridge 内置指令，已转交 Agent 处理。`;
