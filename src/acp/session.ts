@@ -544,6 +544,21 @@ export class SessionManager {
   }
 
   /**
+   * Cancel the ongoing prompt turn for a user using ACP session/cancel.
+   * This sends a notification to the agent to stop as soon as possible.
+   */
+  async cancelPrompt(userId: string): Promise<void> {
+    const session = this.sessions.get(userId);
+    if (!session) {
+      this.opts.log(`[${userId}] No session to cancel`);
+      return;
+    }
+
+    this.opts.log(`[${userId}] Cancelling prompt for session ${session.activeSessionId}`);
+    await session.connection.cancel({ sessionId: session.activeSessionId });
+  }
+
+  /**
    * Get current show flags for a user.
    */
   getShowFlags(userId: string): { showThoughts: boolean; showTools: boolean } | null {

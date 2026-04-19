@@ -30,6 +30,7 @@ import {
   parseReasoningCommand,
   parseStatusCommand,
   parseThinkingCommand,
+  parseStopCommand,
   parseHelpCommand,
   formatHelp,
   formatHelpWithNativeCommands,
@@ -366,6 +367,14 @@ export class WeChatOpencodeBridge {
       if (thCmd) {
         this.handleThinkingCommand(userId, contextToken, thCmd).catch((err) => {
           this.log(`Thinking command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const stopCmd = parseStopCommand(textContent);
+      if (stopCmd) {
+        this.handleStopCommand(userId, contextToken, stopCmd).catch((err) => {
+          this.log(`Stop command error: ${String(err)}`);
         });
         return;
       }
@@ -981,6 +990,35 @@ export class WeChatOpencodeBridge {
     }
   }
 
+  // ─── Stop command (/stop) ───
+
+  private async handleStopCommand(
+    userId: string,
+    contextToken: string,
+    _cmd: ReturnType<typeof parseStopCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    const session = this.sessionManager.getSession(userId);
+    if (!session) {
+      await this.sendReply(userId, contextToken, "⚠️ 没有正在运行的 Agent会话");
+      return;
+    }
+
+    if (!session.processing) {
+      await this.sendReply(userId, contextToken, "ℹ️ Agent 当前没有正在处理的请求");
+      return;
+    }
+
+    try {
+      await this.sessionManager.cancelPrompt(userId);
+      await this.sendReply(userId, contextToken, "🛑 已发送停止信号，Agent 将尽快中断");
+    } catch (err) {
+      this.log(`[${userId}] Cancel prompt error: ${String(err)}`);
+      await this.sendReply(userId, contextToken, `⚠️ 停止失败: ${String(err)}`);
+    }
+  }
+
   // ─── Helpers ───
 
   /**
@@ -998,8 +1036,8 @@ export class WeChatOpencodeBridge {
 
     const cmdName = match[1].toLowerCase();
 
-    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status, thinking
-    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking"];
+    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status, thinking, stop
+    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking", "stop"];
     if (bridgeCommands.includes(cmdName)) return null;
 
     return `⚠️ 指令 "/${match[1]}" 不是 Bridge 内置指令，已转交 Agent 处理。`;

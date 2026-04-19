@@ -53,6 +53,10 @@ export interface ThinkingCommand {
   target?: "thoughts" | "tools";
 }
 
+export interface StopCommand {
+  kind: "stop";
+}
+
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^\/(?:workspace|ws)\s+(.+)$/i);
@@ -270,6 +274,14 @@ export function parseThinkingCommand(text: string): ThinkingCommand | null {
   }
 }
 
+export function parseStopCommand(text: string): StopCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/stop") {
+    return { kind: "stop" };
+  }
+  return null;
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ id: string; name: string; cwd: string }>,
   activeId: string | null,
@@ -426,6 +438,9 @@ export function formatHelp(): string {
     "── 状态 ──",
     "  /status                  显示当前会话、工作区、Agent、模型、上下文使用量",
     "",
+    "── 停止 ──",
+    "  /stop                    停止正在运行的 Agent（相当于按 ESC）",
+    "",
     "── 思考 ──",
     "  /thinking on             开启思考与工具显示（暂时禁用）",
     "  /thinking off            关闭思考与工具显示",
@@ -474,6 +489,9 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "",
     "── 状态 ──",
     "  /status                  显示当前会话、工作区、Agent、模型、上下文使用量",
+    "",
+    "── 停止 ──",
+    "  /stop                    停止正在运行的 Agent（相当于按 ESC）",
     "",
     "── 思考 ──",
     "  /thinking on             开启思考与工具显示（暂时禁用）",
