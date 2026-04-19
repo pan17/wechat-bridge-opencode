@@ -56,7 +56,7 @@ First run will:
 | `--login` | Force re-login |
 | `--daemon` | Run in background |
 | `--config <file>` | JSON config file |
-| `--idle-timeout <min>` | Session idle timeout (default: 1440, 0 = unlimited) |
+| `--idle-timeout <min>` | Session idle timeout (default: 0 = unlimited) |
 
 ## WeChat Commands
 

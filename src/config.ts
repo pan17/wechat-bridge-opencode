@@ -86,7 +86,7 @@ export function defaultConfig(): WeChatOpencodeConfig {
     },
     agents: { ...BUILT_IN_AGENTS },
     session: {
-      idleTimeoutMs: 1440 * 60_000, // 24 hours
+      idleTimeoutMs: 0, // disabled by default
     },
     daemon: {
       enabled: false,

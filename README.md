@@ -57,7 +57,7 @@ wbo --agent opencode
 | `--login` | 强制重新登录 |
 | `--daemon` | 后台运行 |
 | `--config <文件>` | JSON 配置文件 |
-| `--idle-timeout <分钟>` | 会话空闲超时（默认 1440，0 = 无限） |
+| `--idle-timeout <分钟>` | 会话空闲超时（默认 0 = 无限） |
 
 ## 微信命令
 
