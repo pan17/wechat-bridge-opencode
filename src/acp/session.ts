@@ -269,9 +269,41 @@ export class SessionManager {
       mcpServers: [],
     });
 
+    // NOTE: We do NOT call applyLoadSessionState here because it would overwrite
+    // currentMode and currentModelId with the agent's DEFAULT values (before our
+    // setSessionMode/unstable_setSessionModel calls take effect). ACP calls are
+    // async, so the newSession response reflects the initial state, not the state
+    // after we switch mode/model.
     session.sessions.set(result.sessionId, { cwd });
     session.activeSessionId = result.sessionId;
-    this.applyLoadSessionState(session, result);
+
+    // Preserve availableModes/availableModels/configOptions from the response
+    if (result.modes) {
+      session.availableModes = result.modes.availableModes;
+    }
+    if (result.models) {
+      session.availableModels = result.models.availableModels;
+    }
+    if (result.configOptions) {
+      session.configOptions = result.configOptions;
+    }
+
+    // Restore previously selected agent mode and model (must be AFTER session state is updated)
+    if (session.currentMode) {
+      this.opts.log(`[${userId}] Restoring agent mode: ${session.currentMode}`);
+      await session.connection.setSessionMode({
+        sessionId: result.sessionId,
+        modeId: session.currentMode,
+      });
+    }
+    if (session.currentModelId) {
+      this.opts.log(`[${userId}] Restoring model: ${session.currentModelId}`);
+      await session.connection.unstable_setSessionModel({
+        sessionId: result.sessionId,
+        modelId: session.currentModelId,
+      });
+    }
+
     session.contextToken = contextToken;
     session.lastActivity = Date.now();
 

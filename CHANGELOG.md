@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-04-19
+
+### Added
+- `/stop` — 通过 ACP `session/cancel` 通知停止正在运行的 Agent（效果等同于 OpenCode 终端按 ESC 键）
+
+### Fixed
+- `/session new`（`/s new`）现在会保留并恢复用户之前选择的 Agent 模式和模型（此前切换后会重置为默认）
+
 ## [0.2.6] - 2026-04-08
 
 ### Removed

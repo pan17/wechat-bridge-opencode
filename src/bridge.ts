@@ -609,8 +609,11 @@ export class WeChatOpencodeBridge {
 
       case "new": {
         const cwd = this.userStates.get(userId)?.cwd ?? this.config.agent.cwd;
+        const currentMode = this.sessionManager.getActiveMode(userId);
+        const currentModel = this.sessionManager.getCurrentModel(userId);
         await this.sessionManager.createNewSession(userId, contextToken, cwd);
-        await this.sendReply(userId, contextToken, "✅ Session restarted. Context cleared.");
+        const agentInfo = currentMode ? ` (${currentMode}${currentModel ? ` / ${currentModel}` : ""})` : "";
+        await this.sendReply(userId, contextToken, `✅ Session restarted. Context cleared.${agentInfo}`);
         break;
       }
 

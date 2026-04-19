@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-opencode` v0.2.6 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-opencode` v0.2.7 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -182,6 +182,11 @@ src/weixin/
 | Command | Description |
 |---------|-------------|
 | `/status` | Show current session, workspace, agent, model, reasoning, context usage |
+
+### Stop (/stop)
+| Command | Description |
+|---------|-------------|
+| `/stop` | Cancel the running agent (equivalent to pressing ESC in OpenCode terminal) |
 
 ### Thinking (/thinking)
 | Command | Description |
