@@ -24,7 +24,7 @@ function loadState(): { lastUserId?: string; lastSessionId?: string } {
       const raw = JSON.parse(fs.readFileSync(stateFile, "utf-8"))
       // Current format: { users: [{ userId, sessionId, cwd }], updatedAt }
       if (raw.users && Array.isArray(raw.users) && raw.users.length > 0) {
-        const lastUser = raw.users[raw.users.length - 1]
+        const lastUser = raw.users[0]
         return {
           lastUserId: lastUser.userId,
           lastSessionId: lastUser.sessionId,

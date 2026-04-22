@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-22
+
+### Fixed
+- `send-wechat` 工具改为取数组第一个用户（修复多用户环境下取错用户导致 "User session not found" 错误）
+- `/help` 命令现在正确显示 OpenCode 原生指令（此前 `nativeCommands` 参数被忽略）
+
 ## [0.2.9] - 2026-04-19
 
 ### Changed

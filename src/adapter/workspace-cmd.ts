@@ -545,5 +545,14 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "── 帮助 ──",
     "  /help                    显示本帮助信息",
   ];
+
+  // Append OpenCode native commands if available
+  if (nativeCommands.length > 0) {
+    lines.push("", "── OpenCode 指令 ──");
+    for (const cmd of nativeCommands) {
+      lines.push(`  /${cmd.name}`);
+    }
+  }
+
   return lines.join("\n");
 }
