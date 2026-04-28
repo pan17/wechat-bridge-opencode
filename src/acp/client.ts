@@ -26,6 +26,8 @@ export interface WeChatAcpClientOpts {
   sendTyping: () => Promise<void>;
   onThoughtFlush: (text: string) => Promise<void>;
   onMediaFlush: (blocks: MediaContent[]) => Promise<void>;
+  /** Called when content arrives after the prompt cycle has ended (e.g. background task completion). */
+  onDelayedFlush?: (text: string) => Promise<void>;
   onCommandsUpdate?: (commands: acp.AvailableCommand[]) => void;
   onUsageUpdate?: (usage: { size: number; used: number }) => void;
   onToolCall?: (text: string) => Promise<void>;
@@ -46,7 +48,9 @@ export class WeChatAcpClient implements acp.Client {
   private currentUsage: acp.UsageUpdate | null = null;
   private cumulativeUsage: acp.Usage | null = null;
   private hadToolCall = false;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly TYPING_INTERVAL_MS = 5_000;
+  private static readonly FLUSH_DEBOUNCE_MS = 2_000;
 
   constructor(opts: WeChatAcpClientOpts) {
     this.opts = opts;
@@ -81,6 +85,7 @@ export class WeChatAcpClient implements acp.Client {
     sendTyping: () => Promise<void>;
     onThoughtFlush: (text: string) => Promise<void>;
     onMediaFlush: (blocks: MediaContent[]) => Promise<void>;
+    onDelayedFlush?: (text: string) => Promise<void>;
     showThoughts?: boolean;
     showTools?: boolean;
   }): void {
@@ -90,6 +95,7 @@ export class WeChatAcpClient implements acp.Client {
       onThoughtFlush: callbacks.onThoughtFlush,
       onMediaFlush: callbacks.onMediaFlush,
     };
+    if (callbacks.onDelayedFlush !== undefined) this.opts.onDelayedFlush = callbacks.onDelayedFlush;
     if (callbacks.showThoughts !== undefined) this.opts.showThoughts = callbacks.showThoughts;
     if (callbacks.showTools !== undefined) this.opts.showTools = callbacks.showTools;
   }
@@ -126,6 +132,7 @@ export class WeChatAcpClient implements acp.Client {
         await this.maybeFlushThoughts();
         if (update.content.type === "text") {
           this.chunks.push(update.content.text);
+          this.scheduleDelayedFlush();
         } else if (update.content.type === "image") {
           // Image content - send immediately via media callback
           const imageBlock: MediaContent = {
@@ -276,6 +283,10 @@ export class WeChatAcpClient implements acp.Client {
 
   /** Get accumulated text and reset the buffer. Also flushes any remaining thoughts. */
   async flush(): Promise<string> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     await this.maybeFlushThoughts();
     const text = this.chunks.join("");
     this.chunks = [];
@@ -317,6 +328,30 @@ export class WeChatAcpClient implements acp.Client {
     } catch {
       // best effort
     }
+  }
+
+  /**
+   * Schedule a delayed flush for content that arrives after the prompt cycle has ended
+   * (e.g. background task completion). The timer is debounced so rapid chunks are batched.
+   * Normal processQueue flush() clears the timer, so this only fires for truly delayed content.
+   */
+  private scheduleDelayedFlush(): void {
+    if (!this.opts.onDelayedFlush) return;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+    }
+    this.flushTimer = setTimeout(async () => {
+      this.flushTimer = null;
+      const text = await this.flush();
+      if (text.trim()) {
+        this.opts.log(`Delayed flush, reply ${text.length} chars`);
+        try {
+          await this.opts.onDelayedFlush!(text);
+        } catch {
+          // best effort
+        }
+      }
+    }, WeChatAcpClient.FLUSH_DEBOUNCE_MS);
   }
 
   private async maybeFlushThoughts(): Promise<void> {

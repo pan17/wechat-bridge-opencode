@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-28
+
+### Fixed
+- 修复 Agent 启用子代理后第二条回复无法转发到微信的问题（因 `prompt` 返回 `end_turn` 后新到达的 `agent_message_chunk` 无人调用 `flush()` 导致永久丢失）
+- 新增延迟自动 flush 机制（debounce 2 秒），确保 Agent 在后台任务完成后产生的回复也能正常转发
+
 ## [0.3.0] - 2026-04-22
 
 ### Fixed

@@ -633,6 +633,7 @@ export class SessionManager {
       sendTyping: () => this.opts.sendTyping(userId, contextToken),
       onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
       onMediaFlush: (blocks) => this.opts.onMediaReply(userId, contextToken, blocks),
+      onDelayedFlush: (text) => this.opts.onReply(userId, contextToken, text),
       onUsageUpdate: (usage) => {
         const s = this.sessions.get(userId);
         if (s) s.contextWindowSize = usage.size;
@@ -724,6 +725,7 @@ export class SessionManager {
       sendTyping: () => this.opts.sendTyping(userId, contextToken),
       onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
       onMediaFlush: (blocks) => this.opts.onMediaReply(userId, contextToken, blocks),
+      onDelayedFlush: (text) => this.opts.onReply(userId, contextToken, text),
       onUsageUpdate: (usage) => {
         const session = this.sessions.get(userId);
         if (session) session.contextWindowSize = usage.size;
@@ -797,6 +799,7 @@ export class SessionManager {
           sendTyping: () => this.opts.sendTyping(session.userId, pending.contextToken),
           onThoughtFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
           onMediaFlush: (blocks) => this.opts.onMediaReply(session.userId, pending.contextToken, blocks),
+          onDelayedFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
         });
 
         await session.client.flush();
