@@ -11,6 +11,21 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { WeChatAcpClient, type MediaContent } from "./client.js";
 import { spawnAgent, killAgent, type AgentCapabilities } from "./agent-manager.js";
 
+/**
+ * OpenCode encodes reasoning level as a suffix in the model ID.
+ * Known suffixes: /low, /medium, /high, /max
+ */
+const REASONING_SUFFIXES = ["low", "medium", "high", "max"] as const;
+
+function splitModelId(modelId: string): { base: string; level?: string } {
+  for (const suffix of REASONING_SUFFIXES) {
+    if (modelId.endsWith(`/${suffix}`)) {
+      return { base: modelId.slice(0, -suffix.length - 1), level: suffix };
+    }
+  }
+  return { base: modelId, level: undefined };
+}
+
 export interface PendingMessage {
   prompt: acp.ContentBlock[];
   contextToken: string;
@@ -431,40 +446,43 @@ export class SessionManager {
   }
 
   /**
-   * Switch the reasoning level (thought_level) using ACP protocol.
+   * Switch the reasoning level by selecting a model variant with the appropriate suffix.
+   * OpenCode encodes reasoning level in the model ID (e.g., provider/model/low).
    */
   async setReasoning(userId: string, level: string): Promise<void> {
     const session = this.sessions.get(userId);
-    if (!session) {
-      return;
-    }
+    if (!session) throw new Error("No active session");
 
-    // Find the thought_level config option to get its id
-    const thoughtLevelOpt = session.configOptions?.find(
-      (o) => o.category === "thought_level",
+    const modelOpt = session.configOptions?.find(
+      (o) => o.id === "model" || o.category === "model",
     );
-
-    if (thoughtLevelOpt) {
-      // Use the actual config option id
-      await session.connection.setSessionConfigOption({
-        sessionId: session.activeSessionId,
-        configId: thoughtLevelOpt.id,
-        type: "select",
-        value: level,
-      });
-      // Track locally so status works even if ACP doesn't echo back
-      session.currentThoughtLevel = level;
-    } else {
-      // Fallback: try without config discovery
-      await session.connection.setSessionConfigOption({
-        sessionId: session.activeSessionId,
-        configId: level,
-        type: "select",
-        value: level,
-      });
-      session.currentThoughtLevel = level;
+    if (!modelOpt || modelOpt.type !== "select") {
+      throw new Error("Cannot access model configuration");
     }
 
+    const currentModelId = session.currentModelId ?? modelOpt.currentValue;
+    const { base: currentBase } = splitModelId(currentModelId);
+    const targetModelId = `${currentBase}/${level}`;
+
+    // Verify target model exists among options (including nested groups)
+    const exists = modelOpt.options.some((item) => {
+      if ("value" in item) return item.value === targetModelId;
+      return item.options.some((o) => o.value === targetModelId);
+    });
+    if (!exists) {
+      throw new Error(`Reasoning level "${level}" not available for current model`);
+    }
+
+    // Use unstable_setSessionModel to actually switch the model (setSessionConfigOption
+    // with configId="model" returns success but doesn't actually change the model)
+    await session.connection.unstable_setSessionModel({
+      sessionId: session.activeSessionId,
+      modelId: targetModelId,
+    });
+
+    // Update local state
+    session.currentModelId = targetModelId;
+    session.currentThoughtLevel = level;
     session.lastActivity = Date.now();
   }
 
@@ -483,17 +501,54 @@ export class SessionManager {
   }
 
   /**
-   * Get current reasoning/thought level.
+   * Get current reasoning/thought level by extracting the suffix from the current model ID.
    */
   getCurrentReasoning(userId: string): string | undefined {
     const session = this.sessions.get(userId);
     if (!session) return undefined;
-    const localTracking = session.currentThoughtLevel;
-    if (localTracking) return localTracking;
-    const thoughtLevelOpt = session.configOptions?.find(
-      (o) => o.category === "thought_level",
+    if (session.currentModelId) {
+      const { level } = splitModelId(session.currentModelId);
+      return level;
+    }
+    return undefined;
+  }
+
+  /**
+   * Get available reasoning levels for the current model.
+   * Extracted from model ID suffixes (e.g., provider/model/low, provider/model/medium).
+   * Uses session.currentModelId (authoritative) rather than modelOpt.currentValue (may be stale).
+   */
+  getReasoningLevels(userId: string): Array<{ value: string; name: string; current: boolean }> {
+    const session = this.sessions.get(userId);
+    if (!session) return [];
+
+    const modelOpt = session.configOptions?.find(
+      (o) => o.id === "model" || o.category === "model",
     );
-    return thoughtLevelOpt?.type === "select" ? thoughtLevelOpt.currentValue : undefined;
+    if (!modelOpt || modelOpt.type !== "select") return [];
+
+    const currentModelId = session.currentModelId ?? modelOpt.currentValue;
+    const { base: currentBase, level: currentLevel } = splitModelId(currentModelId);
+
+    const levels: Array<{ value: string; name: string; current: boolean }> = [];
+    const seen = new Set<string>();
+
+    for (const item of modelOpt.options) {
+      const items = "value" in item ? [item] : item.options;
+      for (const opt of items) {
+        const { base, level } = splitModelId(opt.value);
+        if (base === currentBase && level && !seen.has(level)) {
+          seen.add(level);
+          levels.push({ value: level, name: opt.name, current: level === currentLevel });
+        }
+      }
+    }
+
+    // Sort: low < medium < high < max
+    const order: Record<string, number> = { low: 0, medium: 1, high: 2, max: 3 };
+    levels.sort((a, b) => (order[a.value] ?? 99) - (order[b.value] ?? 99));
+
+    return levels;
   }
 
   /**
@@ -730,6 +785,12 @@ export class SessionManager {
         const session = this.sessions.get(userId);
         if (session) session.contextWindowSize = usage.size;
       },
+      onConfigOptionsUpdate: (configOptions) => {
+        const session = this.sessions.get(userId);
+        if (session) {
+          session.configOptions = configOptions;
+        }
+      },
       log: (msg) => this.opts.log(`[${userId}] ${msg}`),
       showThoughts: this.opts.showThoughts,
       showTools: this.opts.showTools,
@@ -776,7 +837,7 @@ export class SessionManager {
       currentModelId: agentInfo.currentModelId,
       availableModes: agentInfo.availableModes,
       availableModels: agentInfo.availableModels,
-      configOptions: agentInfo.configOptions,
+      configOptions: agentInfo.configOptions ?? client.getLatestConfigOptions() ?? undefined,
     };
   }
 

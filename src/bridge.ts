@@ -870,29 +870,15 @@ export class WeChatOpencodeBridge {
 
     switch (cmd!.kind) {
       case "list": {
-        const configOptions = this.sessionManager.getConfigOptions(userId);
-        const thoughtLevelOpt = configOptions?.find(
-          (o) => o.category === "thought_level",
-        );
-        const lines = ["🧠 推理级别 (thought_level):"];
-        if (thoughtLevelOpt?.type === "select") {
-          const current = thoughtLevelOpt.currentValue;
-          for (const opt of thoughtLevelOpt.options) {
-            if ("value" in opt) {
-              const marker = opt.value === current ? " ✅" : "";
-              const desc = opt.description ? ` — ${opt.description}` : "";
-              lines.push(`  ${opt.value}${marker} — ${opt.name}${desc}`);
-            } else {
-              lines.push(`  ── ${opt.name} ──`);
-              for (const o of opt.options) {
-                const marker = o.value === current ? " ✅" : "";
-                const desc = o.description ? ` — ${o.description}` : "";
-                lines.push(`  ${o.value}${marker} — ${o.name}${desc}`);
-              }
-            }
+        const levels = this.sessionManager.getReasoningLevels(userId);
+        const lines = ["🧠 推理级别:"];
+        if (levels.length > 0) {
+          for (const lv of levels) {
+            const marker = lv.current ? " ✅" : "";
+            lines.push(`  ${lv.value}${marker} — ${lv.name}`);
           }
         } else {
-          lines.push("  (OpenCode 未返回推理级别配置)");
+          lines.push("  (当前模型无推理级别选项)");
         }
         lines.push("");
         lines.push(`💡 使用 /reasoning switch <level> 切换`);

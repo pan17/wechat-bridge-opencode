@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-07
+
+### Fixed
+- `/reasoning list` 现在正确显示当前模型的可用推理级别（此前错误假设 thought_level 是独立的 ACP SessionConfigOption，实际上 OpenCode 将推理级别编码为 model ID 的后缀，如 `provider/model/low`）
+- `/reasoning switch <level>` 现在正确切换到对应模型变体（使用 `unstable_setSessionModel` 而非 `setSessionConfigOption`）
+- `/reasoning status` 改为从当前 model ID 实时读取推理级别（不再依赖可能过期的本地缓存）
+
 ## [0.3.1] - 2026-04-28
 
 ### Fixed

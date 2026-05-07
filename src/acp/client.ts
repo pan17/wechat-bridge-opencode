@@ -30,6 +30,7 @@ export interface WeChatAcpClientOpts {
   onDelayedFlush?: (text: string) => Promise<void>;
   onCommandsUpdate?: (commands: acp.AvailableCommand[]) => void;
   onUsageUpdate?: (usage: { size: number; used: number }) => void;
+  onConfigOptionsUpdate?: (configOptions: acp.SessionConfigOption[]) => void;
   onToolCall?: (text: string) => Promise<void>;
   log: (msg: string) => void;
   showThoughts: boolean;
@@ -47,6 +48,7 @@ export class WeChatAcpClient implements acp.Client {
   private availableCommands: acp.AvailableCommand[] = [];
   private currentUsage: acp.UsageUpdate | null = null;
   private cumulativeUsage: acp.Usage | null = null;
+  private latestConfigOptions: acp.SessionConfigOption[] | null = null;
   private hadToolCall = false;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly TYPING_INTERVAL_MS = 5_000;
@@ -237,10 +239,13 @@ export class WeChatAcpClient implements acp.Client {
         this.opts.log(`[session_info_update]`);
         break;
 
-      case "config_option_update":
-        // Log it, no action needed
-        this.opts.log(`[config_option_update]`);
+      case "config_option_update": {
+        const cfgUpdate = update as acp.ConfigOptionUpdate & { sessionUpdate: "config_option_update" };
+        this.latestConfigOptions = cfgUpdate.configOptions;
+        this.opts.log(`[config_option_update] ${cfgUpdate.configOptions.length} options`);
+        this.opts.onConfigOptionsUpdate?.(cfgUpdate.configOptions);
         break;
+      }
 
       case "available_commands_update": {
         const cmdsUpdate = update as acp.AvailableCommandsUpdate & { sessionUpdate: "available_commands_update" };
@@ -309,6 +314,11 @@ export class WeChatAcpClient implements acp.Client {
   /** Get the latest available commands from the agent. */
   getAvailableCommands(): acp.AvailableCommand[] {
     return this.availableCommands;
+  }
+
+  /** Get the latest config options received from notifications. */
+  getLatestConfigOptions(): acp.SessionConfigOption[] | null {
+    return this.latestConfigOptions;
   }
 
   /** Get the latest context window usage. */
