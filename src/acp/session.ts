@@ -51,6 +51,8 @@ export interface UserSession {
   configOptions?: acp.SessionConfigOption[];
   /** Current thought level value (tracked manually when setReasoning is called) */
   currentThoughtLevel?: string;
+  /** Cached thought_level config option ID (survives configOptions replacement from newSession) */
+  thoughtLevelConfigId?: string;
   /** Last queried models (used when user does /model list <provider>) */
   lastQueriedModels?: Map<string, acp.ModelInfo[]>;
   /** Track which provider was last queried for index-based switching */
@@ -319,6 +321,25 @@ export class SessionManager {
       });
     }
 
+    // Restore reasoning level (thought_level config option, if available)
+    if (session.currentThoughtLevel && session.thoughtLevelConfigId) {
+      this.opts.log(`[${userId}] Restoring reasoning: ${session.currentThoughtLevel} (configId=${session.thoughtLevelConfigId})`);
+      try {
+        const rResult = await session.connection.setSessionConfigOption({
+          sessionId: result.sessionId,
+          configId: session.thoughtLevelConfigId,
+          type: "select",
+          value: session.currentThoughtLevel,
+        });
+        if (rResult.configOptions) {
+          session.configOptions = rResult.configOptions;
+        }
+        this.opts.log(`[${userId}] Reasoning restored successfully`);
+      } catch (err) {
+        this.opts.log(`[${userId}] Failed to restore reasoning: ${String(err)}`);
+      }
+    }
+
     session.contextToken = contextToken;
     session.lastActivity = Date.now();
 
@@ -446,13 +467,45 @@ export class SessionManager {
   }
 
   /**
-   * Switch the reasoning level by selecting a model variant with the appropriate suffix.
-   * OpenCode encodes reasoning level in the model ID (e.g., provider/model/low).
+   * Switch the reasoning level.
+   * Tries: thought_level config option → model ID suffix approach.
    */
   async setReasoning(userId: string, level: string): Promise<void> {
     const session = this.sessions.get(userId);
     if (!session) throw new Error("No active session");
 
+    // Approach 1: thought_level config option (new OpenCode)
+    const thoughtOpt = session.configOptions?.find(
+      (o) => o.category === "thought_level" || o.id === "thought_level" || o.id === "effort",
+    );
+    if (thoughtOpt?.type === "select") {
+      // Verify the level is valid
+      const exists = thoughtOpt.options.some((item: any) => {
+        if ("value" in item) return item.value === level;
+        return item.options?.some((o: any) => o.value === level);
+      });
+      if (!exists) {
+        throw new Error(`Reasoning level "${level}" not available`);
+      }
+
+      // Cache the config option ID for restoration across session/new
+      session.thoughtLevelConfigId = thoughtOpt.id;
+
+      const result = await session.connection.setSessionConfigOption({
+        sessionId: session.activeSessionId,
+        configId: thoughtOpt.id,
+        type: "select",
+        value: level,
+      });
+      if (result.configOptions) {
+        session.configOptions = result.configOptions;
+      }
+      session.currentThoughtLevel = level;
+      session.lastActivity = Date.now();
+      return;
+    }
+
+    // Approach 2: model ID suffix (legacy OpenCode)
     const modelOpt = session.configOptions?.find(
       (o) => o.id === "model" || o.category === "model",
     );
@@ -473,14 +526,11 @@ export class SessionManager {
       throw new Error(`Reasoning level "${level}" not available for current model`);
     }
 
-    // Use unstable_setSessionModel to actually switch the model (setSessionConfigOption
-    // with configId="model" returns success but doesn't actually change the model)
     await session.connection.unstable_setSessionModel({
       sessionId: session.activeSessionId,
       modelId: targetModelId,
     });
 
-    // Update local state
     session.currentModelId = targetModelId;
     session.currentThoughtLevel = level;
     session.lastActivity = Date.now();
@@ -501,54 +551,84 @@ export class SessionManager {
   }
 
   /**
-   * Get current reasoning/thought level by extracting the suffix from the current model ID.
+   * Get current reasoning/thought level.
+   * Tries: local tracking → model ID suffix → thought_level config option.
    */
   getCurrentReasoning(userId: string): string | undefined {
     const session = this.sessions.get(userId);
     if (!session) return undefined;
+
+    // Approach 1: model ID suffix (legacy OpenCode)
     if (session.currentModelId) {
       const { level } = splitModelId(session.currentModelId);
-      return level;
+      if (level) return level;
     }
+
+    // Approach 2: thought_level config option (new OpenCode)
+    const thoughtOpt = session.configOptions?.find(
+      (o) => o.category === "thought_level" || o.id === "thought_level" || o.id === "effort",
+    );
+    if (thoughtOpt?.type === "select") {
+      return thoughtOpt.currentValue;
+    }
+
     return undefined;
   }
 
   /**
-   * Get available reasoning levels for the current model.
-   * Extracted from model ID suffixes (e.g., provider/model/low, provider/model/medium).
-   * Uses session.currentModelId (authoritative) rather than modelOpt.currentValue (may be stale).
+   * Get available reasoning levels.
+   * Tries: model ID suffix approach → thought_level config option approach.
    */
   getReasoningLevels(userId: string): Array<{ value: string; name: string; current: boolean }> {
     const session = this.sessions.get(userId);
     if (!session) return [];
 
+    // Approach 1: model ID suffixes (legacy OpenCode)
     const modelOpt = session.configOptions?.find(
       (o) => o.id === "model" || o.category === "model",
     );
-    if (!modelOpt || modelOpt.type !== "select") return [];
+    if (modelOpt?.type === "select") {
+      const currentModelId = session.currentModelId ?? modelOpt.currentValue;
+      const { base: currentBase, level: currentLevel } = splitModelId(currentModelId);
 
-    const currentModelId = session.currentModelId ?? modelOpt.currentValue;
-    const { base: currentBase, level: currentLevel } = splitModelId(currentModelId);
+      const levels: Array<{ value: string; name: string; current: boolean }> = [];
+      const seen = new Set<string>();
 
-    const levels: Array<{ value: string; name: string; current: boolean }> = [];
-    const seen = new Set<string>();
-
-    for (const item of modelOpt.options) {
-      const items = "value" in item ? [item] : item.options;
-      for (const opt of items) {
-        const { base, level } = splitModelId(opt.value);
-        if (base === currentBase && level && !seen.has(level)) {
-          seen.add(level);
-          levels.push({ value: level, name: opt.name, current: level === currentLevel });
+      for (const item of modelOpt.options) {
+        const items = "value" in item ? [item] : item.options;
+        for (const opt of items) {
+          const { base, level } = splitModelId(opt.value);
+          if (base === currentBase && level && !seen.has(level)) {
+            seen.add(level);
+            levels.push({ value: level, name: opt.name, current: level === currentLevel });
+          }
         }
+      }
+
+      if (levels.length > 0) {
+        const order: Record<string, number> = { low: 0, medium: 1, high: 2, max: 3 };
+        levels.sort((a, b) => (order[a.value] ?? 99) - (order[b.value] ?? 99));
+        return levels;
       }
     }
 
-    // Sort: low < medium < high < max
-    const order: Record<string, number> = { low: 0, medium: 1, high: 2, max: 3 };
-    levels.sort((a, b) => (order[a.value] ?? 99) - (order[b.value] ?? 99));
+    // Approach 2: thought_level config option (new OpenCode)
+    const thoughtOpt = session.configOptions?.find(
+      (o) => o.category === "thought_level" || o.id === "thought_level" || o.id === "effort",
+    );
+    if (thoughtOpt?.type === "select") {
+      const current = thoughtOpt.currentValue;
+      const levels: Array<{ value: string; name: string; current: boolean }> = [];
+      for (const item of thoughtOpt.options) {
+        const items = "value" in item ? [item] : item.options;
+        for (const opt of items) {
+          levels.push({ value: opt.value, name: opt.name, current: opt.value === current });
+        }
+      }
+      return levels;
+    }
 
-    return levels;
+    return [];
   }
 
   /**
@@ -740,12 +820,12 @@ export class SessionManager {
       await session.connection.unstable_setSessionModel({ sessionId: agentInfo.sessionId, modelId: savedModel });
       session.currentModelId = savedModel;
     }
-    if (savedReasoning) {
+    if (savedReasoning && session.thoughtLevelConfigId) {
       this.opts.log(`[${userId}] Restoring reasoning: ${savedReasoning}`);
       try {
         await session.connection.setSessionConfigOption({
           sessionId: agentInfo.sessionId,
-          configId: savedReasoning,
+          configId: session.thoughtLevelConfigId,
           type: "select",
           value: savedReasoning,
         });
@@ -884,14 +964,18 @@ export class SessionManager {
           let replyText = await session.client.flush();
 
           // Poll for trailing chunks that arrive after end_turn.
-          // Always wait at least once, then continue if more chunks arrive.
-          for (let i = 0; i < 6; i++) {
-            await new Promise((r) => setTimeout(r, 500));
+          // Continue until no new content arrives for 1.5s (silence threshold).
+          let silenceCount = 0;
+          for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setTimeout(r, 400));
             const trailing = await session.client.flush();
             if (trailing.trim()) {
-              replyText = replyText ? `${replyText}\n${trailing}` : trailing;
+              replyText = replyText ? `${replyText}${trailing}` : trailing;
+              silenceCount = 0;
+            } else {
+              silenceCount++;
             }
-            if (!session.client.hasTrailingContent()) break;
+            if (silenceCount >= 4) break;
           }
           session.client.resetToolCallFlag();
 

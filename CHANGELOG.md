@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-05-26
+
+### Fixed
+- AI 回复被意外拆成多条消息的问题（`onDelayedFlush` 的 trailing chunk 用 `\n` 强制换行拼接，改为直接拼接）
+- 延长 trailing poll 窗口（从固定 3s 改为自适应最长 12s、1.6s 静默退出），进一步减少延迟到达内容导致的拆分
+- `/reasoning` 命令适配 OpenCode 新版配置项（`thought_level` 重命名为 `effort`，`/session new` 和 `/restart` 现在正确继承推理级别）
+- `/reasoning list` / `switch` / `status` 同时支持旧版 model ID 后缀和新版 `effort` 配置项
+
 ## [0.3.2] - 2026-05-07
 
 ### Fixed
