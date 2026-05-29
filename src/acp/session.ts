@@ -9,7 +9,7 @@
 import type { ChildProcess } from "node:child_process";
 import type * as acp from "@agentclientprotocol/sdk";
 import { WeChatAcpClient, type MediaContent } from "./client.js";
-import { spawnAgent, killAgent, type AgentCapabilities } from "./agent-manager.js";
+import { spawnAgent, killAgent, getMcpServers, type AgentCapabilities } from "./agent-manager.js";
 
 /**
  * OpenCode encodes reasoning level as a suffix in the model ID.
@@ -206,7 +206,7 @@ export class SessionManager {
           const loadResult = await session.connection.loadSession({
             sessionId: existingSessionId,
             cwd,
-            mcpServers: [],
+            mcpServers: getMcpServers(cwd),
           });
           session.activeSessionId = existingSessionId;
           this.applyLoadSessionState(session, loadResult);
@@ -923,6 +923,10 @@ export class SessionManager {
 
   /** Warm-up delay for freshly spawned agents before first prompt. */
   private static readonly AGENT_WARMUP_MS = 2000;
+  /** Maximum time to wait for a single prompt before rejecting. */
+  private static readonly PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
+  /** Maximum time to wait for client.flush() before rejecting. */
+  private static readonly FLUSH_TIMEOUT_MS = 30_000;
 
   private async processQueue(session: UserSession): Promise<void> {
     try {
@@ -949,10 +953,18 @@ export class SessionManager {
           this.opts.sendTyping(session.userId, pending.contextToken).catch(() => {});
 
           this.opts.log(`[${session.userId}] Sending prompt to agent...`);
-          const result = await session.connection.prompt({
-            sessionId: session.activeSessionId,
-            prompt: pending.prompt,
-          });
+          const result = await Promise.race([
+            session.connection.prompt({
+              sessionId: session.activeSessionId,
+              prompt: pending.prompt,
+            }),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error(`Prompt timed out after ${SessionManager.PROMPT_TIMEOUT_MS / 60000}min`)),
+                SessionManager.PROMPT_TIMEOUT_MS,
+              ),
+            ),
+          ]);
 
           // Capture usage from prompt response
           if (result.usage) {
@@ -961,14 +973,30 @@ export class SessionManager {
             this.opts.log(`[${session.userId}] Usage: totalTokens=${result.usage.totalTokens}`);
           }
 
-          let replyText = await session.client.flush();
+          let replyText = await Promise.race([
+            session.client.flush(),
+            new Promise<string>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("Flush timed out after 30s")),
+                SessionManager.FLUSH_TIMEOUT_MS,
+              ),
+            ),
+          ]);
 
           // Poll for trailing chunks that arrive after end_turn.
           // Continue until no new content arrives for 1.5s (silence threshold).
           let silenceCount = 0;
           for (let i = 0; i < 30; i++) {
             await new Promise((r) => setTimeout(r, 400));
-            const trailing = await session.client.flush();
+            const trailing = await Promise.race([
+              session.client.flush(),
+              new Promise<string>((_, reject) =>
+                setTimeout(
+                  () => reject(new Error("Flush timed out after 30s")),
+                  SessionManager.FLUSH_TIMEOUT_MS,
+                ),
+              ),
+            ]);
             if (trailing.trim()) {
               replyText = replyText ? `${replyText}${trailing}` : trailing;
               silenceCount = 0;
