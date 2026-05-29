@@ -63,6 +63,8 @@ export interface UserSession {
   contextWindowSize?: number;
   queue: PendingMessage[];
   processing: boolean;
+  /** Set when user sends /stop — suppresses all further output to WeChat */
+  cancelled: boolean;
   lastActivity: number;
   createdAt: number;
   ready: boolean;
@@ -711,8 +713,9 @@ export class SessionManager {
   }
 
   /**
-   * Cancel the ongoing prompt turn for a user using ACP session/cancel.
-   * This sends a notification to the agent to stop as soon as possible.
+   * Cancel the ongoing prompt and forcefully stop all output.
+   * Sends ACP cancel, then force-kills agent process after a short grace period.
+   * Also sets cancelled flag to suppress any in-flight messages.
    */
   async cancelPrompt(userId: string): Promise<void> {
     const session = this.sessions.get(userId);
@@ -721,8 +724,22 @@ export class SessionManager {
       return;
     }
 
+    session.cancelled = true;
     this.opts.log(`[${userId}] Cancelling prompt for session ${session.activeSessionId}`);
-    await session.connection.cancel({ sessionId: session.activeSessionId });
+
+    try {
+      await session.connection.cancel({ sessionId: session.activeSessionId });
+    } catch {
+      // Cancel may fail if connection is hung
+    }
+
+    setTimeout(() => {
+      if (session.processing) {
+        this.opts.log(`[${userId}] Force-killing agent after cancel`);
+        killAgent(session.process);
+        this.sessions.delete(userId);
+      }
+    }, 3_000).unref();
   }
 
   /**
@@ -909,6 +926,7 @@ export class SessionManager {
       sessions: new Map([[agentInfo.sessionId, { cwd }]]),
       queue: [],
       processing: false,
+      cancelled: false,
       lastActivity: Date.now(),
       createdAt: Date.now(),
       ready: true,
@@ -941,10 +959,22 @@ export class SessionManager {
         }
 
         session.client.updateCallbacks({
-          sendTyping: () => this.opts.sendTyping(session.userId, pending.contextToken),
-          onThoughtFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
-          onMediaFlush: (blocks) => this.opts.onMediaReply(session.userId, pending.contextToken, blocks),
-          onDelayedFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
+          sendTyping: () => {
+            if (session.cancelled) return Promise.resolve();
+            return this.opts.sendTyping(session.userId, pending.contextToken);
+          },
+          onThoughtFlush: (text) => {
+            if (session.cancelled) return Promise.resolve();
+            return this.opts.onReply(session.userId, pending.contextToken, text);
+          },
+          onMediaFlush: (blocks) => {
+            if (session.cancelled) return Promise.resolve();
+            return this.opts.onMediaReply(session.userId, pending.contextToken, blocks);
+          },
+          onDelayedFlush: (text) => {
+            if (session.cancelled) return Promise.resolve();
+            return this.opts.onReply(session.userId, pending.contextToken, text);
+          },
         });
 
         await session.client.flush();
@@ -1020,7 +1050,7 @@ export class SessionManager {
             replyText += `\n\n${pending.hint}`;
           }
 
-          if (replyText.trim()) {
+          if (replyText.trim() && !session.cancelled) {
             await this.opts.onReply(session.userId, pending.contextToken, replyText);
           }
         } catch (err) {
@@ -1032,14 +1062,16 @@ export class SessionManager {
             return;
           }
 
-          try {
-            await this.opts.onReply(
-              session.userId,
-              pending.contextToken,
-              `⚠️ Agent error: ${String(err)}`,
-            );
-          } catch {
-            // best effort
+          if (!session.cancelled) {
+            try {
+              await this.opts.onReply(
+                session.userId,
+                pending.contextToken,
+                `⚠️ Agent error: ${String(err)}`,
+              );
+            } catch {
+              // best effort
+            }
           }
         }
       }
