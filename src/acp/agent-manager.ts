@@ -11,6 +11,14 @@ import * as acp from "@agentclientprotocol/sdk";
 import packageJson from "../../package.json" with { type: "json" };
 import type { WeChatAcpClient } from "./client.js";
 
+/** Raw MCP server entry from opencode.json (before normalization). */
+interface McpServerEntry {
+  enabled?: boolean;
+  command?: string;
+  args?: string[];
+  env?: Record<string, unknown>;
+}
+
 export interface McpServerConfig {
   name: string;
   command: string;
@@ -19,27 +27,26 @@ export interface McpServerConfig {
 }
 
 /**
- * Read MCP server configurations from opencode.json / opencode.jsonc.
+ * Read MCP server configurations from opencode.json.
  * Searches project-level then global config.
  */
-export function getMcpServers(cwd: string): McpServerConfig[] {
+export async function getMcpServers(cwd: string, log?: (msg: string) => void): Promise<McpServerConfig[]> {
   const configPaths = [
     path.join(cwd, ".opencode", "opencode.json"),
-    path.join(cwd, ".opencode", "opencode.jsonc"),
     path.join(os.homedir(), ".config", "opencode", "opencode.json"),
   ];
 
   for (const configPath of configPaths) {
     try {
-      if (!fs.existsSync(configPath)) continue;
-      const raw = fs.readFileSync(configPath, "utf-8");
+      await fs.promises.access(configPath);
+      const raw = await fs.promises.readFile(configPath, "utf-8");
       const cfg = JSON.parse(raw);
       const mcp = cfg.mcp || cfg.mcpServers;
       if (!mcp) continue;
 
       const servers: McpServerConfig[] = [];
       for (const [name, server] of Object.entries(mcp)) {
-        const s = server as any;
+        const s = server as McpServerEntry;
         if (s.enabled === false) continue;
         if (!s.command) continue;
         const config: McpServerConfig = { name, command: s.command, args: s.args || [] };
@@ -49,7 +56,9 @@ export function getMcpServers(cwd: string): McpServerConfig[] {
         servers.push(config);
       }
       return servers;
-    } catch {}
+    } catch (err) {
+      log?.(`Failed to read MCP config from ${configPath}: ${String(err)}`);
+    }
   }
   return [];
 }
@@ -127,9 +136,6 @@ export async function spawnAgent(params: {
   if (opencodeConfig && !mergedEnv.OPENCODE_CONFIG) {
     mergedEnv.OPENCODE_CONFIG = opencodeConfig;
   }
-  if (opencodeConfig && !mergedEnv.OPENCODE_CONFIG) {
-    mergedEnv.OPENCODE_CONFIG = opencodeConfig;
-  }
 
   const proc = spawn(command, args, {
     stdio: ["pipe", "pipe", "inherit"],
@@ -199,7 +205,7 @@ export async function spawnAgent(params: {
       const resumeResult = await connection.unstable_resumeSession({
         sessionId: existingSessionId,
         cwd,
-        mcpServers: getMcpServers(cwd),
+        mcpServers: await getMcpServers(cwd),
       });
       finalSessionId = existingSessionId;
       log(`ACP session resumed: ${finalSessionId}`);
@@ -219,7 +225,7 @@ export async function spawnAgent(params: {
       log(`Failed to resume session ${existingSessionId}: ${String(err)}, creating new one`);
       const newResult = await connection.newSession({
         cwd,
-        mcpServers: getMcpServers(cwd),
+        mcpServers: await getMcpServers(cwd),
       });
       finalSessionId = newResult.sessionId;
       log(`ACP session created (fallback): ${finalSessionId}`);
@@ -240,7 +246,7 @@ export async function spawnAgent(params: {
     log("Creating ACP session...");
     const newResult = await connection.newSession({
       cwd,
-        mcpServers: getMcpServers(cwd),
+      mcpServers: await getMcpServers(cwd),
     });
     finalSessionId = newResult.sessionId;
     log(`ACP session created: ${finalSessionId}`);

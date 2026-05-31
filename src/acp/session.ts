@@ -102,6 +102,12 @@ export class SessionManager {
     this.opts = opts;
   }
 
+  /** Returns resolved promise if cancelled, otherwise calls fn. */
+  private ifCancelled(session: UserSession, fn: () => Promise<void>): Promise<void> {
+    if (session.cancelled) return Promise.resolve();
+    return fn();
+  }
+
   start(): void {
     this.cleanupTimer = setInterval(() => this.cleanupIdleSessions(), 2 * 60_000);
     this.cleanupTimer.unref();
@@ -203,21 +209,21 @@ export class SessionManager {
     if (existingSessionId) {
       // Load existing session for this cwd
       this.opts.log(`[${userId}] Loading session ${existingSessionId} for workspace switch (cwd: ${cwd})`);
-        session.client.setReplaying(true);
-        try {
-          const loadResult = await session.connection.loadSession({
-            sessionId: existingSessionId,
-            cwd,
-            mcpServers: getMcpServers(cwd),
-          });
-          session.activeSessionId = existingSessionId;
-          this.applyLoadSessionState(session, loadResult);
-          if (!session.sessions.has(existingSessionId)) {
-            session.sessions.set(existingSessionId, { cwd });
-          }
-        } finally {
-          session.client.setReplaying(false);
+      session.client.setReplaying(true);
+      try {
+        const loadResult = await session.connection.loadSession({
+          sessionId: existingSessionId,
+          cwd,
+          mcpServers: await getMcpServers(cwd),
+        });
+        session.activeSessionId = existingSessionId;
+        this.applyLoadSessionState(session, loadResult);
+        if (!session.sessions.has(existingSessionId)) {
+          session.sessions.set(existingSessionId, { cwd });
         }
+      } finally {
+        session.client.setReplaying(false);
+      }
     } else {
       // No existing session — create new one
       this.opts.log(`[${userId}] Creating new session for workspace switch (cwd: ${cwd})`);
@@ -739,7 +745,7 @@ export class SessionManager {
         killAgent(session.process);
         this.sessions.delete(userId);
       }
-    }, 3_000).unref();
+    }, 5_000).unref();
   }
 
   /**
@@ -951,6 +957,9 @@ export class SessionManager {
       while (session.queue.length > 0 && !this.aborted) {
         const pending = session.queue.shift()!;
 
+        // Reset cancelled flag at the start of each message processing
+        session.cancelled = false;
+
         // If agent was just spawned, give it a moment to fully initialize
         if (Date.now() - session.createdAt < SessionManager.AGENT_WARMUP_MS) {
           const delay = SessionManager.AGENT_WARMUP_MS - (Date.now() - session.createdAt);
@@ -959,22 +968,10 @@ export class SessionManager {
         }
 
         session.client.updateCallbacks({
-          sendTyping: () => {
-            if (session.cancelled) return Promise.resolve();
-            return this.opts.sendTyping(session.userId, pending.contextToken);
-          },
-          onThoughtFlush: (text) => {
-            if (session.cancelled) return Promise.resolve();
-            return this.opts.onReply(session.userId, pending.contextToken, text);
-          },
-          onMediaFlush: (blocks) => {
-            if (session.cancelled) return Promise.resolve();
-            return this.opts.onMediaReply(session.userId, pending.contextToken, blocks);
-          },
-          onDelayedFlush: (text) => {
-            if (session.cancelled) return Promise.resolve();
-            return this.opts.onReply(session.userId, pending.contextToken, text);
-          },
+          sendTyping: () => this.ifCancelled(session, () => this.opts.sendTyping(session.userId, pending.contextToken)),
+          onThoughtFlush: (text) => this.ifCancelled(session, () => this.opts.onReply(session.userId, pending.contextToken, text)),
+          onMediaFlush: (blocks) => this.ifCancelled(session, () => this.opts.onMediaReply(session.userId, pending.contextToken, blocks)),
+          onDelayedFlush: (text) => this.ifCancelled(session, () => this.opts.onReply(session.userId, pending.contextToken, text)),
         });
 
         await session.client.flush();
@@ -983,18 +980,21 @@ export class SessionManager {
           this.opts.sendTyping(session.userId, pending.contextToken).catch(() => {});
 
           this.opts.log(`[${session.userId}] Sending prompt to agent...`);
+          let promptTimeout: ReturnType<typeof setTimeout> | undefined;
           const result = await Promise.race([
             session.connection.prompt({
               sessionId: session.activeSessionId,
               prompt: pending.prompt,
             }),
-            new Promise<never>((_, reject) =>
-              setTimeout(
-                () => reject(new Error(`Prompt timed out after ${SessionManager.PROMPT_TIMEOUT_MS / 60000}min`)),
-                SessionManager.PROMPT_TIMEOUT_MS,
-              ),
-            ),
+            new Promise<never>((_, reject) => {
+              promptTimeout = setTimeout(() => {
+                // Send ACP cancel when timeout fires
+                session.connection.cancel({ sessionId: session.activeSessionId }).catch(() => {});
+                reject(new Error(`Prompt timed out after ${SessionManager.PROMPT_TIMEOUT_MS / 60000}min`));
+              }, SessionManager.PROMPT_TIMEOUT_MS);
+            }),
           ]);
+          if (promptTimeout) clearTimeout(promptTimeout);
 
           // Capture usage from prompt response
           if (result.usage) {
@@ -1003,15 +1003,18 @@ export class SessionManager {
             this.opts.log(`[${session.userId}] Usage: totalTokens=${result.usage.totalTokens}`);
           }
 
+          let flushTimeout: ReturnType<typeof setTimeout> | undefined;
           let replyText = await Promise.race([
             session.client.flush(),
-            new Promise<string>((_, reject) =>
-              setTimeout(
-                () => reject(new Error("Flush timed out after 30s")),
-                SessionManager.FLUSH_TIMEOUT_MS,
-              ),
-            ),
+            new Promise<string>((_, reject) => {
+              flushTimeout = setTimeout(() => {
+                // Send ACP cancel when flush timeout fires
+                session.connection.cancel({ sessionId: session.activeSessionId }).catch(() => {});
+                reject(new Error("Flush timed out after 30s"));
+              }, SessionManager.FLUSH_TIMEOUT_MS);
+            }),
           ]);
+          if (flushTimeout) clearTimeout(flushTimeout);
 
           // Poll for trailing chunks that arrive after end_turn.
           // Continue until no new content arrives for 1.5s (silence threshold).
