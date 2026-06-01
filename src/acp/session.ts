@@ -7,6 +7,7 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import fs from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 import { WeChatAcpClient, type MediaContent } from "./client.js";
 import { spawnAgent, killAgent, getMcpServers, extractModesFromConfigOptions, extractModelsFromConfigOptions, type AgentCapabilities } from "./agent-manager.js";
@@ -217,6 +218,11 @@ export class SessionManager {
    * NO kill/respawn of the agent process.
    */
   async switchWorkspace(userId: string, contextToken: string, cwd: string, existingSessionId?: string): Promise<void> {
+    // Check if directory exists before switching
+    if (!fs.existsSync(cwd)) {
+      throw new Error(`Working directory does not exist: ${cwd}`);
+    }
+
     const { session } = await this.getOrCreateSession(userId, contextToken);
 
     if (existingSessionId) {
@@ -258,6 +264,11 @@ export class SessionManager {
    * Switch to an existing ACP session, replaying its conversation history.
    */
   async switchSession(userId: string, contextToken: string, sessionId: string, cwd: string): Promise<void> {
+    // Check if directory exists before switching
+    if (!fs.existsSync(cwd)) {
+      throw new Error(`Working directory does not exist: ${cwd}`);
+    }
+
     const { session } = await this.getOrCreateSession(userId, contextToken);
 
     this.opts.log(`[${userId}] Loading session ${sessionId} (cwd: ${cwd})`);
