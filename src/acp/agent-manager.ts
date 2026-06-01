@@ -195,6 +195,11 @@ export async function spawnAgent(params: {
 }): Promise<AgentProcessInfo> {
   const { command, args, cwd, env, client, log, existingSessionId } = params;
 
+  // Check if cwd exists before spawning
+  if (!fs.existsSync(cwd)) {
+    throw new Error(`Working directory does not exist: ${cwd}`);
+  }
+
   // On Windows, shell mode avoids EINVAL/ENOENT for command shims like npx/claude/gemini.
   const useShell = process.platform === "win32";
 
@@ -218,13 +223,23 @@ export async function spawnAgent(params: {
     shell: useShell,
   });
 
+  // Collect spawn errors to throw later if needed
+  let spawnError: Error | null = null;
   proc.on("error", (err) => {
     log(`Agent process error: ${String(err)}`);
+    spawnError = err;
   });
 
   proc.on("exit", (code, signal) => {
     log(`Agent process exited: code=${code} signal=${signal}`);
   });
+
+  // Wait a tick to see if spawn fails immediately
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  if (spawnError) {
+    throw spawnError;
+  }
 
   if (!proc.stdin || !proc.stdout) {
     proc.kill();

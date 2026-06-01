@@ -486,8 +486,12 @@ export class WeChatOpencodeBridge {
           const recentForCwd = sessions.find((s) => s.cwd === targetDir);
           this.setUserState(userId, recentForCwd?.sessionId ?? "", targetDir);
           await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${targetDir}`);
-          await this.sessionManager.switchWorkspace(userId, contextToken, targetDir, recentForCwd?.sessionId);
-          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetDir}`);
+          try {
+            await this.sessionManager.switchWorkspace(userId, contextToken, targetDir, recentForCwd?.sessionId);
+            await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetDir}`);
+          } catch (err) {
+            await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+          }
           return;
         }
 
@@ -506,8 +510,12 @@ export class WeChatOpencodeBridge {
         const recentForCwd = sessions.find((s) => s.cwd === target.cwd);
         this.setUserState(userId, recentForCwd?.sessionId ?? "", target.cwd);
         await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${target.cwd}`);
-        await this.sessionManager.switchWorkspace(userId, contextToken, target.cwd, recentForCwd?.sessionId);
-        await this.sendReply(userId, contextToken, `✅ Ready on\n  ${target.cwd}`);
+        try {
+          await this.sessionManager.switchWorkspace(userId, contextToken, target.cwd, recentForCwd?.sessionId);
+          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${target.cwd}`);
+        } catch (err) {
+          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+        }
         break;
       }
 
@@ -530,8 +538,12 @@ export class WeChatOpencodeBridge {
         const recentForCwd = allSessions.find((s) => s.cwd === targetPath);
         this.setUserState(userId, recentForCwd?.sessionId ?? "", targetPath);
         await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${targetPath}`);
-        await this.sessionManager.switchWorkspace(userId, contextToken, targetPath, recentForCwd?.sessionId);
-        await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetPath}`);
+        try {
+          await this.sessionManager.switchWorkspace(userId, contextToken, targetPath, recentForCwd?.sessionId);
+          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetPath}`);
+        } catch (err) {
+          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+        }
         break;
       }
 
