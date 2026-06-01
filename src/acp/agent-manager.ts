@@ -64,6 +64,80 @@ export async function getMcpServers(cwd: string, log?: (msg: string) => void): P
 }
 
 /**
+ * Extract available modes + current mode id from a newSession/loadSession response's
+ * `configOptions`. OpenCode >= ~April 2026 (PR #21134) puts mode/model data in
+ * configOptions instead of the top-level `modes` field, per the ACP Session
+ * Config Options spec. See https://agentclientprotocol.com/protocol/session-config-options
+ *
+ * Returns null if no `mode` config option is present.
+ */
+export function extractModesFromConfigOptions(
+  configOptions: acp.SessionConfigOption[] | null | undefined,
+): { availableModes: acp.SessionMode[]; currentModeId: string | undefined } | null {
+  if (!configOptions) return null;
+  const modeOpt = configOptions.find(
+    (o) => o.id === "mode" || o.category === "mode",
+  );
+  if (!modeOpt || modeOpt.type !== "select") return null;
+
+  const availableModes: acp.SessionMode[] = [];
+  for (const item of modeOpt.options) {
+    if ("value" in item) {
+      availableModes.push({
+        id: item.value,
+        name: item.name,
+        description: item.description ?? undefined,
+      });
+    } else {
+      // SessionConfigSelectGroup — flatten nested options
+      for (const nested of item.options) {
+        availableModes.push({
+          id: nested.value,
+          name: nested.name,
+          description: nested.description ?? undefined,
+        });
+      }
+    }
+  }
+  return { availableModes, currentModeId: modeOpt.currentValue };
+}
+
+/**
+ * Extract available models + current model id from configOptions.
+ * Same rationale as extractModesFromConfigOptions — see ACP spec link there.
+ * Returns null if no `model` config option is present.
+ */
+export function extractModelsFromConfigOptions(
+  configOptions: acp.SessionConfigOption[] | null | undefined,
+): { availableModels: acp.ModelInfo[]; currentModelId: string | undefined } | null {
+  if (!configOptions) return null;
+  const modelOpt = configOptions.find(
+    (o) => o.id === "model" || o.category === "model",
+  );
+  if (!modelOpt || modelOpt.type !== "select") return null;
+
+  const availableModels: acp.ModelInfo[] = [];
+  for (const item of modelOpt.options) {
+    if ("value" in item) {
+      availableModels.push({
+        modelId: item.value,
+        name: item.name,
+        description: item.description ?? undefined,
+      });
+    } else {
+      for (const nested of item.options) {
+        availableModels.push({
+          modelId: nested.value,
+          name: nested.name,
+          description: nested.description ?? undefined,
+        });
+      }
+    }
+  }
+  return { availableModels, currentModelId: modelOpt.currentValue };
+}
+
+/**
  * Resolve the global opencode config path.
  * Priority: OPENCODE_CONFIG env > ~/.config/opencode/opencode.json
  */
@@ -213,10 +287,23 @@ export async function spawnAgent(params: {
       if (resumeResult.modes) {
         availableModes = resumeResult.modes.availableModes;
         currentModeId = resumeResult.modes.currentModeId;
+      } else {
+        // OpenCode 1.15+ puts mode data in configOptions (per ACP spec)
+        const fromConfig = extractModesFromConfigOptions(resumeResult.configOptions);
+        if (fromConfig) {
+          availableModes = fromConfig.availableModes;
+          currentModeId = fromConfig.currentModeId;
+        }
       }
       if (resumeResult.models) {
         availableModels = resumeResult.models.availableModels;
         sessionModelId = resumeResult.models.currentModelId;
+      } else {
+        const fromConfig = extractModelsFromConfigOptions(resumeResult.configOptions);
+        if (fromConfig) {
+          availableModels = fromConfig.availableModels;
+          sessionModelId = fromConfig.currentModelId;
+        }
       }
       if (resumeResult.configOptions) {
         configOptions = resumeResult.configOptions;
@@ -233,10 +320,23 @@ export async function spawnAgent(params: {
       if (newResult.modes) {
         availableModes = newResult.modes.availableModes;
         currentModeId = newResult.modes.currentModeId;
+      } else {
+        // OpenCode 1.15+ puts mode data in configOptions (per ACP spec)
+        const fromConfig = extractModesFromConfigOptions(newResult.configOptions);
+        if (fromConfig) {
+          availableModes = fromConfig.availableModes;
+          currentModeId = fromConfig.currentModeId;
+        }
       }
       if (newResult.models) {
         availableModels = newResult.models.availableModels;
         sessionModelId = newResult.models.currentModelId;
+      } else {
+        const fromConfig = extractModelsFromConfigOptions(newResult.configOptions);
+        if (fromConfig) {
+          availableModels = fromConfig.availableModels;
+          sessionModelId = fromConfig.currentModelId;
+        }
       }
       if (newResult.configOptions) {
         configOptions = newResult.configOptions;
@@ -254,10 +354,23 @@ export async function spawnAgent(params: {
     if (newResult.modes) {
       availableModes = newResult.modes.availableModes;
       currentModeId = newResult.modes.currentModeId;
+    } else {
+      // OpenCode 1.15+ puts mode data in configOptions (per ACP spec)
+      const fromConfig = extractModesFromConfigOptions(newResult.configOptions);
+      if (fromConfig) {
+        availableModes = fromConfig.availableModes;
+        currentModeId = fromConfig.currentModeId;
+      }
     }
     if (newResult.models) {
       availableModels = newResult.models.availableModels;
       sessionModelId = newResult.models.currentModelId;
+    } else {
+      const fromConfig = extractModelsFromConfigOptions(newResult.configOptions);
+      if (fromConfig) {
+        availableModels = fromConfig.availableModels;
+        sessionModelId = fromConfig.currentModelId;
+      }
     }
     if (newResult.configOptions) {
       configOptions = newResult.configOptions;

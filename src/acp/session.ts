@@ -9,7 +9,7 @@
 import type { ChildProcess } from "node:child_process";
 import type * as acp from "@agentclientprotocol/sdk";
 import { WeChatAcpClient, type MediaContent } from "./client.js";
-import { spawnAgent, killAgent, getMcpServers, type AgentCapabilities } from "./agent-manager.js";
+import { spawnAgent, killAgent, getMcpServers, extractModesFromConfigOptions, extractModelsFromConfigOptions, type AgentCapabilities } from "./agent-manager.js";
 
 /**
  * OpenCode encodes reasoning level as a suffix in the model ID.
@@ -188,10 +188,23 @@ export class SessionManager {
     if (result.modes) {
       session.availableModes = result.modes.availableModes;
       session.currentMode = result.modes.currentModeId;
+    } else {
+      // OpenCode 1.15+ puts mode data in configOptions (per ACP spec)
+      const fromConfig = extractModesFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModes = fromConfig.availableModes;
+        session.currentMode = fromConfig.currentModeId;
+      }
     }
     if (result.models) {
       session.availableModels = result.models.availableModels;
       session.currentModelId = result.models.currentModelId;
+    } else {
+      const fromConfig = extractModelsFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModels = fromConfig.availableModels;
+        session.currentModelId = fromConfig.currentModelId;
+      }
     }
     if (result.configOptions) {
       session.configOptions = result.configOptions;
@@ -305,9 +318,23 @@ export class SessionManager {
     // Preserve availableModes/availableModels/configOptions from the response
     if (result.modes) {
       session.availableModes = result.modes.availableModes;
+    } else {
+      // OpenCode 1.15+ puts mode data in configOptions (per ACP spec).
+      // Only update the list, NOT session.currentMode — the previously
+      // selected mode is restored right after via setSessionMode.
+      const fromConfig = extractModesFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModes = fromConfig.availableModes;
+      }
     }
     if (result.models) {
       session.availableModels = result.models.availableModels;
+    } else {
+      // Same as above — only update the list, NOT currentModelId.
+      const fromConfig = extractModelsFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModels = fromConfig.availableModels;
+      }
     }
     if (result.configOptions) {
       session.configOptions = result.configOptions;
@@ -472,6 +499,30 @@ export class SessionManager {
 
     session.currentModelId = modelId;
     session.lastActivity = Date.now();
+
+    // Refresh configOptions after model switch — OpenCode may change the
+    // available config options (e.g. effort/thought_level) when the model
+    // changes.  Calling setSessionConfigOption with the new model forces
+    // OpenCode to return a complete, up-to-date configOptions.
+    try {
+      const modelOpt = session.configOptions?.find(
+        (o) => o.id === "model" || o.category === "model",
+      );
+      if (modelOpt?.type === "select") {
+        const result = await session.connection.setSessionConfigOption({
+          sessionId: session.activeSessionId,
+          configId: modelOpt.id,
+          type: "select",
+          value: modelId,
+        });
+        if (result.configOptions) {
+          session.configOptions = result.configOptions;
+          this.opts.log(`[${userId}] ConfigOptions refreshed after model switch: ${result.configOptions.map((o: any) => o.id).join(", ")}`);
+        }
+      }
+    } catch {
+      // best-effort
+    }
   }
 
   /**
@@ -525,19 +576,18 @@ export class SessionManager {
     const { base: currentBase } = splitModelId(currentModelId);
     const targetModelId = `${currentBase}/${level}`;
 
-    // Verify target model exists among options (including nested groups)
-    const exists = modelOpt.options.some((item) => {
-      if ("value" in item) return item.value === targetModelId;
-      return item.options.some((o) => o.value === targetModelId);
-    });
-    if (!exists) {
-      throw new Error(`Reasoning level "${level}" not available for current model`);
+    // OpenCode accepts suffixed model IDs (e.g. "model/low") even when they
+    // are NOT listed in the available model options. So we skip the exists
+    // check and call unstable_setSessionModel directly — if OpenCode rejects
+    // it, the call will throw and the error propagates to the user.
+    try {
+      await session.connection.unstable_setSessionModel({
+        sessionId: session.activeSessionId,
+        modelId: targetModelId,
+      });
+    } catch (err) {
+      throw new Error(`Reasoning level "${level}" not available for current model: ${String(err)}`);
     }
-
-    await session.connection.unstable_setSessionModel({
-      sessionId: session.activeSessionId,
-      modelId: targetModelId,
-    });
 
     session.currentModelId = targetModelId;
     session.currentThoughtLevel = level;
@@ -947,10 +997,6 @@ export class SessionManager {
 
   /** Warm-up delay for freshly spawned agents before first prompt. */
   private static readonly AGENT_WARMUP_MS = 2000;
-  /** Maximum time to wait for a single prompt before rejecting. */
-  private static readonly PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
-  /** Maximum time to wait for client.flush() before rejecting. */
-  private static readonly FLUSH_TIMEOUT_MS = 30_000;
 
   private async processQueue(session: UserSession): Promise<void> {
     try {
@@ -980,21 +1026,10 @@ export class SessionManager {
           this.opts.sendTyping(session.userId, pending.contextToken).catch(() => {});
 
           this.opts.log(`[${session.userId}] Sending prompt to agent...`);
-          let promptTimeout: ReturnType<typeof setTimeout> | undefined;
-          const result = await Promise.race([
-            session.connection.prompt({
-              sessionId: session.activeSessionId,
-              prompt: pending.prompt,
-            }),
-            new Promise<never>((_, reject) => {
-              promptTimeout = setTimeout(() => {
-                // Send ACP cancel when timeout fires
-                session.connection.cancel({ sessionId: session.activeSessionId }).catch(() => {});
-                reject(new Error(`Prompt timed out after ${SessionManager.PROMPT_TIMEOUT_MS / 60000}min`));
-              }, SessionManager.PROMPT_TIMEOUT_MS);
-            }),
-          ]);
-          if (promptTimeout) clearTimeout(promptTimeout);
+          const result = await session.connection.prompt({
+            sessionId: session.activeSessionId,
+            prompt: pending.prompt,
+          });
 
           // Capture usage from prompt response
           if (result.usage) {
@@ -1003,33 +1038,14 @@ export class SessionManager {
             this.opts.log(`[${session.userId}] Usage: totalTokens=${result.usage.totalTokens}`);
           }
 
-          let flushTimeout: ReturnType<typeof setTimeout> | undefined;
-          let replyText = await Promise.race([
-            session.client.flush(),
-            new Promise<string>((_, reject) => {
-              flushTimeout = setTimeout(() => {
-                // Send ACP cancel when flush timeout fires
-                session.connection.cancel({ sessionId: session.activeSessionId }).catch(() => {});
-                reject(new Error("Flush timed out after 30s"));
-              }, SessionManager.FLUSH_TIMEOUT_MS);
-            }),
-          ]);
-          if (flushTimeout) clearTimeout(flushTimeout);
+          let replyText = await session.client.flush();
 
           // Poll for trailing chunks that arrive after end_turn.
           // Continue until no new content arrives for 1.5s (silence threshold).
           let silenceCount = 0;
           for (let i = 0; i < 30; i++) {
             await new Promise((r) => setTimeout(r, 400));
-            const trailing = await Promise.race([
-              session.client.flush(),
-              new Promise<string>((_, reject) =>
-                setTimeout(
-                  () => reject(new Error("Flush timed out after 30s")),
-                  SessionManager.FLUSH_TIMEOUT_MS,
-                ),
-              ),
-            ]);
+            const trailing = await session.client.flush();
             if (trailing.trim()) {
               replyText = replyText ? `${replyText}${trailing}` : trailing;
               silenceCount = 0;
