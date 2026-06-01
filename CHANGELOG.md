@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-01
+
+### Added
+- ACP configOptions fallback for OpenCode 1.15+（从 `configOptions` 提取 mode/model 信息）
+- 切换工作区/会话前检查目录是否存在，不存在时提示用户删除或创建
+
+### Changed
+- `/workspace list` 标题从 `Directories` 改为 `Workspaces`
+- 移除了 prompt/flush timeout（5 分钟 prompt 超时和 30 秒 flush 超时）
+
+### Fixed
+- `/stop` 后切换工作区报 `ENOENT` 的问题（spawn 失败的错误现在会正确抛出）
+- `/stop` 后工作区切换失败不会回滚用户状态的问题
+- 工作区/会话切换失败时微信端无错误提示的问题（添加 try-catch 和错误消息）
+
 ## [0.3.3] - 2026-05-26
 
 ### Fixed
