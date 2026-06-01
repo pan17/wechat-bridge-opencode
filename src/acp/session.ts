@@ -7,9 +7,10 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import fs from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 import { WeChatAcpClient, type MediaContent } from "./client.js";
-import { spawnAgent, killAgent, type AgentCapabilities } from "./agent-manager.js";
+import { spawnAgent, killAgent, getMcpServers, extractModesFromConfigOptions, extractModelsFromConfigOptions, type AgentCapabilities } from "./agent-manager.js";
 
 /**
  * OpenCode encodes reasoning level as a suffix in the model ID.
@@ -63,6 +64,8 @@ export interface UserSession {
   contextWindowSize?: number;
   queue: PendingMessage[];
   processing: boolean;
+  /** Set when user sends /stop — suppresses all further output to WeChat */
+  cancelled: boolean;
   lastActivity: number;
   createdAt: number;
   ready: boolean;
@@ -98,6 +101,12 @@ export class SessionManager {
 
   constructor(opts: SessionManagerOpts) {
     this.opts = opts;
+  }
+
+  /** Returns resolved promise if cancelled, otherwise calls fn. */
+  private ifCancelled(session: UserSession, fn: () => Promise<void>): Promise<void> {
+    if (session.cancelled) return Promise.resolve();
+    return fn();
   }
 
   start(): void {
@@ -180,10 +189,23 @@ export class SessionManager {
     if (result.modes) {
       session.availableModes = result.modes.availableModes;
       session.currentMode = result.modes.currentModeId;
+    } else {
+      // OpenCode 1.15+ puts mode data in configOptions (per ACP spec)
+      const fromConfig = extractModesFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModes = fromConfig.availableModes;
+        session.currentMode = fromConfig.currentModeId;
+      }
     }
     if (result.models) {
       session.availableModels = result.models.availableModels;
       session.currentModelId = result.models.currentModelId;
+    } else {
+      const fromConfig = extractModelsFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModels = fromConfig.availableModels;
+        session.currentModelId = fromConfig.currentModelId;
+      }
     }
     if (result.configOptions) {
       session.configOptions = result.configOptions;
@@ -196,26 +218,31 @@ export class SessionManager {
    * NO kill/respawn of the agent process.
    */
   async switchWorkspace(userId: string, contextToken: string, cwd: string, existingSessionId?: string): Promise<void> {
+    // Check if directory exists before switching
+    if (!fs.existsSync(cwd)) {
+      throw new Error(`Working directory does not exist: ${cwd}`);
+    }
+
     const { session } = await this.getOrCreateSession(userId, contextToken);
 
     if (existingSessionId) {
       // Load existing session for this cwd
       this.opts.log(`[${userId}] Loading session ${existingSessionId} for workspace switch (cwd: ${cwd})`);
-        session.client.setReplaying(true);
-        try {
-          const loadResult = await session.connection.loadSession({
-            sessionId: existingSessionId,
-            cwd,
-            mcpServers: [],
-          });
-          session.activeSessionId = existingSessionId;
-          this.applyLoadSessionState(session, loadResult);
-          if (!session.sessions.has(existingSessionId)) {
-            session.sessions.set(existingSessionId, { cwd });
-          }
-        } finally {
-          session.client.setReplaying(false);
+      session.client.setReplaying(true);
+      try {
+        const loadResult = await session.connection.loadSession({
+          sessionId: existingSessionId,
+          cwd,
+          mcpServers: await getMcpServers(cwd),
+        });
+        session.activeSessionId = existingSessionId;
+        this.applyLoadSessionState(session, loadResult);
+        if (!session.sessions.has(existingSessionId)) {
+          session.sessions.set(existingSessionId, { cwd });
         }
+      } finally {
+        session.client.setReplaying(false);
+      }
     } else {
       // No existing session — create new one
       this.opts.log(`[${userId}] Creating new session for workspace switch (cwd: ${cwd})`);
@@ -237,6 +264,11 @@ export class SessionManager {
    * Switch to an existing ACP session, replaying its conversation history.
    */
   async switchSession(userId: string, contextToken: string, sessionId: string, cwd: string): Promise<void> {
+    // Check if directory exists before switching
+    if (!fs.existsSync(cwd)) {
+      throw new Error(`Working directory does not exist: ${cwd}`);
+    }
+
     const { session } = await this.getOrCreateSession(userId, contextToken);
 
     this.opts.log(`[${userId}] Loading session ${sessionId} (cwd: ${cwd})`);
@@ -297,9 +329,23 @@ export class SessionManager {
     // Preserve availableModes/availableModels/configOptions from the response
     if (result.modes) {
       session.availableModes = result.modes.availableModes;
+    } else {
+      // OpenCode 1.15+ puts mode data in configOptions (per ACP spec).
+      // Only update the list, NOT session.currentMode — the previously
+      // selected mode is restored right after via setSessionMode.
+      const fromConfig = extractModesFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModes = fromConfig.availableModes;
+      }
     }
     if (result.models) {
       session.availableModels = result.models.availableModels;
+    } else {
+      // Same as above — only update the list, NOT currentModelId.
+      const fromConfig = extractModelsFromConfigOptions(result.configOptions);
+      if (fromConfig) {
+        session.availableModels = fromConfig.availableModels;
+      }
     }
     if (result.configOptions) {
       session.configOptions = result.configOptions;
@@ -464,6 +510,30 @@ export class SessionManager {
 
     session.currentModelId = modelId;
     session.lastActivity = Date.now();
+
+    // Refresh configOptions after model switch — OpenCode may change the
+    // available config options (e.g. effort/thought_level) when the model
+    // changes.  Calling setSessionConfigOption with the new model forces
+    // OpenCode to return a complete, up-to-date configOptions.
+    try {
+      const modelOpt = session.configOptions?.find(
+        (o) => o.id === "model" || o.category === "model",
+      );
+      if (modelOpt?.type === "select") {
+        const result = await session.connection.setSessionConfigOption({
+          sessionId: session.activeSessionId,
+          configId: modelOpt.id,
+          type: "select",
+          value: modelId,
+        });
+        if (result.configOptions) {
+          session.configOptions = result.configOptions;
+          this.opts.log(`[${userId}] ConfigOptions refreshed after model switch: ${result.configOptions.map((o: any) => o.id).join(", ")}`);
+        }
+      }
+    } catch {
+      // best-effort
+    }
   }
 
   /**
@@ -517,19 +587,18 @@ export class SessionManager {
     const { base: currentBase } = splitModelId(currentModelId);
     const targetModelId = `${currentBase}/${level}`;
 
-    // Verify target model exists among options (including nested groups)
-    const exists = modelOpt.options.some((item) => {
-      if ("value" in item) return item.value === targetModelId;
-      return item.options.some((o) => o.value === targetModelId);
-    });
-    if (!exists) {
-      throw new Error(`Reasoning level "${level}" not available for current model`);
+    // OpenCode accepts suffixed model IDs (e.g. "model/low") even when they
+    // are NOT listed in the available model options. So we skip the exists
+    // check and call unstable_setSessionModel directly — if OpenCode rejects
+    // it, the call will throw and the error propagates to the user.
+    try {
+      await session.connection.unstable_setSessionModel({
+        sessionId: session.activeSessionId,
+        modelId: targetModelId,
+      });
+    } catch (err) {
+      throw new Error(`Reasoning level "${level}" not available for current model: ${String(err)}`);
     }
-
-    await session.connection.unstable_setSessionModel({
-      sessionId: session.activeSessionId,
-      modelId: targetModelId,
-    });
 
     session.currentModelId = targetModelId;
     session.currentThoughtLevel = level;
@@ -711,8 +780,9 @@ export class SessionManager {
   }
 
   /**
-   * Cancel the ongoing prompt turn for a user using ACP session/cancel.
-   * This sends a notification to the agent to stop as soon as possible.
+   * Cancel the ongoing prompt and forcefully stop all output.
+   * Sends ACP cancel, then force-kills agent process after a short grace period.
+   * Also sets cancelled flag to suppress any in-flight messages.
    */
   async cancelPrompt(userId: string): Promise<void> {
     const session = this.sessions.get(userId);
@@ -721,8 +791,22 @@ export class SessionManager {
       return;
     }
 
+    session.cancelled = true;
     this.opts.log(`[${userId}] Cancelling prompt for session ${session.activeSessionId}`);
-    await session.connection.cancel({ sessionId: session.activeSessionId });
+
+    try {
+      await session.connection.cancel({ sessionId: session.activeSessionId });
+    } catch {
+      // Cancel may fail if connection is hung
+    }
+
+    setTimeout(() => {
+      if (session.processing) {
+        this.opts.log(`[${userId}] Force-killing agent after cancel`);
+        killAgent(session.process);
+        this.sessions.delete(userId);
+      }
+    }, 5_000).unref();
   }
 
   /**
@@ -909,6 +993,7 @@ export class SessionManager {
       sessions: new Map([[agentInfo.sessionId, { cwd }]]),
       queue: [],
       processing: false,
+      cancelled: false,
       lastActivity: Date.now(),
       createdAt: Date.now(),
       ready: true,
@@ -929,6 +1014,9 @@ export class SessionManager {
       while (session.queue.length > 0 && !this.aborted) {
         const pending = session.queue.shift()!;
 
+        // Reset cancelled flag at the start of each message processing
+        session.cancelled = false;
+
         // If agent was just spawned, give it a moment to fully initialize
         if (Date.now() - session.createdAt < SessionManager.AGENT_WARMUP_MS) {
           const delay = SessionManager.AGENT_WARMUP_MS - (Date.now() - session.createdAt);
@@ -937,10 +1025,10 @@ export class SessionManager {
         }
 
         session.client.updateCallbacks({
-          sendTyping: () => this.opts.sendTyping(session.userId, pending.contextToken),
-          onThoughtFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
-          onMediaFlush: (blocks) => this.opts.onMediaReply(session.userId, pending.contextToken, blocks),
-          onDelayedFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
+          sendTyping: () => this.ifCancelled(session, () => this.opts.sendTyping(session.userId, pending.contextToken)),
+          onThoughtFlush: (text) => this.ifCancelled(session, () => this.opts.onReply(session.userId, pending.contextToken, text)),
+          onMediaFlush: (blocks) => this.ifCancelled(session, () => this.opts.onMediaReply(session.userId, pending.contextToken, blocks)),
+          onDelayedFlush: (text) => this.ifCancelled(session, () => this.opts.onReply(session.userId, pending.contextToken, text)),
         });
 
         await session.client.flush();
@@ -992,7 +1080,7 @@ export class SessionManager {
             replyText += `\n\n${pending.hint}`;
           }
 
-          if (replyText.trim()) {
+          if (replyText.trim() && !session.cancelled) {
             await this.opts.onReply(session.userId, pending.contextToken, replyText);
           }
         } catch (err) {
@@ -1004,14 +1092,16 @@ export class SessionManager {
             return;
           }
 
-          try {
-            await this.opts.onReply(
-              session.userId,
-              pending.contextToken,
-              `⚠️ Agent error: ${String(err)}`,
-            );
-          } catch {
-            // best effort
+          if (!session.cancelled) {
+            try {
+              await this.opts.onReply(
+                session.userId,
+                pending.contextToken,
+                `⚠️ Agent error: ${String(err)}`,
+              );
+            } catch {
+              // best effort
+            }
           }
         }
       }

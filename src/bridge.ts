@@ -448,9 +448,9 @@ export class WeChatOpencodeBridge {
           if (!dirs.includes(s.cwd)) dirs.push(s.cwd);
         }
         if (dirs.length === 0) {
-          await this.sendReply(userId, contextToken, "No directories found.");
+          await this.sendReply(userId, contextToken, "No workspaces found.");
         } else {
-          const lines = ["📂 Directories:"];
+          const lines = ["📂 Workspaces:"];
           for (let i = 0; i < dirs.length; i++) {
             lines.push(`  ${i + 1}. ${dirs[i]}`);
           }
@@ -482,12 +482,21 @@ export class WeChatOpencodeBridge {
             await this.sendReply(userId, contextToken, `Already on ${targetDir}`);
             return;
           }
+          // Check if directory exists
+          if (!fs.existsSync(targetDir)) {
+            await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${targetDir}\nPlease remove this workspace or create the directory.`);
+            return;
+          }
           // Find most recent session for this cwd
           const recentForCwd = sessions.find((s) => s.cwd === targetDir);
           this.setUserState(userId, recentForCwd?.sessionId ?? "", targetDir);
           await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${targetDir}`);
-          await this.sessionManager.switchWorkspace(userId, contextToken, targetDir, recentForCwd?.sessionId);
-          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetDir}`);
+          try {
+            await this.sessionManager.switchWorkspace(userId, contextToken, targetDir, recentForCwd?.sessionId);
+            await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetDir}`);
+          } catch (err) {
+            await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+          }
           return;
         }
 
@@ -502,12 +511,21 @@ export class WeChatOpencodeBridge {
           await this.sendReply(userId, contextToken, `Already on ${target.cwd}`);
           return;
         }
+        // Check if directory exists
+        if (!fs.existsSync(target.cwd)) {
+          await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${target.cwd}\nPlease remove this workspace or create the directory.`);
+          return;
+        }
         // Find most recent session for this cwd
         const recentForCwd = sessions.find((s) => s.cwd === target.cwd);
         this.setUserState(userId, recentForCwd?.sessionId ?? "", target.cwd);
         await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${target.cwd}`);
-        await this.sessionManager.switchWorkspace(userId, contextToken, target.cwd, recentForCwd?.sessionId);
-        await this.sendReply(userId, contextToken, `✅ Ready on\n  ${target.cwd}`);
+        try {
+          await this.sessionManager.switchWorkspace(userId, contextToken, target.cwd, recentForCwd?.sessionId);
+          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${target.cwd}`);
+        } catch (err) {
+          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+        }
         break;
       }
 
@@ -530,8 +548,12 @@ export class WeChatOpencodeBridge {
         const recentForCwd = allSessions.find((s) => s.cwd === targetPath);
         this.setUserState(userId, recentForCwd?.sessionId ?? "", targetPath);
         await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${targetPath}`);
-        await this.sessionManager.switchWorkspace(userId, contextToken, targetPath, recentForCwd?.sessionId);
-        await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetPath}`);
+        try {
+          await this.sessionManager.switchWorkspace(userId, contextToken, targetPath, recentForCwd?.sessionId);
+          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetPath}`);
+        } catch (err) {
+          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+        }
         break;
       }
 
@@ -601,10 +623,19 @@ export class WeChatOpencodeBridge {
         const idx = parseInt(cmd!.name!, 10);
         if (!isNaN(idx) && idx >= 1 && idx <= displaySessions.length) {
           const target = displaySessions[idx - 1];
+          // Check if directory exists before updating state
+          if (!fs.existsSync(target.cwd)) {
+            await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${target.cwd}\nPlease remove this workspace or create the directory.`);
+            return;
+          }
           this.setUserState(userId, target.sessionId, target.cwd);
           await this.sendReply(userId, contextToken, `🔄 Switching to "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
-          await this.sessionManager.switchSession(userId, contextToken, target.sessionId, target.cwd);
-          await this.sendReply(userId, contextToken, `✅ Ready on "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
+          try {
+            await this.sessionManager.switchSession(userId, contextToken, target.sessionId, target.cwd);
+            await this.sendReply(userId, contextToken, `✅ Ready on "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
+          } catch (err) {
+            await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+          }
           return;
         }
 
@@ -617,10 +648,19 @@ export class WeChatOpencodeBridge {
           return;
         }
 
+        // Check if directory exists before updating state
+        if (!fs.existsSync(target.cwd)) {
+          await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${target.cwd}\nPlease remove this workspace or create the directory.`);
+          return;
+        }
         this.setUserState(userId, target.sessionId, target.cwd);
         await this.sendReply(userId, contextToken, `🔄 Switching to "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
-        await this.sessionManager.switchSession(userId, contextToken, target.sessionId, target.cwd);
-        await this.sendReply(userId, contextToken, `✅ Ready on "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
+        try {
+          await this.sessionManager.switchSession(userId, contextToken, target.sessionId, target.cwd);
+          await this.sendReply(userId, contextToken, `✅ Ready on "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
+        } catch (err) {
+          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+        }
         break;
       }
 
