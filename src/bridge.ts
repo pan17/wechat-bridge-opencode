@@ -47,6 +47,13 @@ const TEXT_CHUNK_LIMIT = 4000;
 const TOOL_API_PORT = 18792;
 const TOOL_API_HOST = "127.0.0.1";
 
+/** A message cached when WeChat 10-msg limit is reached, flushed on /next. */
+type PendingMessage =
+  | { kind: "text"; text: string; contextToken: string }
+  | { kind: "media"; block: MediaContent; contextToken: string }
+  | { kind: "tool_text"; text: string; contextToken: string }
+  | { kind: "tool_file"; filePath: string; fileName: string; mimeType?: string; contextToken: string };
+
 interface UserState {
   userId: string;
   sessionId: string;       // OpenCode session ID (for resume)
@@ -64,6 +71,12 @@ export class WeChatOpencodeBridge {
   private userStates = new Map<string, UserState>();
   private typingTickets = new Map<string, { ticket: string; expiresAt: number }>();
   private toolApiServer: http.Server | null = null;
+  /** Per-user WeChat message count since last user reply (for 10-msg gateway limit). */
+  private wechatMsgCount = new Map<string, number>();
+  /** Messages cached when 10-msg limit reached, flushed on /next. */
+  private pendingOutbound = new Map<string, PendingMessage[]>();
+  private static readonly MSG_LIMIT_WARN = 7;
+  private static readonly MSG_LIMIT_MAX = 10;
   private log: (msg: string) => void;
 
   constructor(config: WeChatOpencodeConfig, log?: (msg: string) => void) {
@@ -266,33 +279,58 @@ export class WeChatOpencodeBridge {
         if (text) {
           const segments = splitText(text, TEXT_CHUNK_LIMIT);
           for (const segment of segments) {
-            await sendTextMessage(targetUserId, segment, {
+            const sent = this.wechatMsgCount.get(targetUserId) ?? 0;
+            if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+              this.log(`[tool-api] WeChat 10-msg limit reached (sent=${sent}), caching remaining text segments`);
+              const remaining = segments.slice(segments.indexOf(segment));
+              const cached: PendingMessage[] = remaining.map((s) => ({ kind: "tool_text", text: s, contextToken }));
+              const existing = this.pendingOutbound.get(targetUserId) ?? [];
+              this.pendingOutbound.set(targetUserId, [...existing, ...cached]);
+              break;
+            }
+            // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
+            this.wechatMsgCount.set(targetUserId, sent + 1);
+            let payload = segment;
+            if (sent >= WeChatOpencodeBridge.MSG_LIMIT_WARN) {
+              payload += `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${sent + 1} 条），发送 /next 可重置`;
+            }
+            await sendTextMessage(targetUserId, payload, {
               baseUrl: this.tokenData!.baseUrl,
               token: this.tokenData!.token,
               contextToken,
             });
           }
           results.push("text");
-          this.log(`[tool-api] Sent text (${text.length} chars) to user ${targetUserId}`);
+          this.log(`[tool-api] Sent text (${text.length} chars) to user ${targetUserId} (sent=${this.wechatMsgCount.get(targetUserId) ?? 0})`);
         }
 
         // Send file if provided
         if (filePath) {
-          const fileBuffer = await fs.promises.readFile(filePath);
-          const fileName = path.basename(filePath);
-          const detectedMimeType = mimeType ?? this.guessMimeType(fileName);
+          const sent = this.wechatMsgCount.get(targetUserId) ?? 0;
+          if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+            this.log(`[tool-api] WeChat 10-msg limit reached (sent=${sent}), caching file`);
+            const fName = path.basename(filePath);
+            const cached: PendingMessage = { kind: "tool_file", filePath, fileName: fName, mimeType, contextToken };
+            const existing = this.pendingOutbound.get(targetUserId) ?? [];
+            this.pendingOutbound.set(targetUserId, [...existing, cached]);
+          } else {
+            // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
+            this.wechatMsgCount.set(targetUserId, sent + 1);
+            const fileBuffer = await fs.promises.readFile(filePath);
+            const fileName = path.basename(filePath);
+            const detectedMimeType = mimeType ?? this.guessMimeType(fileName);
 
-          await sendMediaMessage(targetUserId, detectedMimeType.startsWith("image/") ? UploadMediaType.IMAGE : UploadMediaType.FILE, fileBuffer, {
-            baseUrl: this.tokenData!.baseUrl,
-            token: this.tokenData!.token,
-            contextToken,
-            cdnBaseUrl: this.config.wechat.cdnBaseUrl,
-            mimeType: detectedMimeType,
-            fileName,
-          });
-
-          results.push("file");
-          this.log(`[tool-api] Sent file ${fileName} to user ${targetUserId}`);
+            await sendMediaMessage(targetUserId, detectedMimeType.startsWith("image/") ? UploadMediaType.IMAGE : UploadMediaType.FILE, fileBuffer, {
+              baseUrl: this.tokenData!.baseUrl,
+              token: this.tokenData!.token,
+              contextToken,
+              cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+              mimeType: detectedMimeType,
+              fileName,
+            });
+            results.push("file");
+            this.log(`[tool-api] Sent file ${fileName} to user ${targetUserId} (sent=${this.wechatMsgCount.get(targetUserId) ?? 0})`);
+          }
         }
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -334,6 +372,17 @@ export class WeChatOpencodeBridge {
     const userId = msg.from_user_id;
     const contextToken = msg.context_token;
     if (!userId || !contextToken) return;
+
+    // User reply resets the WeChat 10-message gateway limit
+    this.wechatMsgCount.set(userId, 0);
+
+    // Auto-flush pending cache on any user message (Plan A: cache priority)
+    const pending = this.pendingOutbound.get(userId);
+    if (pending && pending.length > 0 && !/^\/next\b/.test(this.extractTextFromMessage(msg)?.trim() ?? "")) {
+      this.flushPending(userId, contextToken).catch((err) => {
+        this.log(`[${userId}] auto-flush error: ${String(err)}`);
+      });
+    }
 
     this.log(`Message from ${userId}: ${this.previewMessage(msg)}`);
 
@@ -420,6 +469,14 @@ export class WeChatOpencodeBridge {
       if (upgradeCmd) {
         this.handleUpgradeCommand(userId, contextToken, upgradeCmd).catch((err) => {
           this.log(`Upgrade command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      // /next — flush cached messages, do NOT forward to agent
+      if (/^\/next\b/.test(textContent.trim())) {
+        this.flushPending(userId, contextToken).catch((err) => {
+          this.log(`[${userId}] /next error: ${String(err)}`);
         });
         return;
       }
@@ -1215,7 +1272,7 @@ export class WeChatOpencodeBridge {
     const cmdName = match[1].toLowerCase();
 
     // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status, thinking, stop, version, upgrade, restart
-    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking", "stop", "version", "upgrade", "restart"];
+    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking", "stop", "version", "upgrade", "restart", "next"];
     if (bridgeCommands.includes(cmdName)) return null;
 
     return `⚠️ 指令 "/${match[1]}" 不是 Bridge 内置指令，已转交 Agent 处理。`;
@@ -1244,21 +1301,162 @@ export class WeChatOpencodeBridge {
     await this.sessionManager!.enqueue(userId, { prompt, contextToken, hint });
   }
 
+  /** Flush cached outbound messages on /next. Respects the 10-msg limit; re-caches if exceeded. */
+  private async flushPending(userId: string, contextToken: string): Promise<void> {
+    const pending = this.pendingOutbound.get(userId);
+    if (!pending || pending.length === 0) {
+      await this.sendReply(userId, contextToken, "✅ 暂无缓存消息");
+      return;
+    }
+
+    this.wechatMsgCount.set(userId, 0);
+    this.log(`[${userId}] /next: flushing ${pending.length} cached messages`);
+
+    const remaining: PendingMessage[] = [];
+    let sent = 0;
+
+    for (const msg of pending) {
+      const count = this.wechatMsgCount.get(userId) ?? 0;
+      if (count >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+        remaining.push(msg);
+        continue;
+      }
+      this.wechatMsgCount.set(userId, count + 1);
+
+      try {
+        const text = msg.kind === "text" || msg.kind === "tool_text" ? msg.text : "";
+        const payload = text && count >= WeChatOpencodeBridge.MSG_LIMIT_WARN
+          ? text + `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${count + 1} 条），发送 /next 可重置`
+          : text;
+
+        switch (msg.kind) {
+          case "text":
+            await sendTextMessage(userId, payload || msg.text, {
+              baseUrl: this.tokenData!.baseUrl,
+              token: this.tokenData!.token,
+              contextToken,
+            });
+            break;
+          case "media":
+            if (msg.block.type === "image" && msg.block.data) {
+              await sendMediaMessage(userId, UploadMediaType.IMAGE, Buffer.from(msg.block.data, "base64"), {
+                baseUrl: this.tokenData!.baseUrl,
+                token: this.tokenData!.token,
+                contextToken,
+                cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+                mimeType: msg.block.mimeType ?? "image/jpeg",
+              });
+            } else if (msg.block.type === "resource" && msg.block.blob) {
+              const buf = Buffer.from(msg.block.blob, "base64");
+              const mime = msg.block.resourceMimeType ?? "application/octet-stream";
+              if (mime.startsWith("image/")) {
+                await sendMediaMessage(userId, UploadMediaType.IMAGE, buf, {
+                  baseUrl: this.tokenData!.baseUrl,
+                  token: this.tokenData!.token,
+                  contextToken,
+                  cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+                  mimeType: mime,
+                });
+              } else {
+                await sendMediaMessage(userId, UploadMediaType.FILE, buf, {
+                  baseUrl: this.tokenData!.baseUrl,
+                  token: this.tokenData!.token,
+                  contextToken,
+                  cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+                  mimeType: mime,
+                  fileName: msg.block.uri ? msg.block.uri.split("/").pop() : "file",
+                });
+              }
+            }
+            break;
+          case "tool_text":
+            await sendTextMessage(userId, payload || msg.text, {
+              baseUrl: this.tokenData!.baseUrl,
+              token: this.tokenData!.token,
+              contextToken,
+            });
+            break;
+          case "tool_file": {
+            const buf = await fs.promises.readFile(msg.filePath);
+            const mime = msg.mimeType ?? this.guessMimeType(msg.fileName);
+            await sendMediaMessage(userId, mime.startsWith("image/") ? UploadMediaType.IMAGE : UploadMediaType.FILE, buf, {
+              baseUrl: this.tokenData!.baseUrl,
+              token: this.tokenData!.token,
+              contextToken,
+              cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+              mimeType: mime,
+              fileName: msg.filePath.split(/[\\/]/).pop(),
+            });
+            break;
+          }
+        }
+        sent++;
+      } catch (err) {
+        this.log(`[${userId}] /next send error: ${String(err)}`);
+      }
+    }
+
+    if (remaining.length > 0) {
+      this.pendingOutbound.set(userId, remaining);
+      await this.sendReply(userId, contextToken, `✅ 已发 ${sent} 条，还有 ${remaining.length} 条缓存，再发 /next 继续`);
+    } else {
+      this.pendingOutbound.delete(userId);
+      await this.sendReply(userId, contextToken, `✅ 缓存消息已全部发送完毕（${sent} 条）`);
+    }
+  }
+
   private async sendReply(userId: string, contextToken: string, text: string): Promise<void> {
     const formatted = formatForWeChat(text);
     const segments = splitText(formatted, TEXT_CHUNK_LIMIT);
+
     for (const segment of segments) {
-      await sendTextMessage(userId, segment, {
+      const sent = this.wechatMsgCount.get(userId) ?? 0;
+
+      if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+        this.log(`[${userId}] WeChat 10-msg limit reached (sent=${sent}), caching remaining ${segments.length - segments.indexOf(segment)} segments`);
+        // Cache remaining segments and all future calls
+        const remaining = segments.slice(segments.indexOf(segment));
+        const cached: PendingMessage[] = remaining.map((s) => ({ kind: "text", text: s, contextToken }));
+        const existing = this.pendingOutbound.get(userId) ?? [];
+        this.pendingOutbound.set(userId, [...existing, ...cached]);
+        break;
+      }
+
+      // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
+      this.wechatMsgCount.set(userId, sent + 1);
+
+      let payload = segment;
+      if (sent >= WeChatOpencodeBridge.MSG_LIMIT_WARN) {
+        payload += `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${sent + 1} 条），发送 /next 可重置`;
+      }
+
+      await sendTextMessage(userId, payload, {
         baseUrl: this.tokenData!.baseUrl,
         token: this.tokenData!.token,
         contextToken,
       });
+      this.log(`[${userId}] Sent text (${payload.length} chars, sent=${this.wechatMsgCount.get(userId) ?? 0})`);
     }
+
     this.cancelTypingIndicator(userId, contextToken).catch(() => {});
   }
 
   private async sendMediaReply(userId: string, contextToken: string, blocks: MediaContent[]): Promise<void> {
     for (const block of blocks) {
+      const sent = this.wechatMsgCount.get(userId) ?? 0;
+      if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+        this.log(`[${userId}] WeChat 10-msg limit reached (sent=${sent}), caching remaining media`);
+        const remaining = blocks.slice(blocks.indexOf(block));
+        const cached: PendingMessage[] = remaining.map((b) => ({ kind: "media", block: b, contextToken }));
+        const existing = this.pendingOutbound.get(userId) ?? [];
+        this.pendingOutbound.set(userId, [...existing, ...cached]);
+        break;
+      }
+
+      // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
+      this.wechatMsgCount.set(userId, sent + 1);
+
+      const count = this.wechatMsgCount.get(userId) ?? 0;
       if (block.type === "image" && block.data) {
         await sendMediaMessage(userId, UploadMediaType.IMAGE, Buffer.from(block.data, "base64"), {
           baseUrl: this.tokenData!.baseUrl,
@@ -1267,6 +1465,7 @@ export class WeChatOpencodeBridge {
           cdnBaseUrl: this.config.wechat.cdnBaseUrl,
           mimeType: block.mimeType ?? "image/jpeg",
         });
+        this.log(`[${userId}] Sent image (sent=${count})`);
       } else if (block.type === "resource" && block.blob) {
         const buffer = Buffer.from(block.blob, "base64");
         const mimeType = block.resourceMimeType ?? "application/octet-stream";
@@ -1278,6 +1477,7 @@ export class WeChatOpencodeBridge {
             cdnBaseUrl: this.config.wechat.cdnBaseUrl,
             mimeType,
           });
+          this.log(`[${userId}] Sent image resource (sent=${count})`);
         } else {
           await sendMediaMessage(userId, UploadMediaType.FILE, buffer, {
             baseUrl: this.tokenData!.baseUrl,
@@ -1287,6 +1487,7 @@ export class WeChatOpencodeBridge {
             mimeType,
             fileName: block.uri ? block.uri.split("/").pop() : "file",
           });
+          this.log(`[${userId}] Sent file resource (sent=${count})`);
         }
       }
     }

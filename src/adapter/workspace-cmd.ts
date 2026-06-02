@@ -486,6 +486,9 @@ export function formatHelp(): string {
     "  /thinking off            关闭思考与工具显示",
     "  /thinking status         查看当前思考与工具显示设置",
     "",
+    "── 消息计数 ──",
+    "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
+    "",
     "  /help                    显示本帮助信息",
   ].join("\n");
 }
@@ -541,6 +544,9 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "  /thinking on             开启思考与工具显示（暂时禁用）",
     "  /thinking off            关闭思考与工具显示",
     "  /thinking status         查看当前思考与工具显示设置",
+    "",
+    "── 消息计数 ──",
+    "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
     "",
     "── 帮助 ──",
     "  /help                    显示本帮助信息",
