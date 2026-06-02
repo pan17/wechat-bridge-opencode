@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-06-01
+
+### Fixed
+- OpenCode 1.15+ 中 MCP server 格式变更导致 ACP 会话创建失败的问题（`command` 从字符串变为数组，`environment` 替代 `env`）
+
 ## [0.3.4] - 2026-06-01
 
 ### Added

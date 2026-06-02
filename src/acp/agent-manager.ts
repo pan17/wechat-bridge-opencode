@@ -14,21 +14,28 @@ import type { WeChatAcpClient } from "./client.js";
 /** Raw MCP server entry from opencode.json (before normalization). */
 interface McpServerEntry {
   enabled?: boolean;
-  command?: string;
+  /** OpenCode internal type, e.g. "local" */
+  type?: string;
+  /** Command as array: ["npx", "arg1", "arg2", ...] */
+  command?: string | string[];
   args?: string[];
+  /** OpenCode uses "environment" key for env vars */
   env?: Record<string, unknown>;
+  /** OpenCode 1.15+ uses "environment" instead of "env" */
+  environment?: Record<string, unknown>;
 }
 
 export interface McpServerConfig {
   name: string;
   command: string;
   args: string[];
-  env?: { name: string; value: string }[];
+  env: { name: string; value: string }[];
 }
 
 /**
  * Read MCP server configurations from opencode.json.
  * Searches project-level then global config.
+ * Converts OpenCode's internal MCP format to ACP McpServer format.
  */
 export async function getMcpServers(cwd: string, log?: (msg: string) => void): Promise<McpServerConfig[]> {
   const configPaths = [
@@ -49,11 +56,29 @@ export async function getMcpServers(cwd: string, log?: (msg: string) => void): P
         const s = server as McpServerEntry;
         if (s.enabled === false) continue;
         if (!s.command) continue;
-        const config: McpServerConfig = { name, command: s.command, args: s.args || [] };
-        if (s.env) {
-          config.env = Object.entries(s.env).map(([name, value]) => ({ name, value: String(value) }));
+
+        // OpenCode stores command as array ["exe", "arg1", "arg2"]
+        // ACP expects command: string, args: string[]
+        let command: string;
+        let args: string[];
+        if (Array.isArray(s.command)) {
+          command = s.command[0];
+          args = s.command.slice(1);
+        } else {
+          command = s.command;
+          args = s.args ?? [];
         }
-        servers.push(config);
+
+        // OpenCode uses "environment" key (1.15+) or "env" key
+        const envRaw = s.environment ?? s.env;
+        const env: { name: string; value: string }[] = [];
+        if (envRaw) {
+          for (const [k, v] of Object.entries(envRaw)) {
+            env.push({ name: k, value: String(v) });
+          }
+        }
+
+        servers.push({ name, command, args, env });
       }
       return servers;
     } catch (err) {

@@ -1,6 +1,6 @@
 {
   "name": "wechat-bridge-opencode",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Bridge WeChat to OpenCode",
   "type": "module",
   "files": [
