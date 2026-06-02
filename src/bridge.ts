@@ -211,13 +211,13 @@ export class WeChatOpencodeBridge {
       for await (const chunk of req) body += chunk;
 
       try {
-        const { sessionId, userId: directUserId, filePath, mimeType } = JSON.parse(body) as {
-          sessionId?: string; userId?: string; filePath: string; mimeType?: string;
+        const { sessionId, userId: directUserId, filePath, mimeType, text } = JSON.parse(body) as {
+          sessionId?: string; userId?: string; filePath?: string; mimeType?: string; text?: string;
         };
 
-        if (!filePath) {
+        if (!text && !filePath) {
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "filePath is required" }));
+          res.end(JSON.stringify({ error: "Either text or filePath is required" }));
           return;
         }
 
@@ -259,22 +259,43 @@ export class WeChatOpencodeBridge {
           return;
         }
 
-        const fileBuffer = await fs.promises.readFile(filePath);
-        const fileName = path.basename(filePath);
-        const detectedMimeType = mimeType ?? this.guessMimeType(fileName);
+        const results: string[] = [];
 
-        await sendMediaMessage(targetUserId, detectedMimeType.startsWith("image/") ? UploadMediaType.IMAGE : UploadMediaType.FILE, fileBuffer, {
-          baseUrl: this.tokenData!.baseUrl,
-          token: this.tokenData!.token,
-          contextToken,
-          cdnBaseUrl: this.config.wechat.cdnBaseUrl,
-          mimeType: detectedMimeType,
-          fileName,
-        });
+        // Send text if provided
+        if (text) {
+          const segments = splitText(text, TEXT_CHUNK_LIMIT);
+          for (const segment of segments) {
+            await sendTextMessage(targetUserId, segment, {
+              baseUrl: this.tokenData!.baseUrl,
+              token: this.tokenData!.token,
+              contextToken,
+            });
+          }
+          results.push("text");
+          this.log(`[tool-api] Sent text (${text.length} chars) to user ${targetUserId}`);
+        }
 
-        this.log(`[tool-api] Sent file ${fileName} to user ${targetUserId}`);
+        // Send file if provided
+        if (filePath) {
+          const fileBuffer = await fs.promises.readFile(filePath);
+          const fileName = path.basename(filePath);
+          const detectedMimeType = mimeType ?? this.guessMimeType(fileName);
+
+          await sendMediaMessage(targetUserId, detectedMimeType.startsWith("image/") ? UploadMediaType.IMAGE : UploadMediaType.FILE, fileBuffer, {
+            baseUrl: this.tokenData!.baseUrl,
+            token: this.tokenData!.token,
+            contextToken,
+            cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+            mimeType: detectedMimeType,
+            fileName,
+          });
+
+          results.push("file");
+          this.log(`[tool-api] Sent file ${fileName} to user ${targetUserId}`);
+        }
+
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, fileName }));
+        res.end(JSON.stringify({ success: true, sent: results }));
       } catch (err) {
         this.log(`[tool-api] Error: ${String(err)}`);
         res.writeHead(500, { "Content-Type": "application/json" });
