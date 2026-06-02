@@ -134,6 +134,12 @@ wbo --agent opencode
 | `/thinking off` | 关闭思考与工具调用显示 |
 | `/thinking status` | 查看当前显示设置 |
 
+### 消息计数（`/next`）
+
+| 命令 | 说明 |
+|------|------|
+| `/next` | 微信限制连续发送 10 条消息，超出后需用户回复才能继续。发送 `/next` 重置计数，不转发给 Agent |
+
 ## 环境要求
 
 - Node.js 20+
