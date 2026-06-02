@@ -320,7 +320,7 @@ export class WeChatOpencodeBridge {
             const fileName = path.basename(filePath);
             const detectedMimeType = mimeType ?? this.guessMimeType(fileName);
 
-            await sendMediaMessage(targetUserId, detectedMimeType.startsWith("image/") ? UploadMediaType.IMAGE : UploadMediaType.FILE, fileBuffer, {
+            await sendMediaMessage(targetUserId, this.mimeToMediaType(detectedMimeType), fileBuffer, {
               baseUrl: this.tokenData!.baseUrl,
               token: this.tokenData!.token,
               contextToken,
@@ -353,14 +353,51 @@ export class WeChatOpencodeBridge {
   private guessMimeType(fileName: string): string {
     const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
     const map: Record<string, string> = {
+      // Image
       png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
       gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
-      pdf: "application/pdf", zip: "application/zip",
+      bmp: "image/bmp", ico: "image/x-icon",
+      // Video
+      mp4: "video/mp4", mov: "video/quicktime", avi: "video/x-msvideo",
+      mkv: "video/x-matroska", webm: "video/webm", flv: "video/x-flv",
+      wmv: "video/x-ms-wmv", m4v: "video/mp4", "3gp": "video/3gpp",
+      // Audio
+      mp3: "audio/mpeg", wav: "audio/wav", aac: "audio/aac",
+      ogg: "audio/ogg", flac: "audio/flac", wma: "audio/x-ms-wma",
+      m4a: "audio/mp4", amr: "audio/amr", opus: "audio/opus",
+      // Document
+      pdf: "application/pdf", doc: "application/msword",
+      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      xls: "application/vnd.ms-excel",
+      xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      ppt: "application/vnd.ms-powerpoint",
+      pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      // Text / Code
       txt: "text/plain", md: "text/markdown", json: "application/json",
       js: "text/javascript", ts: "text/typescript", py: "text/x-python",
+      java: "text/x-java", go: "text/x-go", rs: "text/x-rust",
+      c: "text/x-c", cpp: "text/x-c++", h: "text/x-c",
+      cs: "text/x-csharp", php: "text/x-php", rb: "text/x-ruby",
+      swift: "text/x-swift", kt: "text/x-kotlin", scala: "text/x-scala",
       html: "text/html", css: "text/css", xml: "text/xml",
+      yaml: "text/yaml", yml: "text/yaml", toml: "text/toml",
+      ini: "text/plain", cfg: "text/plain", conf: "text/plain",
+      log: "text/plain", csv: "text/csv",
+      // Archive
+      zip: "application/zip", rar: "application/vnd.rar",
+      "7z": "application/x-7z-compressed", tar: "application/x-tar",
+      gz: "application/gzip", bz2: "application/x-bzip2",
     };
     return map[ext] ?? "application/octet-stream";
+  }
+
+  /** Map MIME type to WeChat upload media type.
+   *  NOTE: audio/* maps to FILE, not VOICE — iLink Bot API does not support
+   *  bot-sending native voice messages (VOICE is receive-only). */
+  private mimeToMediaType(mime: string): 1 | 2 | 3 | 4 {
+    if (mime.startsWith("image/")) return UploadMediaType.IMAGE;
+    if (mime.startsWith("video/")) return UploadMediaType.VIDEO;
+    return UploadMediaType.FILE;
   }
 
   // ─── Message handling ───
@@ -1349,24 +1386,16 @@ export class WeChatOpencodeBridge {
             } else if (msg.block.type === "resource" && msg.block.blob) {
               const buf = Buffer.from(msg.block.blob, "base64");
               const mime = msg.block.resourceMimeType ?? "application/octet-stream";
-              if (mime.startsWith("image/")) {
-                await sendMediaMessage(userId, UploadMediaType.IMAGE, buf, {
-                  baseUrl: this.tokenData!.baseUrl,
-                  token: this.tokenData!.token,
-                  contextToken,
-                  cdnBaseUrl: this.config.wechat.cdnBaseUrl,
-                  mimeType: mime,
-                });
-              } else {
-                await sendMediaMessage(userId, UploadMediaType.FILE, buf, {
-                  baseUrl: this.tokenData!.baseUrl,
-                  token: this.tokenData!.token,
-                  contextToken,
-                  cdnBaseUrl: this.config.wechat.cdnBaseUrl,
-                  mimeType: mime,
-                  fileName: msg.block.uri ? msg.block.uri.split("/").pop() : "file",
-                });
-              }
+              const mediaType = this.mimeToMediaType(mime);
+              const fileName = msg.block.uri ? msg.block.uri.split("/").pop() : "file";
+              await sendMediaMessage(userId, mediaType, buf, {
+                baseUrl: this.tokenData!.baseUrl,
+                token: this.tokenData!.token,
+                contextToken,
+                cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+                mimeType: mime,
+                fileName,
+              });
             }
             break;
           case "tool_text":
@@ -1379,7 +1408,7 @@ export class WeChatOpencodeBridge {
           case "tool_file": {
             const buf = await fs.promises.readFile(msg.filePath);
             const mime = msg.mimeType ?? this.guessMimeType(msg.fileName);
-            await sendMediaMessage(userId, mime.startsWith("image/") ? UploadMediaType.IMAGE : UploadMediaType.FILE, buf, {
+            await sendMediaMessage(userId, this.mimeToMediaType(mime), buf, {
               baseUrl: this.tokenData!.baseUrl,
               token: this.tokenData!.token,
               contextToken,
@@ -1467,28 +1496,20 @@ export class WeChatOpencodeBridge {
         });
         this.log(`[${userId}] Sent image (sent=${count})`);
       } else if (block.type === "resource" && block.blob) {
-        const buffer = Buffer.from(block.blob, "base64");
-        const mimeType = block.resourceMimeType ?? "application/octet-stream";
-        if (mimeType.startsWith("image/")) {
-          await sendMediaMessage(userId, UploadMediaType.IMAGE, buffer, {
-            baseUrl: this.tokenData!.baseUrl,
-            token: this.tokenData!.token,
-            contextToken,
-            cdnBaseUrl: this.config.wechat.cdnBaseUrl,
-            mimeType,
-          });
-          this.log(`[${userId}] Sent image resource (sent=${count})`);
-        } else {
-          await sendMediaMessage(userId, UploadMediaType.FILE, buffer, {
-            baseUrl: this.tokenData!.baseUrl,
-            token: this.tokenData!.token,
-            contextToken,
-            cdnBaseUrl: this.config.wechat.cdnBaseUrl,
-            mimeType,
-            fileName: block.uri ? block.uri.split("/").pop() : "file",
-          });
-          this.log(`[${userId}] Sent file resource (sent=${count})`);
-        }
+        const buf2 = Buffer.from(block.blob, "base64");
+        const mimeType2 = block.resourceMimeType ?? "application/octet-stream";
+        const mt = this.mimeToMediaType(mimeType2);
+        const fileName2 = block.uri ? block.uri.split("/").pop() : "file";
+        await sendMediaMessage(userId, mt, buf2, {
+          baseUrl: this.tokenData!.baseUrl,
+          token: this.tokenData!.token,
+          contextToken,
+          cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+          mimeType: mimeType2,
+          fileName: fileName2,
+        });
+        const typeLabel = mt === UploadMediaType.IMAGE ? "image" : mt === UploadMediaType.VIDEO ? "video" : mt === UploadMediaType.VOICE ? "voice" : "file";
+        this.log(`[${userId}] Sent ${typeLabel} resource (sent=${count})`);
       }
     }
     this.cancelTypingIndicator(userId, contextToken).catch(() => {});

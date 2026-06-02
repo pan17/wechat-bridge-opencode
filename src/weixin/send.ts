@@ -172,6 +172,7 @@ export async function sendMediaMessage(
         video_item: {
           media: cdnMedia,
           thumb_media: thumbCdnMedia,
+          video_size: encryptedSize,
         },
       }];
       break;
