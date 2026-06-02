@@ -189,6 +189,7 @@ export class WeChatOpencodeBridge {
   }
 
   private setUserState(userId: string, sessionId: string, cwd: string): void {
+    this.userStates.clear();
     this.userStates.set(userId, { userId, sessionId, cwd });
     this.saveUserStates();
   }
