@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-06-02
+
+### Fixed
+- 视频文件无法内联播放（`video_item` 缺少 `video_size`，`guessMimeType` 缺少视频扩展名映射）
+- 音频文件被误识别为 VOICE 类型导致发送失败（`mimeToMediaType` 将 `audio/*` 改为 `FILE`）
+- `guessMimeType` 大幅扩充：新增视频、音频、文档、代码、压缩包等扩展名支持
+
 ## [0.3.7] - 2026-06-02
 
 ### Added
