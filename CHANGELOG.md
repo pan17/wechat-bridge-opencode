@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-06-02
+
+### Added
+- `send-wechat` 工具现在支持发送文本消息（新增 `text` 参数），Agent 可直接回复文字到微信
+- `send-wechat` 工具返回 `sent` 数组标明已发送的内容类型
+
+### Fixed
+- session 恢复时 mode/model 无效不再导致整个操作崩溃（改为 try/catch 降级）
+- stale session 导致 prompt 失败时自动创建新 session 重试
+- 多用户场景下 state 文件只保留当前活跃用户，`send-wechat` 不再取错用户
+
 ## [0.3.5] - 2026-06-01
 
 ### Fixed

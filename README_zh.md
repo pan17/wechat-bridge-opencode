@@ -15,7 +15,7 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 - **QR Login** — Terminal QR code rendering for WeChat login
 - **One Session Per User** — Dedicated ACP session for each WeChat user
 - **Daemon Mode** — Run in background with `--daemon`
-- **send-wechat Tool** — Agents can send files/images back to WeChat
+- **send-wechat Tool** — Agents can send text, files, and images back to WeChat
 
 ## Install
 

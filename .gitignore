@@ -27,3 +27,6 @@ Thumbs.db
 *.ntvs*
 *.njsproj
 *.sln
+
+# OpenCode internal files
+.omo/
