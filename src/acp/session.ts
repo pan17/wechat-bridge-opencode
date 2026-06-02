@@ -354,17 +354,25 @@ export class SessionManager {
     // Restore previously selected agent mode and model (must be AFTER session state is updated)
     if (session.currentMode) {
       this.opts.log(`[${userId}] Restoring agent mode: ${session.currentMode}`);
-      await session.connection.setSessionMode({
-        sessionId: result.sessionId,
-        modeId: session.currentMode,
-      });
+      try {
+        await session.connection.setSessionMode({
+          sessionId: result.sessionId,
+          modeId: session.currentMode,
+        });
+      } catch (err) {
+        this.opts.log(`[${userId}] Failed to restore mode: ${String(err)}`);
+      }
     }
     if (session.currentModelId) {
       this.opts.log(`[${userId}] Restoring model: ${session.currentModelId}`);
-      await session.connection.unstable_setSessionModel({
-        sessionId: result.sessionId,
-        modelId: session.currentModelId,
-      });
+      try {
+        await session.connection.unstable_setSessionModel({
+          sessionId: result.sessionId,
+          modelId: session.currentModelId,
+        });
+      } catch (err) {
+        this.opts.log(`[${userId}] Failed to restore model: ${String(err)}`);
+      }
     }
 
     // Restore reasoning level (thought_level config option, if available)
@@ -893,16 +901,24 @@ export class SessionManager {
     // Notify bridge of the new session ID
     this.opts.onSessionReady?.(userId, agentInfo.sessionId);
 
-    // Restore saved state
+    // Restore saved state (best-effort — stale mode/model should not crash restart)
     if (savedMode) {
       this.opts.log(`[${userId}] Restoring agent mode: ${savedMode}`);
-      await session.connection.setSessionMode({ sessionId: agentInfo.sessionId, modeId: savedMode });
-      session.currentMode = savedMode;
+      try {
+        await session.connection.setSessionMode({ sessionId: agentInfo.sessionId, modeId: savedMode });
+        session.currentMode = savedMode;
+      } catch (err) {
+        this.opts.log(`[${userId}] Failed to restore mode: ${String(err)}`);
+      }
     }
     if (savedModel) {
       this.opts.log(`[${userId}] Restoring model: ${savedModel}`);
-      await session.connection.unstable_setSessionModel({ sessionId: agentInfo.sessionId, modelId: savedModel });
-      session.currentModelId = savedModel;
+      try {
+        await session.connection.unstable_setSessionModel({ sessionId: agentInfo.sessionId, modelId: savedModel });
+        session.currentModelId = savedModel;
+      } catch (err) {
+        this.opts.log(`[${userId}] Failed to restore model: ${String(err)}`);
+      }
     }
     if (savedReasoning && session.thoughtLevelConfigId) {
       this.opts.log(`[${userId}] Restoring reasoning: ${savedReasoning}`);
@@ -1090,6 +1106,22 @@ export class SessionManager {
             this.opts.log(`[${session.userId}] Agent process died, removing session`);
             this.sessions.delete(session.userId);
             return;
+          }
+
+          // Stale session recovery: create new ACP session and retry once
+          if (!session.cancelled) {
+            try {
+              this.opts.log(`[${session.userId}] Creating new session to recover from stale session...`);
+              const cwd = this.opts.resolveCwd(session.userId);
+              const result = await session.connection.newSession({ cwd, mcpServers: [] });
+              session.activeSessionId = result.sessionId;
+              session.sessions.set(result.sessionId, { cwd });
+              this.opts.log(`[${session.userId}] New session created, retrying prompt...`);
+              session.queue.unshift(pending);
+              continue;
+            } catch (recoverErr) {
+              this.opts.log(`[${session.userId}] Session recovery failed: ${String(recoverErr)}`);
+            }
           }
 
           if (!session.cancelled) {
