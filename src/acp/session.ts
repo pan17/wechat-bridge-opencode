@@ -66,6 +66,8 @@ export interface UserSession {
   processing: boolean;
   /** Set when user sends /stop — suppresses all further output to WeChat */
   cancelled: boolean;
+  /** Number of consecutive recovery attempts (stale session) without a successful prompt */
+  recoveryAttempts: number;
   lastActivity: number;
   createdAt: number;
   ready: boolean;
@@ -1010,6 +1012,7 @@ export class SessionManager {
       queue: [],
       processing: false,
       cancelled: false,
+      recoveryAttempts: 0,
       lastActivity: Date.now(),
       createdAt: Date.now(),
       ready: true,
@@ -1024,6 +1027,9 @@ export class SessionManager {
 
   /** Warm-up delay for freshly spawned agents before first prompt. */
   private static readonly AGENT_WARMUP_MS = 2000;
+
+  /** Maximum number of consecutive stale-session recovery attempts before giving up. */
+  private static readonly MAX_RECOVERY_ATTEMPTS = 2;
 
   private async processQueue(session: UserSession): Promise<void> {
     try {
@@ -1099,6 +1105,9 @@ export class SessionManager {
           if (replyText.trim() && !session.cancelled) {
             await this.opts.onReply(session.userId, pending.contextToken, replyText);
           }
+
+          // Successful prompt — reset recovery counter
+          session.recoveryAttempts = 0;
         } catch (err) {
           this.opts.log(`[${session.userId}] Agent prompt error: ${String(err)}`);
 
@@ -1108,19 +1117,25 @@ export class SessionManager {
             return;
           }
 
-          // Stale session recovery: create new ACP session and retry once
+          // Stale session recovery: create new ACP session and retry (with limit)
           if (!session.cancelled) {
-            try {
-              this.opts.log(`[${session.userId}] Creating new session to recover from stale session...`);
-              const cwd = this.opts.resolveCwd(session.userId);
-              const result = await session.connection.newSession({ cwd, mcpServers: [] });
-              session.activeSessionId = result.sessionId;
-              session.sessions.set(result.sessionId, { cwd });
-              this.opts.log(`[${session.userId}] New session created, retrying prompt...`);
-              session.queue.unshift(pending);
-              continue;
-            } catch (recoverErr) {
-              this.opts.log(`[${session.userId}] Session recovery failed: ${String(recoverErr)}`);
+            if (session.recoveryAttempts >= SessionManager.MAX_RECOVERY_ATTEMPTS) {
+              this.opts.log(`[${session.userId}] Recovery limit reached (${session.recoveryAttempts} attempts), giving up`);
+              session.recoveryAttempts = 0;
+            } else {
+              try {
+                session.recoveryAttempts++;
+                this.opts.log(`[${session.userId}] Creating new session to recover from stale session (attempt ${session.recoveryAttempts}/${SessionManager.MAX_RECOVERY_ATTEMPTS})...`);
+                const cwd = this.opts.resolveCwd(session.userId);
+                const result = await session.connection.newSession({ cwd, mcpServers: [] });
+                session.activeSessionId = result.sessionId;
+                session.sessions.set(result.sessionId, { cwd });
+                this.opts.log(`[${session.userId}] New session created, retrying prompt...`);
+                session.queue.unshift(pending);
+                continue;
+              } catch (recoverErr) {
+                this.opts.log(`[${session.userId}] Session recovery failed: ${String(recoverErr)}`);
+              }
             }
           }
 
