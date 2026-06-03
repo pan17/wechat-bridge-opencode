@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-06-03
+
+### Fixed
+- 自动恢复机制死循环：`processQueue` 的 stale session recovery 缺少重试上限，当 OpenCode 服务持续失败时无限创建新 session 撑爆数据库。新增 `MAX_RECOVERY_ATTEMPTS=2` 限制，超过后停止并通知用户
+
 ## [0.3.8] - 2026-06-02
 
 ### Fixed
