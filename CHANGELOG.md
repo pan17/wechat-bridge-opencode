@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-06-05
+
+### Fixed
+- Agent 使用 `read` 工具时,读到的图片被自动发送到微信的问题(工具结果为 agent
+  内部上下文,不应透传)
+- `/restart` 后 Agent 最近几条消息被重新发送到微信的问题(resumeSession 时未
+  抑制重放内容)
+
 ## [0.3.9] - 2026-06-03
 
 ### Fixed
