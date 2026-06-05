@@ -315,6 +315,10 @@ export async function spawnAgent(params: {
 
   if (existingSessionId) {
     log(`Resuming ACP session: ${existingSessionId}`);
+    // Suppress replayed content during session resume — OpenCode replays
+    // previous messages as agent_message_chunk which would otherwise be
+    // forwarded to WeChat (resulting in duplicate messages).
+    client.setReplaying(true);
     try {
       const resumeResult = await connection.unstable_resumeSession({
         sessionId: existingSessionId,
@@ -381,6 +385,8 @@ export async function spawnAgent(params: {
       if (newResult.configOptions) {
         configOptions = newResult.configOptions;
       }
+    } finally {
+      client.setReplaying(false);
     }
   } else {
     log("Creating ACP session...");

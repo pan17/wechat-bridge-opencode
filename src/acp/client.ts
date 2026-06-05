@@ -193,29 +193,21 @@ export class WeChatAcpClient implements acp.Client {
         if (update.status === "completed" && update.content) {
           for (const c of update.content) {
             if (c.type === "content") {
-              // Tool result content block - could be text, image, or resource
+              // Tool result content - text is delivered via agent_message_chunk
+              // and image/resource blobs are internal to the agent (e.g. read tool
+              // returning an image for the model's own context). Do NOT forward
+              // these to WeChat — the agent should explicitly use the send-wechat
+              // tool or embed images in agent_message_chunk when it intends to
+              // deliver media to the user.
               const content = (c as { content: acp.ContentBlock }).content;
               if (content.type === "image") {
-                const imageBlock: MediaContent = {
-                  type: "image",
-                  data: content.data,
-                  mimeType: content.mimeType,
-                };
-                await this.flushMedia([imageBlock]);
+                this.opts.log(`[tool] suppressed image from tool result (mimeType=${content.mimeType ?? "unknown"})`);
               } else if (content.type === "resource") {
                 const resource = content.resource;
-                // Check if it's a BlobResourceContents (has blob field)
                 if ("blob" in resource && resource.blob != null) {
-                  const resourceBlock: MediaContent = {
-                    type: "resource",
-                    uri: resource.uri,
-                    blob: resource.blob,
-                    resourceMimeType: resource.mimeType ?? undefined,
-                  };
-                  await this.flushMedia([resourceBlock]);
+                  this.opts.log(`[tool] suppressed resource from tool result (uri=${resource.uri}, mimeType=${resource.mimeType ?? "unknown"})`);
                 }
               }
-              // Text content is accumulated to chunks as normal
             }
           }
         }
