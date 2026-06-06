@@ -1,11 +1,5 @@
 # AGENTS.md — wechat-opencode
 
-**四项基本原则**
-1. 行动前思考 — 不要假设，分析问题相关内容，明确说明假设
-2. 简洁优先 — 用最少的步骤解决问题
-3. 精准修改 — 只碰必须碰的，只清理自己造成的混乱
-4. 目标驱动执行 — 定义成功标准，循环验证直到达成
-
 > Bridge WeChat direct messages to OpenCode Server via HTTP API.
 
 ## Project Overview

@@ -114,6 +114,7 @@ export class WeChatOpencodeBridge {
       onReply: (contextToken, text) => this.sendReply(contextToken, text),
       onMediaReply: (contextToken, blocks) => this.sendMediaReply(contextToken, blocks),
       sendTyping: (contextToken) => this.sendTypingIndicator(contextToken),
+      cancelTyping: (contextToken) => this.cancelTypingIndicator(contextToken),
       onSessionReady: (sessionId) => {
         if (!this.userState) {
           this.setUserState(sessionId, this.config.agent.cwd);
@@ -126,7 +127,12 @@ export class WeChatOpencodeBridge {
     // 4. Tool API server
     this.startToolApiServer();
 
-    // 5. Monitor loop
+    // 5. Start the SSE event pipeline so we don't miss any agent events
+    //    (session.status, message.part.delta, sub-agent completions, etc.).
+    //    The pipeline is always-on and filters by sessionId internally.
+    await this.sessionManager.startEventPipeline(this.config.agent.cwd);
+
+    // 6. Monitor loop
     this.log("Starting message polling...");
     await startMonitor({
       baseUrl: this.tokenData.baseUrl,
@@ -141,6 +147,10 @@ export class WeChatOpencodeBridge {
   async stop(): Promise<void> {
     this.log("Stopping bridge...");
     this.abortController.abort();
+    // Stop the SSE event pipeline before tearing down the session manager.
+    if (this.sessionManager) {
+      await this.sessionManager.stopEventPipeline();
+    }
     this.sessionManager = null;
     if (this.toolApiServer) {
       await new Promise<void>((resolve) => this.toolApiServer!.close(() => resolve()));

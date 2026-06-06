@@ -22,6 +22,11 @@ export class OpenCodeServerClient {
     this.log = opts.log ?? (() => {});
   }
 
+  /** Base URL of the opencode server (used by the SSE event pipeline). */
+  getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
   // ─── Health ───
 
   async health(): Promise<{ ok: boolean; version?: string }> {
@@ -164,20 +169,26 @@ export class OpenCodeServerClient {
 
   /**
    * Send a message asynchronously (returns immediately).
-   * Response comes via SSE /event stream.
+   * Response comes via the SSE /global/event stream.
+   *
+   * The HTTP response itself only confirms the request was accepted; the
+   * actual agent output streams in via the event pipeline.
    */
   async sendMessageAsync(
     sessionId: string,
     parts: MessagePart[],
-    opts?: { agent?: string; model?: ModelRef },
-  ): Promise<void> {
+    opts?: { agent?: string; model?: ModelRef; directory?: string },
+  ): Promise<{ accepted: boolean; status: number }> {
     const body: Record<string, unknown> = { parts };
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.model) body.model = opts.model;
 
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (opts?.directory) headers["x-opencode-directory"] = opts.directory;
+
     const res = await this.fetch(`/session/${encodeURIComponent(sessionId)}/prompt_async`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
 
@@ -185,6 +196,7 @@ export class OpenCodeServerClient {
       const text = await res.text().catch(() => "");
       throw new Error(`Async prompt failed: ${res.status} ${text}`);
     }
+    return { accepted: true, status: res.status };
   }
 
   async getSessionMessages(sessionId: string, limit?: number): Promise<MessageResponse[]> {
@@ -267,13 +279,28 @@ export class OpenCodeServerClient {
 
   // ─── Internal ───
 
-  private async fetch(path: string, init: RequestInit): Promise<Response> {
+  /**
+   * Internal fetch wrapper.
+   *
+   * Per-method timeout policy:
+   *   - Pass `timeoutMs` in `init` to apply an AbortSignal timeout for this call.
+   *   - By default NO timeout is applied. sendMessage() and the SSE event
+   *     pipeline need unbounded time; short probes (health/list) should pass
+   *     an explicit `timeoutMs`.
+   */
+  private async fetch(
+    path: string,
+    init: RequestInit & { timeoutMs?: number } = {},
+  ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
     this.log(`[server] ${init.method ?? "GET"} ${url}`);
-    const response = await fetch(url, {
-      ...init,
-      signal: AbortSignal.timeout(120_000), // 2min default timeout
-    });
-    return response;
+
+    const { timeoutMs, ...rest } = init;
+    const finalInit: RequestInit = { ...rest };
+    if (timeoutMs !== undefined && timeoutMs > 0) {
+      finalInit.signal = AbortSignal.timeout(timeoutMs);
+    }
+
+    return fetch(url, finalInit);
   }
 }

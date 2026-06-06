@@ -1,5 +1,5 @@
 /**
- * Outbound adapter: format ACP output for WeChat delivery.
+ * Outbound adapter: format agent output for WeChat delivery.
  */
 
 /**

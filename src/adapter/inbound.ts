@@ -63,6 +63,14 @@ function findMediaItem(itemList?: MessageItem[]): MessageItem | undefined {
 
 /**
  * Convert a WeChat message to MessagePart[] for use in session/prompt.
+ *
+ * The "[系统提示: ...]" context line is emitted as a separate part so the
+ * model knows it's chatting via WeChat. User-input parts are filtered
+ * out before reaching WeChat by the session manager (see
+ * `session.ts:maybeSendTextPart` — it only sends parts whose
+ * `messageID === assistantMessageId`), so even though the model sees the
+ * system prompt as part of its input, it never gets echoed back to the
+ * WeChat user.
  */
 export async function weixinMessageToPrompt(
   msg: WeixinMessage,
@@ -75,9 +83,12 @@ export async function weixinMessageToPrompt(
   // Extract text
   const text = extractText(msg.item_list);
   if (text) {
+    // The actual user message.
+    blocks.push({ type: "text", text });
+    // The WeChat context hint as a separate part.
     blocks.push({
       type: "text",
-      text: `${text}\n\n[系统提示: 你正在通过微信(WeChat)与用户聊天。]`,
+      text: "[系统提示: 你正在通过微信(WeChat)与用户聊天。]",
     });
   }
 
