@@ -50,7 +50,6 @@ export interface StatusCommand {
 
 export interface ThinkingCommand {
   kind: "status" | "on" | "off";
-  target?: "thoughts" | "tools";
 }
 
 export interface StopCommand {
@@ -146,18 +145,21 @@ export function parseSessionCommand(text: string): SessionCommand | null {
 
     case "list":
     case "ls": {
-      // /s list                  → no filter
+      // /s list                  → no filter (shows all, newest first)
+      // /s list current          → filter by current workspace
       // /s list --cwd            → filter by current workspace
       // /s list /path/to/cwd     → filter by specific cwd
-      // /s list N                → filter by workspace at index N (resolved by bridge)
       const hasCwdFlag = args.includes("--cwd");
       let cwdFilter: string | undefined;
       if (hasCwdFlag) {
         cwdFilter = "__current__";
       } else if (args.length > 1) {
-        // Take everything after "list" as the filter value
         const filterValue = args.slice(1).join(" ");
-        if (filterValue) cwdFilter = filterValue;
+        if (filterValue === "current") {
+          cwdFilter = "__current__";
+        } else if (filterValue) {
+          cwdFilter = filterValue;
+        }
       }
       return { kind: "list", cwdFilter };
     }
@@ -265,7 +267,7 @@ export function parseStatusCommand(text: string): StatusCommand | null {
 
 export function parseThinkingCommand(text: string): ThinkingCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/thinking\s+(.+)$/i);
+  const match = trimmed.match(/^\/(?:thinking|thought)\s+(.+)$/i);
   if (!match) return null;
 
   const args = match[1].trim().split(/\s+/);
@@ -274,10 +276,10 @@ export function parseThinkingCommand(text: string): ThinkingCommand | null {
   switch (subcommand) {
     case "on":
     case "enable":
-      return { kind: "on", target: args[1]?.toLowerCase() as "thoughts" | "tools" | undefined };
+      return { kind: "on" };
     case "off":
     case "disable":
-      return { kind: "off", target: args[1]?.toLowerCase() as "thoughts" | "tools" | undefined };
+      return { kind: "off" };
     case "status":
     case "current":
       return { kind: "status" };
@@ -319,17 +321,19 @@ export function parseRestartCommand(text: string): RestartCommand | null {
 }
 
 export function formatWorkspaceList(
-  workspaces: Array<{ id: string; name: string; cwd: string }>,
-  activeId: string | null,
+  workspaces: Array<{ cwd: string }>,
+  activeCwd: string | null,
 ): string {
   if (workspaces.length === 0) return "No workspaces configured.";
 
   const lines = ["📂 Workspaces:"];
-  for (const ws of workspaces) {
-    const prefix = ws.id === activeId ? "▶ " : "  ";
-    lines.push(`${prefix}${ws.name} (${ws.id})`);
-    lines.push(`   ${ws.cwd}`);
+  for (let i = 0; i < workspaces.length; i++) {
+    const ws = workspaces[i];
+    const marker = ws.cwd === activeCwd ? " ◀" : "";
+    lines.push(`  ${i + 1}. ${ws.cwd}${marker}`);
   }
+  lines.push("");
+  lines.push("💡 使用 /workspace switch <路径> 或编号 切换工作区");
   return lines.join("\n");
 }
 
@@ -440,45 +444,48 @@ export function formatHelp(): string {
     "📖 可用命令：",
     "",
     "── 工作区 ──",
+    "  /workspace list          列出所有工作区（按活跃度排序）",
     "  /workspace status        显示当前工作区",
     "  /workspace switch <路径>  切换到指定目录",
     "  /workspace add <路径>    添加并切换到目录",
     "  （简写: /ws ...）",
     "",
     "── 会话 ──",
-    "  /session list            列出服务器上的会话",
-    "  /session switch <n>      切换到指定会话",
+    "  /session list            列出最近 20 个会话",
+    "  /session list current    列出当前工作区的会话",
+    "  /session switch <n>      切换到指定会话（自动切换工作区）",
     "  /session new             新会话（清除上下文）",
     "  /session status          显示当前会话",
     "  （简写: /s ...）",
     "",
     "── Agent ──",
-    "  /agent list              列出可用 Agent 模式",
-    "  /agent switch <name|n>   切换 Agent 模式",
-    "  /agent status            显示当前 Agent 模式",
+    "  /agent list              列出可用 Agent（仅 primary 非内置）",
+    "  /agent switch <name|n>   切换 Agent",
+    "  /agent status            显示当前 Agent",
     "  （简写: /a ...）",
     "",
     "── Model ──",
-    "  /model list              显示当前模型",
+    "  /model list              列出模型提供商",
+    "  /model list <provider>   列出指定提供商下的模型",
     "  /model switch <provider/model>  切换模型",
     "  /model status            显示当前模型",
     "",
     "── Reasoning ──",
-    "  /reasoning list          列出推理级别",
+    "  /reasoning list          列出当前模型的实际推理等级",
     "  /reasoning switch <level>  切换推理级别",
     "  /reasoning status        显示当前推理级别",
     "",
     "── 状态 ──",
-    "  /status                  显示会话、工作区、Agent、模型、推理、上下文用量",
+    "  /status                  显示会话标题、工作区、Agent、模型、推理、上下文用量",
     "",
     "── 停止 ──",
     "  /stop                    停止正在运行的 Agent",
     "  /restart                 新会话（清除上下文）",
     "",
     "── 思考 ──",
-    "  /thinking off            关闭思考与工具显示",
-    "  /thinking off tools      仅关闭工具显示",
-    "  /thinking status         查看当前显示设置",
+    "  /thought on             开启思考与工具显示",
+    "  /thought off            关闭思考与工具显示",
+    "  /thought status         查看当前显示设置",
     "",
     "── 消息计数 ──",
     "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
@@ -495,36 +502,39 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "📖 可用命令：",
     "",
     "── 工作区 ──",
+    "  /workspace list          列出所有工作区（按活跃度排序）",
     "  /workspace status        显示当前工作区",
     "  /workspace switch <路径>  切换到指定目录",
     "  /workspace add <路径>    添加并切换到目录",
     "  （简写: /ws ...）",
     "",
     "── 会话 ──",
-    "  /session list            列出服务器上的会话",
-    "  /session switch <n>      切换到指定会话",
+    "  /session list            列出最近 20 个会话",
+    "  /session list current    列出当前工作区的会话",
+    "  /session switch <n>      切换到指定会话（自动切换工作区）",
     "  /session new             新会话（清除上下文）",
     "  /session status          显示当前会话",
     "  （简写: /s ...）",
     "",
     "── Agent ──",
-    "  /agent list              列出可用 Agent 模式",
-    "  /agent switch <name|n>   切换 Agent 模式",
-    "  /agent status            显示当前 Agent 模式",
+    "  /agent list              列出可用 Agent（仅 primary 非内置）",
+    "  /agent switch <name|n>   切换 Agent",
+    "  /agent status            显示当前 Agent",
     "  （简写: /a ...）",
     "",
     "── Model ──",
-    "  /model list              显示当前模型",
+    "  /model list              列出模型提供商",
+    "  /model list <provider>   列出指定提供商下的模型",
     "  /model switch <provider/model>  切换模型",
     "  /model status            显示当前模型",
     "",
     "── Reasoning ──",
-    "  /reasoning list          列出推理级别",
+    "  /reasoning list          列出当前模型的实际推理等级",
     "  /reasoning switch <level>  切换推理级别",
     "  /reasoning status        显示当前推理级别",
     "",
     "── 状态 ──",
-    "  /status                  显示会话、工作区、Agent、模型、推理、上下文用量",
+    "  /status                  显示会话标题、工作区、Agent、模型、推理、上下文用量",
     "",
     "── 停止 ──",
     "  /stop                    停止正在运行的 Agent",

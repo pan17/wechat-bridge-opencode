@@ -80,7 +80,7 @@ export class SessionManager {
 
   // Available modes/models (cached for /agent list, /model list)
   private availableModes: SessionMode[] = [];
-  private availableModels: Array<{ modelId: string; name: string; description?: string }> = [];
+  private availableModels: Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> = [];
 
   constructor(opts: SessionManagerOpts) {
     this.client = new OpenCodeServerClient({
@@ -107,7 +107,11 @@ export class SessionManager {
    * Returns the session ID.
    */
   async ensureSession(cwd?: string): Promise<string> {
-    if (this.sessionId) return this.sessionId;
+    if (this.sessionId) {
+      // Session exists (e.g. restored from saved state) — sync agent/model from server
+      this.syncStateFromServer(this.sessionId).catch(() => {});
+      return this.sessionId;
+    }
     const dir = cwd ?? this.cwd;
     this.log(`Creating server session (cwd: ${dir})...`);
     const info = await this.client.createSession(undefined, undefined, dir);
@@ -161,6 +165,8 @@ export class SessionManager {
     this.sessionId = sessionId;
     this.cwd = cwd;
     this.onSessionReady?.(sessionId);
+    // Sync agent/model from the session's last message
+    await this.syncStateFromServer(sessionId);
   }
 
   /**
@@ -172,6 +178,9 @@ export class SessionManager {
     this.sessionId = info.id;
     this.cwd = cwd;
     this.onSessionReady?.(info.id);
+    // Fetch defaults from server for the new session
+    this.refreshAgents().catch(() => {});
+    this.refreshProviders().catch(() => {});
     return info.id;
   }
 
@@ -215,11 +224,21 @@ export class SessionManager {
           },
         );
 
-        // Track tokens
+        // Track tokens (total is cumulative session tokens from server)
         if (response.info?.tokens?.total) {
-          this.totalTokens += response.info.tokens.total;
+          this.totalTokens = response.info.tokens.total;
           this.log(`Usage: totalTokens=${this.totalTokens}`);
         }
+
+        // Sync agent/model/reasoning from server response (each assistant message records what was used)
+        const msgInfo = response as unknown as { info?: { mode?: string; modelID?: string; providerID?: string; variant?: string } };
+        if (msgInfo.info?.mode) this.currentMode = msgInfo.info.mode;
+        if (msgInfo.info?.modelID && msgInfo.info?.providerID) {
+          this.currentModelId = `${msgInfo.info.providerID}/${msgInfo.info.modelID}`;
+          const mod = this.availableModels.find((m) => m.modelId === this.currentModelId);
+          if (mod?.contextSize) this.contextWindowSize = mod.contextSize;
+        }
+        if (msgInfo.info?.variant) this.currentReasoning = msgInfo.info.variant;
 
         // Extract text from response
         let replyText = "";
@@ -283,9 +302,9 @@ export class SessionManager {
   async refreshAgents(): Promise<void> {
     try {
       const agents = await this.client.listAgents();
-      // Show only primary agents (subagents are internal)
+      // Show only primary non-built-in agents (subagents and system agents are internal)
       this.availableModes = agents
-        .filter((a) => a.mode === "primary")
+        .filter((a) => a.mode === "primary" && !a.builtIn)
         .map((a) => ({
           id: a.name, // Server uses agent name as the switchable value
           name: a.name,
@@ -320,18 +339,34 @@ export class SessionManager {
   async refreshProviders(): Promise<void> {
     try {
       const providers = await this.client.listProviders();
-      const models: Array<{ modelId: string; name: string; description?: string }> = [];
+      const models: Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> = [];
       for (const p of providers) {
         for (const m of p.models ?? []) {
           // Some model IDs already include provider prefix (e.g. "opencode-go/minimax-m3")
           const modelId = m.id.includes("/") ? m.id : `${p.id}/${m.id}`;
-          models.push({ modelId, name: m.name ?? m.id });
+          models.push({ modelId, name: m.name ?? m.id, reasoning: m.reasoning, variants: m.variants, contextSize: m.contextSize });
         }
       }
       this.availableModels = models;
-      // Set default model if none set
-      if (!this.currentModelId && models.length > 0) {
-        this.currentModelId = models[0].modelId;
+      // Set default model from server config, or first available
+      if (!this.currentModelId) {
+        try {
+          const config = await this.client.getConfig();
+          if (config.model && models.some((m) => m.modelId === config.model)) {
+            this.currentModelId = config.model;
+          } else if (models.length > 0) {
+            this.currentModelId = models[0].modelId;
+          }
+        } catch {
+          if (models.length > 0) {
+            this.currentModelId = models[0].modelId;
+          }
+        }
+      }
+      // Update context window size from model info
+      if (this.currentModelId) {
+        const m = this.availableModels.find((mod) => mod.modelId === this.currentModelId);
+        if (m?.contextSize) this.contextWindowSize = m.contextSize;
       }
       this.log(`Fetched ${this.availableModels.length} models across ${providers.length} providers (default: ${this.currentModelId})`);
     } catch (err) {
@@ -343,13 +378,18 @@ export class SessionManager {
     return this.currentModelId;
   }
 
-  getAvailableModels(): Array<{ modelId: string; name: string; description?: string }> {
+  getAvailableModels(): Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> {
     return this.availableModels;
   }
 
   async setModel(modelId: string): Promise<void> {
     this.log(`Switching model to: ${modelId}`);
     this.currentModelId = modelId;
+    // Update context window size from model info
+    const model = this.availableModels.find((m) => m.modelId === modelId);
+    if (model?.contextSize) {
+      this.contextWindowSize = model.contextSize;
+    }
   }
 
   // ─── Reasoning ───
@@ -358,15 +398,25 @@ export class SessionManager {
     return this.currentReasoning;
   }
 
-  getReasoningLevels(): Array<{ value: string; name: string; current: boolean }> {
-    // Default reasoning levels — actual available ones depend on the model
-    const levels = ["low", "medium", "high", "max"];
-    return levels.map((v) => ({
-      value: v,
-      name: v.charAt(0).toUpperCase() + v.slice(1),
-      current: v === this.currentReasoning,
-    }));
-  }
+    getReasoningLevels(): Array<{ value: string; name: string; current: boolean }> {
+        // Use the current model's variants to determine available reasoning levels
+        const currentModel = this.currentModelId
+            ? this.availableModels.find((m) => m.modelId === this.currentModelId)
+            : null;
+
+        if (!currentModel) return [];
+        if (currentModel.reasoning === false) return [];
+
+        const levels = currentModel.variants
+            ? Object.keys(currentModel.variants).filter((k) => currentModel.variants![k]?.reasoningEffort)
+            : [];
+
+        return levels.map((v) => ({
+            value: v,
+            name: v.charAt(0).toUpperCase() + v.slice(1),
+            current: v === this.currentReasoning,
+        }));
+    }
 
   async setReasoning(level: string): Promise<void> {
     this.log(`Setting reasoning level to: ${level}`);
@@ -399,13 +449,64 @@ export class SessionManager {
     return [];
   }
 
-  /** List all sessions on the server. */
-  async listServerSessions(): Promise<Array<{ sessionId: string; cwd?: string; title?: string }>> {
-    const sessions = await this.client.listSessions();
-    return sessions.map((s) => ({
-      sessionId: s.id,
-      title: s.title,
+  /** Sync local agent/model/reasoning state from the server's last message metadata. */
+  async syncStateFromServer(sessionId: string): Promise<void> {
+    try {
+      const messages = await this.client.getSessionMessages(sessionId, 1);
+      if (messages.length > 0) {
+        const lastMsg = messages[0] as unknown as { info?: { mode?: string; modelID?: string; providerID?: string; variant?: string; role?: string } };
+        if (lastMsg.info?.role === "assistant" || lastMsg.info?.mode) {
+          if (lastMsg.info.mode) this.currentMode = lastMsg.info.mode;
+          if (lastMsg.info.modelID && lastMsg.info.providerID) {
+            this.currentModelId = `${lastMsg.info.providerID}/${lastMsg.info.modelID}`;
+          }
+          if (lastMsg.info.variant) this.currentReasoning = lastMsg.info.variant;
+          return;
+        }
+      }
+      // No messages yet — fall back to server config defaults
+      const config = await this.client.getConfig();
+      if (config.model && !this.currentModelId) {
+        this.currentModelId = config.model;
+        const mod = this.availableModels.find((m) => m.modelId === this.currentModelId);
+        if (mod?.contextSize) this.contextWindowSize = mod.contextSize;
+      }
+    } catch {
+      // Ignore — refreshAgents/refreshProviders will set defaults on first call
+    }
+  }
+
+  /** Get session title from the server by ID. */
+  async getSessionTitle(sessionId: string): Promise<string | undefined> {
+    try {
+      const info = await this.client.getSession(sessionId);
+      return info.title;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** List all projects on the server (used as workspace registry). */
+  async listServerProjects(): Promise<Array<{ id: string; worktree: string; updatedAt: number }>> {
+    const projects = await this.client.listProjects();
+    return projects.map((p) => ({
+      id: p.id,
+      worktree: p.worktree,
+      updatedAt: p.time?.updated ?? 0,
     }));
+  }
+
+  /** List all sessions across all workspaces, most recent first. */
+  async listServerSessions(): Promise<Array<{ sessionId: string; cwd?: string; title?: string; updatedAt?: number }>> {
+    const sessions = await this.client.listSessionsV2(50);
+    return sessions
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      .map((s) => ({
+        sessionId: s.id,
+        title: s.title,
+        cwd: s.directory,
+        updatedAt: s.updatedAt,
+      }));
   }
 
   /** Health check: verify server is reachable. */

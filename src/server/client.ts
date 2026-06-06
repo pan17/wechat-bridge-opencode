@@ -5,7 +5,7 @@
  * See https://opencode.ai/docs/server/ for API reference.
  */
 
-import type { MessagePart, MessageResponse, ServerSessionInfo, ModelRef } from "../types.js";
+import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef } from "../types.js";
 
 export interface OpenCodeServerClientOpts {
   baseUrl: string;
@@ -32,6 +32,61 @@ export class OpenCodeServerClient {
       return { ok: true, version: data.version };
     } catch {
       return { ok: false };
+    }
+  }
+
+  // ─── Config ───
+
+  async getConfig(): Promise<{ model?: string; agent?: string }> {
+    try {
+      const res = await this.fetch("/config", { method: "GET" });
+      if (!res.ok) return {};
+      return res.json() as Promise<{ model?: string }>;
+    } catch {
+      return {};
+    }
+  }
+
+  // ─── Sessions V2 (cross-workspace) ───
+
+  async listSessionsV2(limit?: number): Promise<Array<{
+    id: string;
+    title?: string;
+    directory?: string;
+    updatedAt?: number;
+  }>> {
+    try {
+      const params = limit ? `?roots=true&limit=${limit}` : "?roots=true";
+      const res = await this.fetch(`/api/session${params}`, { method: "GET" });
+      if (!res.ok) return [];
+      const body = await res.json() as {
+        data?: Array<{
+          id: string;
+          title?: string;
+          location?: { directory?: string };
+          time?: { updated?: number };
+        }>;
+      };
+      return (body.data ?? []).map((s) => ({
+        id: s.id,
+        title: s.title,
+        directory: s.location?.directory,
+        updatedAt: s.time?.updated,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  // ─── Projects ───
+
+  async listProjects(): Promise<ServerProjectInfo[]> {
+    try {
+      const res = await this.fetch("/project", { method: "GET" });
+      if (!res.ok) return [];
+      return res.json() as Promise<ServerProjectInfo[]>;
+    } catch {
+      return [];
     }
   }
 
@@ -152,17 +207,18 @@ export class OpenCodeServerClient {
 
   // ─── Agents ───
 
-  async listAgents(): Promise<Array<{ id: string; name: string; mode: string; description?: string }>> {
+  async listAgents(): Promise<Array<{ id: string; name: string; mode: string; description?: string; builtIn: boolean }>> {
     try {
       const res = await this.fetch("/agent", { method: "GET" });
       if (!res.ok) return [];
-      const raw = await res.json() as Array<{ id?: string; name: string; mode?: string; description?: string }>;
+      const raw = await res.json() as Array<{ id?: string; name: string; mode?: string; description?: string; builtIn?: boolean }>;
       // Server returns agents with `name` as the switchable value and `mode` for primary/subagent
       return raw.map((a) => ({
         id: a.id || a.name,
         name: a.name,
         mode: a.mode ?? "primary",
         description: a.description,
+        builtIn: a.builtIn ?? false,
       }));
     } catch {
       return [];
@@ -171,26 +227,35 @@ export class OpenCodeServerClient {
 
   // ─── Config / Providers ───
 
-  async listProviders(): Promise<Array<{ id: string; name: string; models?: Array<{ id: string; name: string }> }>> {
+  async listProviders(): Promise<Array<{ id: string; name: string; models?: Array<{ id: string; name: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> }>> {
     try {
       const res = await this.fetch("/config/providers", { method: "GET" });
       if (!res.ok) return [];
       const body = await res.json() as {
         providers?: Array<{
           id: string; name: string;
-          models?: Record<string, { id?: string; name?: string }> | Array<{ id: string; name: string }>;
+          models?: Record<string, { id?: string; name?: string; capabilities?: { reasoning?: boolean }; variants?: Record<string, { reasoningEffort?: string }>; limit?: { context?: number } }> | Array<{ id: string; name: string; capabilities?: { reasoning?: boolean }; variants?: Record<string, { reasoningEffort?: string }>; limit?: { context?: number } }>;
         }>;
       };
       const providers = body.providers ?? [];
       return providers.map((p) => {
-        let models: Array<{ id: string; name: string }> = [];
+        let models: Array<{ id: string; name: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> = [];
         if (Array.isArray(p.models)) {
-          models = p.models;
+          models = p.models.map((m) => ({
+            id: m.id,
+            name: m.name,
+            reasoning: m.capabilities?.reasoning,
+            variants: m.variants,
+            contextSize: m.limit?.context,
+          }));
         } else if (p.models && typeof p.models === "object") {
-          // Models come as a dict { modelId: { id, name, ... } }
+          // Models come as a dict { modelId: { id, name, capabilities, variants, limit, ... } }
           models = Object.values(p.models).map((m) => ({
             id: m.id ?? "",
             name: m.name ?? m.id ?? "",
+            reasoning: m.capabilities?.reasoning,
+            variants: m.variants,
+            contextSize: m.limit?.context,
           }));
         }
         return { id: p.id, name: p.name, models };

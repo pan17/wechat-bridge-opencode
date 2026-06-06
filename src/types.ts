@@ -58,13 +58,33 @@ export interface ToolResultPart {
   result: string;
 }
 
+/** Project info from the server. */
+export interface ServerProjectInfo {
+  id: string;
+  worktree: string;
+  vcsDir?: string;
+  vcs?: string;
+  time?: {
+    created: number;
+    updated: number;
+    initialized?: number;
+  };
+}
+
 /** Session info from the server. */
 export interface ServerSessionInfo {
   id: string;
   slug: string;
   title?: string;
+  directory: string;
+  projectID: string;
+  version: string;
   createdAt?: string;
   updatedAt?: string;
+  time?: {
+    created: number;
+    updated: number;
+  };
 }
 
 /** Available agent mode. */

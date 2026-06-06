@@ -67,6 +67,7 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
+| `/workspace list` | List all workspaces sorted by recent activity, numbered |
 | `/workspace status` | Show current workspace |
 | `/workspace switch <path>` | Switch to directory by path |
 | `/workspace add <path>` | Add and switch to directory |
@@ -75,16 +76,17 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/session list` | List sessions on the server |
-| `/session switch <n>` | Switch to session by index |
+| `/session list` | List 20 most recent sessions with cwd |
+| `/session list current` | List 20 most recent sessions in current workspace |
+| `/session switch <n>` | Switch to session by index (auto-switches workspace) |
 | `/session new` | New session (clear context) |
-| `/session status` | Show current session |
+| `/session status` | Show current session info |
 
 ### Agent (`/agent` or `/a`)
 
 | Command | Description |
 |---------|-------------|
-| `/agent list` | List available agent modes with index and current marker |
+| `/agent list` | List available primary (non-built-in) agent modes with index |
 | `/agent switch <name\|n>` | Switch mode by name or index |
 | `/agent status` | Show current agent mode |
 
@@ -92,7 +94,8 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/model list` | List providers with model counts |
+| `/model list` | List model providers with counts |
+| `/model list <provider>` | List all models under a specific provider |
 | `/model switch <provider/model>` | Switch model (e.g. anthropic/claude-sonnet-4-5) |
 | `/model status` | Show current model |
 
@@ -100,7 +103,7 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/reasoning list` | List available reasoning levels |
+| `/reasoning list` | List actual reasoning levels for the current model (from model variants) |
 | `/reasoning switch <level>` | Switch reasoning level |
 | `/reasoning status` | Show current reasoning level |
 
@@ -108,7 +111,7 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show current session, workspace, agent, model, reasoning, context usage |
+| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage. Agent/model/reasoning fetched from server; defaults from config when no history |
 
 ### Stop (`/stop`)
 
@@ -121,9 +124,9 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/thinking off` | Disable thinking & tool display |
-| `/thinking off tools` | Disable tool display only |
-| `/thinking status` | Show current thinking & tool display settings |
+| `/thought on` | Enable thinking & tool display |
+| `/thought off` | Disable thinking & tool display |
+| `/thought status` | Show current thinking & tool display settings |
 
 ### Message Limit (`/next`)
 

@@ -67,6 +67,7 @@ wbo
 
 | 命令 | 说明 |
 |------|------|
+| `/workspace list` | 列出所有工作区，按最近活跃度排序，带序号 |
 | `/workspace status` | 显示当前工作区 |
 | `/workspace switch <路径>` | 切换到指定目录 |
 | `/workspace add <路径>` | 添加并切换到目录 |
@@ -75,16 +76,17 @@ wbo
 
 | 命令 | 说明 |
 |------|------|
-| `/session list` | 列出服务器上的会话 |
-| `/session switch <n>` | 切换到指定会话 |
+| `/session list` | 列出最近 20 个会话，显示工作路径 |
+| `/session list current` | 列出当前工作区的最近 20 个会话 |
+| `/session switch <n>` | 按编号切换到指定会话（自动切换到对应工作区） |
 | `/session new` | 新会话（清除上下文） |
-| `/session status` | 显示当前会话 |
+| `/session status` | 显示当前会话信息 |
 
 ### Agent（`/agent` 或 `/a`）
 
 | 命令 | 说明 |
 |------|------|
-| `/agent list` | 列出可用 Agent 模式，带序号和当前标记 |
+| `/agent list` | 列出可用 Agent 模式，带序号和当前标记（仅显示 primary 非内置 agent） |
 | `/agent switch <名称\|n>` | 按名称或序号切换 Agent 模式 |
 | `/agent status` | 显示当前 Agent 模式 |
 
@@ -93,6 +95,7 @@ wbo
 | 命令 | 说明 |
 |------|------|
 | `/model list` | 列出模型提供商及其数量 |
+| `/model list <provider>` | 列出指定提供商下的所有模型 |
 | `/model switch <provider/model>` | 切换模型（如 anthropic/claude-sonnet-4-5） |
 | `/model status` | 显示当前模型 |
 
@@ -100,7 +103,7 @@ wbo
 
 | 命令 | 说明 |
 |------|------|
-| `/reasoning list` | 列出可用推理级别 |
+| `/reasoning list` | 列出当前模型支持的实际推理等级（从模型 variants 获取） |
 | `/reasoning switch <level>` | 切换推理级别 |
 | `/reasoning status` | 显示当前推理级别 |
 
@@ -108,7 +111,7 @@ wbo
 
 | 命令 | 说明 |
 |------|------|
-| `/status` | 显示当前会话、工作区、Agent、模型、推理级别和上下文使用情况 |
+| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量。Agent/Model/Reasoning 从服务器获取，无历史消息时取配置默认值 |
 
 ### 停止（`/stop`）
 
@@ -121,9 +124,9 @@ wbo
 
 | 命令 | 说明 |
 |------|------|
-| `/thinking off` | 关闭思考与工具显示 |
-| `/thinking off tools` | 仅关闭工具显示 |
-| `/thinking status` | 查看当前显示设置 |
+| `/thought on` | 开启思考与工具显示 |
+| `/thought off` | 关闭思考与工具显示 |
+| `/thought status` | 查看当前显示设置 |
 
 ### 消息计数（`/next`）
 

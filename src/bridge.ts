@@ -31,6 +31,7 @@ import {
   parseHelpCommand,
   formatHelpWithNativeCommands,
   formatStatus,
+  formatWorkspaceList,
 } from "./adapter/workspace-cmd.js";
 import type { WeChatOpencodeConfig } from "./config.js";
 
@@ -477,9 +478,23 @@ export class WeChatOpencodeBridge {
     switch (cmd!.kind) {
       case "list": {
         const currentCwd = this.userState?.cwd ?? this.config.agent.cwd;
-        const sessions = await this.sessionManager.listServerSessions();
-        // Derive unique workspaces from session titles (or just show current)
-        await this.sendReply(contextToken, `📂 Current workspace:\n  ${currentCwd}\n\n💡 Use /workspace switch <path> to change`);
+        // Fetch projects (they have time.updated for recency sorting)
+        const projects = await this.sessionManager.listServerProjects();
+        // Deduplicate by worktree, keep the most recent updatedAt
+        const wsMap = new Map<string, number>();
+        for (const p of projects) {
+          const existing = wsMap.get(p.worktree) ?? 0;
+          if (p.updatedAt > existing) wsMap.set(p.worktree, p.updatedAt);
+        }
+        // Always include current workspace
+        if (!wsMap.has(currentCwd)) {
+          wsMap.set(currentCwd, 0);
+        }
+        // Sort by recency descending, then by path for ties
+        const workspaces = [...wsMap.entries()]
+          .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+          .map(([cwd]) => ({ cwd }));
+        await this.sendReply(contextToken, formatWorkspaceList(workspaces, currentCwd));
         break;
       }
 
@@ -557,12 +572,27 @@ export class WeChatOpencodeBridge {
     switch (cmd!.kind) {
       case "list": {
         try {
-          const sessions = await this.sessionManager.listServerSessions();
-          const lines: string[] = ["💬 Recent Sessions:"];
-          for (let i = 0; i < Math.min(sessions.length, 10); i++) {
+          const allSessions = await this.sessionManager.listServerSessions();
+          // Apply cwd filter if specified
+          let sessions = allSessions;
+          if (cmd!.cwdFilter) {
+            const filterCwd = cmd!.cwdFilter === "__current__"
+              ? (this.userState?.cwd ?? this.config.agent.cwd)
+              : cmd!.cwdFilter;
+            sessions = allSessions.filter((s) => s.cwd === filterCwd);
+          }
+          const lines: string[] = [cmd!.cwdFilter ? `💬 Sessions in current workspace:` : "💬 Recent Sessions:"];
+          const count = Math.min(sessions.length, 20);
+          for (let i = 0; i < count; i++) {
             const s = sessions[i];
             lines.push(`  ${i + 1}. ${s.title ?? "(untitled)"}`);
+            if (s.cwd) lines.push(`     📂 ${s.cwd}`);
           }
+          if (count === 0) {
+            lines.push("  (no sessions)");
+          }
+          lines.push("");
+          lines.push("💡 使用 /session switch <编号> 切换会话");
           await this.sendReply(contextToken, lines.join("\n"));
         } catch (err) {
           await this.sendReply(contextToken, `⚠️ Failed to list sessions: ${String(err)}`);
@@ -576,11 +606,11 @@ export class WeChatOpencodeBridge {
           const sessions = await this.sessionManager.listServerSessions();
           if (!isNaN(idx) && idx >= 1 && idx <= sessions.length) {
             const target = sessions[idx - 1];
-            const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+            const newCwd = target.cwd ?? this.userState?.cwd ?? this.config.agent.cwd;
             await this.sendReply(contextToken, `🔄 Switching to "${target.title ?? "(untitled)"}"`);
-            await this.sessionManager.switchSession(target.sessionId, cwd);
-            this.setUserState(target.sessionId, cwd);
-            await this.sendReply(contextToken, `✅ Ready`);
+            await this.sessionManager.switchSession(target.sessionId, newCwd);
+            this.setUserState(target.sessionId, newCwd);
+            await this.sendReply(contextToken, `✅ Ready on ${newCwd}`);
           } else {
             await this.sendReply(contextToken, `Session "${cmd!.name}" not found. Use /session list to see available sessions.`);
           }
@@ -708,6 +738,27 @@ export class WeChatOpencodeBridge {
         }
         const currentModelId = this.sessionManager.getCurrentModel();
         const allModels = this.sessionManager.getAvailableModels();
+
+        // If a provider filter is given, show models under that provider
+        if (cmd!.provider) {
+          const filter = cmd!.provider.toLowerCase();
+          const filtered = allModels.filter((m) => m.modelId.toLowerCase().startsWith(`${filter}/`));
+          const lines = [`📱 Models — ${cmd!.provider}:`];
+          if (filtered.length === 0) {
+            lines.push("  (no models found)");
+          } else {
+            for (const m of filtered) {
+              const modelName = m.modelId.split("/").slice(1).join("/") || m.name;
+              const marker = m.modelId === currentModelId ? " ◀" : "";
+              lines.push(`  ${modelName}${marker}`);
+            }
+          }
+          lines.push("");
+          lines.push("💡 使用 /model switch <provider/model> 切换模型");
+          await this.sendReply(contextToken, lines.join("\n"));
+          break;
+        }
+
         const lines = ["📱 Models:"];
 
         // Group by provider
@@ -726,8 +777,8 @@ export class WeChatOpencodeBridge {
             lines.push(`  ${provider} (${models.length})${marker}`);
           }
           lines.push("");
-          lines.push("💡 Use /model list <provider> to list models");
-          lines.push("   Use /model switch <provider/model> to switch");
+          lines.push("💡 使用 /model list <provider> 查看模型列表");
+          lines.push("   使用 /model switch <provider/model> 切换模型");
         }
         await this.sendReply(contextToken, lines.join("\n"));
         break;
@@ -809,13 +860,32 @@ export class WeChatOpencodeBridge {
     if (!this.sessionManager) return;
 
     const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+
+    // Lazy-refresh agents/models if caches are empty
+    if (this.sessionManager.getAvailableModes().length === 0) {
+      try { await this.sessionManager.refreshAgents(); } catch { /* ignore */ }
+    }
+    if (this.sessionManager.getAvailableModels().length === 0) {
+      try { await this.sessionManager.refreshProviders(); } catch { /* ignore */ }
+    }
+
     const currentMode = this.sessionManager.getActiveMode();
     const currentModel = this.sessionManager.getCurrentModel() ?? "(not set)";
-    const currentReasoning = this.sessionManager.getCurrentReasoning() ?? "(not set)";
+    let currentReasoning = this.sessionManager.getCurrentReasoning();
+    if (!currentReasoning) {
+      // Default to the first reasoning level of the current model
+      const levels = this.sessionManager.getReasoningLevels();
+      if (levels.length > 0) {
+        currentReasoning = levels[0].value;
+      } else {
+        currentReasoning = "(not set)";
+      }
+    }
     const contextUsage = this.sessionManager.getContextUsage();
     const sessionId = this.sessionManager.getSessionId();
 
-    const sessionInfo = sessionId ? { id: sessionId, cwd } : null;
+    const sessionTitle = sessionId ? await this.sessionManager.getSessionTitle(sessionId).catch(() => undefined) : undefined;
+    const sessionInfo = sessionId ? { id: sessionId, cwd, title: sessionTitle } : null;
 
     const statusText = formatStatus({
       session: sessionInfo,
@@ -847,21 +917,14 @@ export class WeChatOpencodeBridge {
       }
 
       case "on": {
-        await this.sendReply(contextToken, "⏸️ Feature temporarily disabled.");
+        this.sessionManager.setShowFlags({ showThoughts: true, showTools: true });
+        await this.sendReply(contextToken, "✅ Thinking & tool display on");
         break;
       }
 
       case "off": {
-        if (cmd!.target === "tools") {
-          this.sessionManager.setShowFlags({ showTools: false });
-          await this.sendReply(contextToken, "❌ Tool display off");
-        } else if (cmd!.target === "thoughts") {
-          this.sessionManager.setShowFlags({ showThoughts: false });
-          await this.sendReply(contextToken, "❌ Thinking display off");
-        } else {
-          this.sessionManager.setShowFlags({ showThoughts: false, showTools: false });
-          await this.sendReply(contextToken, "❌ Thinking & tool display off");
-        }
+        this.sessionManager.setShowFlags({ showThoughts: false, showTools: false });
+        await this.sendReply(contextToken, "❌ Thinking & tool display off");
         break;
       }
     }
