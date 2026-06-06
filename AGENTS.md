@@ -6,11 +6,11 @@
 3. 精准修改 — 只碰必须碰的，只清理自己造成的混乱
 4. 目标驱动执行 — 定义成功标准，循环验证直到达成
 
-> Bridge WeChat direct messages to any ACP-compatible AI agent.
+> Bridge WeChat direct messages to OpenCode Server via HTTP API.
 
 ## Project Overview
 
-- **Package**: `wechat-opencode` v0.3.9 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-bridge-opencode` v0.3.10 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -33,25 +33,25 @@ npm run prepack      # Runs build before npm publish
 ```bash
 npm run build
 node dist/bin/wechat-opencode.js --help
-node dist/bin/wechat-opencode.js --agent opencode
+node dist/bin/wechat-opencode.js          # auto-starts opencode serve
+node dist/bin/wechat-opencode.js --no-server  # uses external server
 ```
 
 ## Architecture
 
 ```
-bin/wechat-opencode.ts          — CLI entry (arg parsing, daemon, QR rendering)
+bin/wechat-opencode.ts          — CLI entry (arg parsing, daemon, sidecar server, QR rendering)
 src/index.ts                    — Public API exports
-src/bridge.ts                   — Main orchestrator (WeChat poll ↔ ACP sessions)
-src/config.ts                   — Config types, defaults, agent preset registry
+src/bridge.ts                   — Main orchestrator (WeChat poll ↔ OpenCode Server HTTP)
+src/config.ts                   — Config types, defaults, server connection config
+src/types.ts                    — Shared types (MessagePart, ModelRef, MediaContent)
 src/vendor.d.ts                 — Type declarations for untyped npm packages
-src/acp/
-  session.ts                    — Per-user ACP session manager (spawn/kill/queue)
-  agent-manager.ts              — Spawn agent subprocess + ACP connection (newSession/resumeSession)
-  opencode-sessions.ts          — Read OpenCode SQLite (sessions list, @deprecated fallback only)
-  workspace-manager.ts          — (removed — simplified to direct session management)
+src/server/
+  client.ts                     — OpenCode Server HTTP client (fetch wrapper)
+  session.ts                    — Simplified SessionManager (no subprocess, just HTTP)
 src/adapter/
-  inbound.ts                    — WeChat message → ACP ContentBlock[] (text, image, file)
-  outbound.ts                   — ACP reply → WeChat text (formatting, splitting)
+  inbound.ts                    — WeChat message → MessagePart[] (text, image, file)
+  outbound.ts                   — Server reply → WeChat text (formatting, splitting)
   workspace-cmd.ts              — Parse /workspace, /session, /agent, /model, /reasoning, /help commands
 src/weixin/
   auth.ts                       — WeChat iLink login (QR code, token persistence)
@@ -63,17 +63,17 @@ src/weixin/
 ```
 
 ### Key flows
-1. **CLI** parses args → resolves agent preset → creates `WeChatOpencodeBridge`
-2. **Bridge** handles QR login → starts `SessionManager` → begins WeChat long-poll
-3. **SessionManager** spawns one ACP subprocess per WeChat user
-4. **Adapters** convert WeChat messages ↔ ACP prompt format and back
+1. **CLI** starts `opencode serve` as sidecar → creates `WeChatOpencodeBridge`
+2. **Bridge** handles QR login → creates `SessionManager` (HTTP client) → begins WeChat long-poll
+3. **SessionManager** communicates with OpenCode Server via HTTP REST API (POST /session, POST /session/:id/message)
+4. **Adapters** convert WeChat messages ↔ server message parts
 
 ### Session management
-- Each WeChat user has **one active agent process** at a time
-- Switching workspace/session uses ACP protocol (`session/new`, `session/load`) — **no process restart**
-- Agent process is spawned once per user; all session/workspace/agent/model/reasoning switches happen within the same process
-- `unstable_resumeSession()` is no longer used — `loadSession()` replaces it
-- Session ID is persisted per-user in `~/.wechat-opencode/.wechat-bridge-state.json`
+- **Single-user**: no Map-based routing, no per-user subprocess
+- Agent process is managed by `opencode serve` — bridge only sends HTTP requests
+- Session ID is persisted in `~/.wechat-opencode/.wechat-bridge-state.json`
+- Mode/model/reasoning are passed as per-request parameters, not ACP RPC calls
+- ACL, permission handling, tool execution are all server-side
 
 ## Code Style
 
@@ -99,9 +99,9 @@ src/weixin/
 
 ### Naming
 - **Classes**: `PascalCase` — `WeChatOpencodeBridge`, `SessionManager`
-- **Interfaces**: `PascalCase` — `WeChatOpencodeConfig`, `AgentPreset`
-- **Functions/methods**: `camelCase` — `parseAgentCommand`, `handleMessage`
-- **Constants**: `UPPER_SNAKE_CASE` — `BUILT_IN_AGENTS`, `TEXT_CHUNK_LIMIT`
+- **Interfaces**: `PascalCase` — `WeChatOpencodeConfig`, `SessionMode`
+- **Functions/methods**: `camelCase` — `handleMessage`, `sendReply`
+- **Constants**: `UPPER_SNAKE_CASE` — `TEXT_CHUNK_LIMIT`, `MSG_LIMIT_MAX`
 - **Private fields**: `camelCase` with `private` modifier — `private config`, `private abortController`
 
 ### Error Handling
@@ -114,7 +114,7 @@ src/weixin/
   ```
 - **Throw** `Error` with descriptive messages for invalid input:
   ```ts
-  throw new Error("Agent command cannot be empty");
+  throw new Error("Session not found on server");
   ```
 - CLI errors use `console.error` + `process.exit(1)`
 
@@ -131,15 +131,15 @@ src/weixin/
 
 ## Adding Features
 
-1. **New agent preset**: Add entry to `BUILT_IN_AGENTS` in `src/config.ts`
-2. **New message type**: Update `MessageType` enum in `src/weixin/types.ts`, add handling in `src/adapter/inbound.ts`
+1. **New message type**: Update `MessageType` enum in `src/weixin/types.ts`, add handling in `src/adapter/inbound.ts`
+2. **New Server API call**: Add method to `src/server/client.ts`, use in `src/server/session.ts` or `src/bridge.ts`
 3. **New CLI option**: Add to `parseArgs()` in `bin/wechat-opencode.ts`, update `usage()`, pass through to config
 
 ## Constraints
 
 - **Direct messages only** — group chats are intentionally ignored
-- **Permission requests are auto-approved** — all agent permission requests are auto-allowed
-- **One agent per user** — managed by `SessionManager` with idle timeout and max concurrent limits
+- **Permission requests are auto-approved** — handled server-side by OpenCode
+- **Single-user** — one WeChat user, one OpenCode session at a time
 - **Runtime state** stored in `~/.wechat-opencode/` (auth tokens, daemon PID, logs, user states)
 
 ## WeChat Commands
@@ -147,18 +147,16 @@ src/weixin/
 ### Workspace (/workspace or /ws)
 | Command | Description |
 |---------|-------------|
-| `/workspace list` | List all directories from OpenCode sessions |
-| `/workspace switch <n\|path>` | Switch to directory by index or path |
-| `/workspace add /path [name]` | Add directory (creates if not exists) |
+| `/workspace list` | Show current workspace directory |
+| `/workspace switch <path>` | Switch to directory by path |
+| `/workspace add /path` | Add directory (creates if not exists) |
 | `/workspace status` | Show current directory |
 
 ### Session (/session or /s)
 | Command | Description |
 |---------|-------------|
-| `/session list` | List recent 10 sessions with directory |
-| `/session list --cwd` | List sessions in current workspace only |
-| `/session list <path\|n>` | List sessions filtered by workspace path or index |
-| `/session switch <n\|slug>` | Switch to session by index or slug |
+| `/session list` | List recent sessions from the server |
+| `/session switch <n>` | Switch to session by index |
 | `/session new` | Restart session (clear context) |
 | `/session status` | Show current session info |
 
@@ -172,9 +170,8 @@ src/weixin/
 ### Model (/model)
 | Command | Description |
 |---------|-------------|
-| `/model list` | List all providers with model counts |
-| `/model list <provider>` | List models for a specific provider |
-| `/model switch <provider/model\|n>` | Switch model by full name or index (last queried provider) |
+| `/model list` | Show current model |
+| `/model switch <provider/model>` | Switch model (e.g. anthropic/claude-sonnet-4-5) |
 | `/model status` | Show current model |
 
 ### Reasoning (/reasoning)
@@ -192,12 +189,12 @@ src/weixin/
 ### Stop (/stop)
 | Command | Description |
 |---------|-------------|
-| `/stop` | Cancel the running agent (equivalent to pressing ESC in OpenCode terminal) |
+| `/stop` | Cancel the running agent |
+| `/restart` | New session (clear context) |
 
 ### Thinking (/thinking)
 | Command | Description |
 |---------|-------------|
-| `/thinking on` | Enable thinking & tool display (temporarily disabled) |
 | `/thinking off` | Disable thinking & tool display |
 | `/thinking status` | Show current thinking & tool display settings |
 
@@ -209,10 +206,10 @@ src/weixin/
 ## References
 
 - **OpenCode** — https://github.com/anomalyco/opencode
-  The AI agent this project bridges to. Source for ACP protocol details, tool definitions, and agent behavior.
+  The AI agent this project bridges to. Source for OpenCode Server HTTP API.
+- **OpenCode Server Docs** — https://opencode.ai/docs/server/
+  Official documentation for the OpenCode Server REST API and SSE event stream.
+- **OpenCode SDK** — https://opencode.ai/docs/sdk/
+  TypeScript SDK for interacting with OpenCode Server (`@opencode-ai/sdk`).
 - **OpenClaw Weixin** — https://github.com/Tencent/openclaw-weixin
-  Official WeChat iLink API reference implementation. Authoritative source for image/file/video sending patterns, `image_item` vs `file_item` structures, CDN upload flows, and `mid_size` (ciphertext size) usage.
-- **OpenCode Docs** — https://opencode.ai/docs/
-  Official documentation for OpenCode configuration, tool registration, and agent customization.
-  **ACP Docs** https://agentclientprotocol.com/
-  ACP Server Protocol which OpenCode useing.
+  Official WeChat iLink API reference implementation. Authoritative source for image/file/video sending patterns, CDN upload flows, and AES-ECB encryption details.

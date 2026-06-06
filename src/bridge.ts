@@ -1,9 +1,8 @@
 /**
  * WeChatOpencodeBridge — the main orchestrator.
  *
- * Two concepts:
- *   - Session: OpenCode conversation (from SQLite)
- *   - Directory: working directory (cwd)
+ * Single-user architecture: no Map<string, ...> patterns.
+ * Communicates with OpenCode Server via HTTP (not ACP subprocess).
  */
 
 import http from "node:http";
@@ -15,14 +14,10 @@ import { sendTextMessage, sendMediaMessage, splitText } from "./weixin/send.js";
 import { sendTyping, getConfig } from "./weixin/api.js";
 import { TypingStatus, MessageType, UploadMediaType } from "./weixin/types.js";
 import type { WeixinMessage } from "./weixin/types.js";
-import { SessionManager } from "./acp/session.js";
-// Fallback only — prefer sessionManager.listAgentSessions()
-import { listSessions } from "./acp/opencode-sessions.js";
-import { getInstalledVersion, getLatestVersion, upgradeOpenCode } from "./acp/agent-manager.js";
-import { WeChatAcpClient } from "./acp/client.js";
-import type { MediaContent } from "./acp/client.js";
+import { SessionManager } from "./server/session.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
 import { formatForWeChat } from "./adapter/outbound.js";
+import type { MediaContent } from "./types.js";
 import {
   parseWorkspaceCommand,
   parseSessionCommand,
@@ -32,16 +27,12 @@ import {
   parseStatusCommand,
   parseThinkingCommand,
   parseStopCommand,
-  parseVersionCommand,
-  parseUpgradeCommand,
   parseRestartCommand,
   parseHelpCommand,
-  formatHelp,
   formatHelpWithNativeCommands,
   formatStatus,
 } from "./adapter/workspace-cmd.js";
-import { listBuiltInAgents, type WeChatOpencodeConfig } from "./config.js";
-import type { ModelInfo } from "@agentclientprotocol/sdk";
+import type { WeChatOpencodeConfig } from "./config.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 const TOOL_API_PORT = 18792;
@@ -56,11 +47,8 @@ type PendingMessage =
 
 interface UserState {
   userId: string;
-  sessionId: string;       // OpenCode session ID (for resume)
+  sessionId: string;
   cwd: string;
-  currentMode?: string;     // Saved agent mode
-  currentModelId?: string;  // Saved model
-  currentReasoning?: string; // Saved reasoning level
 }
 
 export class WeChatOpencodeBridge {
@@ -68,13 +56,14 @@ export class WeChatOpencodeBridge {
   private abortController = new AbortController();
   private sessionManager: SessionManager | null = null;
   private tokenData: TokenData | null = null;
-  private userStates = new Map<string, UserState>();
-  private typingTickets = new Map<string, { ticket: string; expiresAt: number }>();
+  private userState: UserState | null = null;
+  private currentContextToken: string | null = null;
+  private typingTicket: { ticket: string; expiresAt: number } | null = null;
   private toolApiServer: http.Server | null = null;
-  /** Per-user WeChat message count since last user reply (for 10-msg gateway limit). */
-  private wechatMsgCount = new Map<string, number>();
-  /** Messages cached when 10-msg limit reached, flushed on /next. */
-  private pendingOutbound = new Map<string, PendingMessage[]>();
+
+  // Single-user state (no Map<string, ...>)
+  private wechatMsgCount = 0;
+  private pendingOutbound: PendingMessage[] = [];
   private static readonly MSG_LIMIT_WARN = 7;
   private static readonly MSG_LIMIT_MAX = 10;
   private log: (msg: string) => void;
@@ -83,6 +72,8 @@ export class WeChatOpencodeBridge {
     this.config = config;
     this.log = log ?? ((msg: string) => console.log(`[wechat-opencode] ${msg}`));
   }
+
+  // ─── Lifecycle ───
 
   async start(opts?: { forceLogin?: boolean; renderQrUrl?: (url: string) => void }): Promise<void> {
     const { forceLogin, renderQrUrl } = opts ?? {};
@@ -108,41 +99,28 @@ export class WeChatOpencodeBridge {
       });
     } else {
       this.log(`Loaded saved token (Bot: ${this.tokenData.accountId}, saved at ${this.tokenData.savedAt})`);
-      this.log(`Use --login to force re-login`);
+      this.log("Use --login to force re-login");
     }
 
-    // 2. Load saved user states
-    this.loadUserStates();
+    // 2. Load saved user state
+    this.loadUserState();
 
-    // 3. Create SessionManager
+    // 3. Create SessionManager (HTTP-based, no subprocess)
     this.sessionManager = new SessionManager({
-      agentCommand: this.config.agent.command,
-      agentArgs: this.config.agent.args,
-      agentEnv: this.config.agent.env,
-      idleTimeoutMs: this.config.session.idleTimeoutMs,
-      showThoughts: this.config.agent.showThoughts,
-      showTools: this.config.agent.showTools,
+      serverUrl: this.config.server.url,
+      cwd: this.config.agent.cwd,
       log: this.log,
-      onReply: (userId, contextToken, text) => this.sendReply(userId, contextToken, text),
-      onMediaReply: (userId, contextToken, blocks) => this.sendMediaReply(userId, contextToken, blocks),
-      sendTyping: (userId, contextToken) => this.sendTypingIndicator(userId, contextToken),
-      resolveCwd: (userId) => this.userStates.get(userId)?.cwd ?? this.config.agent.cwd,
-      getExistingSessionId: (userId) => {
-        const state = this.userStates.get(userId);
-        return state?.sessionId && state.sessionId !== "" ? state.sessionId : undefined;
-      },
-      onSessionReady: (userId, sessionId) => {
-        const state = this.userStates.get(userId);
-        if (!state) {
-          // New user — create state on first session ready
-          this.setUserState(userId, sessionId, this.config.agent.cwd);
-        } else if (state.sessionId !== sessionId) {
-          // Existing user — only write when sessionId changes
-          this.setUserState(userId, sessionId, state.cwd);
+      onReply: (contextToken, text) => this.sendReply(contextToken, text),
+      onMediaReply: (contextToken, blocks) => this.sendMediaReply(contextToken, blocks),
+      sendTyping: (contextToken) => this.sendTypingIndicator(contextToken),
+      onSessionReady: (sessionId) => {
+        if (!this.userState) {
+          this.setUserState(sessionId, this.config.agent.cwd);
+        } else if (this.userState.sessionId !== sessionId) {
+          this.setUserState(sessionId, this.userState.cwd);
         }
       },
     });
-    this.sessionManager.start();
 
     // 4. Tool API server
     this.startToolApiServer();
@@ -162,7 +140,7 @@ export class WeChatOpencodeBridge {
   async stop(): Promise<void> {
     this.log("Stopping bridge...");
     this.abortController.abort();
-    await this.sessionManager?.stop();
+    this.sessionManager = null;
     if (this.toolApiServer) {
       await new Promise<void>((resolve) => this.toolApiServer!.close(() => resolve()));
       this.toolApiServer = null;
@@ -170,48 +148,54 @@ export class WeChatOpencodeBridge {
     this.log("Bridge stopped");
   }
 
-  // ─── User state ───
+  // ─── User state (single-user) ───
 
-  private loadUserStates(): void {
+  private loadUserState(): void {
     try {
       const stateFile = path.join(this.config.storage.dir, ".wechat-bridge-state.json");
       const raw = fs.readFileSync(stateFile, "utf-8");
-      const state = JSON.parse(raw) as { users?: Array<{ userId: string; sessionId?: string; cwd: string }> };
-      if (state.users) {
-        for (const u of state.users) {
-          this.userStates.set(u.userId, {
-            userId: u.userId,
-            sessionId: u.sessionId ?? "",
-            cwd: u.cwd,
-          });
-        }
+      const state = JSON.parse(raw) as
+        | { sessionId?: string; cwd: string }
+        | { users?: Array<{ userId: string; sessionId?: string; cwd: string }> };
+      if ("users" in state && state.users && state.users.length > 0) {
+        const u = state.users[0];
+        this.userState = { userId: u.userId ?? "", sessionId: u.sessionId ?? "", cwd: u.cwd };
+      } else if ("sessionId" in state || "cwd" in state) {
+        this.userState = {
+          userId: "",
+          sessionId: (state as { sessionId?: string }).sessionId ?? "",
+          cwd: (state as { cwd: string }).cwd,
+        };
       }
     } catch {
       // No saved state
     }
   }
 
-  private saveUserStates(): void {
+  private saveUserState(): void {
+    if (!this.userState) return;
     try {
       const stateFile = path.join(this.config.storage.dir, ".wechat-bridge-state.json");
-      const users = Array.from(this.userStates.values());
-      fs.writeFileSync(stateFile, JSON.stringify({ users, updatedAt: new Date().toISOString() }, null, 2));
+      fs.writeFileSync(
+        stateFile,
+        JSON.stringify(
+          { sessionId: this.userState.sessionId, cwd: this.userState.cwd, updatedAt: new Date().toISOString() },
+          null,
+          2,
+        ),
+      );
     } catch {
       // Best effort
     }
   }
 
-  private setUserState(userId: string, sessionId: string, cwd: string): void {
-    this.userStates.clear();
-    this.userStates.set(userId, { userId, sessionId, cwd });
-    this.saveUserStates();
+  private setUserState(sessionId: string, cwd: string): void {
+    const userId = this.userState?.userId ?? "";
+    this.userState = { userId, sessionId, cwd };
+    this.saveUserState();
   }
 
-  private getUserState(userId: string): UserState | null {
-    return this.userStates.get(userId) ?? null;
-  }
-
-  // ─── Tool API ───
+  // ─── Tool API (send-wechat endpoint) ───
 
   private startToolApiServer(): void {
     this.toolApiServer = http.createServer(async (req, res) => {
@@ -225,7 +209,7 @@ export class WeChatOpencodeBridge {
       for await (const chunk of req) body += chunk;
 
       try {
-        const { sessionId, userId: directUserId, filePath, mimeType, text } = JSON.parse(body) as {
+        const { filePath, mimeType, text } = JSON.parse(body) as {
           sessionId?: string; userId?: string; filePath?: string; mimeType?: string; text?: string;
         };
 
@@ -235,64 +219,25 @@ export class WeChatOpencodeBridge {
           return;
         }
 
-        let targetUserId: string;
-        let contextToken: string;
-
-        if (sessionId) {
-          const userInfo = this.sessionManager!.getUserBySessionId(sessionId);
-          if (userInfo) {
-            targetUserId = userInfo.userId;
-            contextToken = userInfo.contextToken;
-          } else if (directUserId) {
-            // sessionId may be stale (e.g. user did /session new). Fall back to userId.
-            const session = this.sessionManager!.getSession(directUserId);
-            if (!session) {
-              res.writeHead(404, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "User session not found. Has this user sent a message recently?" }));
-              return;
-            }
-            targetUserId = directUserId;
-            contextToken = session.contextToken;
-          } else {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Session not found" }));
-            return;
-          }
-        } else if (directUserId) {
-          const session = this.sessionManager!.getSession(directUserId);
-          if (!session) {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "User session not found. Has this user sent a message recently?" }));
-            return;
-          }
-          targetUserId = directUserId;
-          contextToken = session.contextToken;
-        } else {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Either sessionId or userId is required" }));
-          return;
-        }
-
+        const targetUserId = this.userState?.userId ?? "";
+        const contextToken = this.currentContextToken ?? "";
         const results: string[] = [];
 
-        // Send text if provided
+        // Send text
         if (text) {
           const segments = splitText(text, TEXT_CHUNK_LIMIT);
           for (const segment of segments) {
-            const sent = this.wechatMsgCount.get(targetUserId) ?? 0;
-            if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
-              this.log(`[tool-api] WeChat 10-msg limit reached (sent=${sent}), caching remaining text segments`);
+            if (this.wechatMsgCount >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+              this.log(`[tool-api] WeChat 10-msg limit reached (sent=${this.wechatMsgCount}), caching remaining text segments`);
               const remaining = segments.slice(segments.indexOf(segment));
               const cached: PendingMessage[] = remaining.map((s) => ({ kind: "tool_text", text: s, contextToken }));
-              const existing = this.pendingOutbound.get(targetUserId) ?? [];
-              this.pendingOutbound.set(targetUserId, [...existing, ...cached]);
+              this.pendingOutbound = [...this.pendingOutbound, ...cached];
               break;
             }
-            // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
-            this.wechatMsgCount.set(targetUserId, sent + 1);
+            this.wechatMsgCount++;
             let payload = segment;
-            if (sent >= WeChatOpencodeBridge.MSG_LIMIT_WARN) {
-              payload += `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${sent + 1} 条），发送 /next 可重置`;
+            if (this.wechatMsgCount > WeChatOpencodeBridge.MSG_LIMIT_WARN) {
+              payload += `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${this.wechatMsgCount} 条），发送 /next 可重置`;
             }
             await sendTextMessage(targetUserId, payload, {
               baseUrl: this.tokenData!.baseUrl,
@@ -301,25 +246,20 @@ export class WeChatOpencodeBridge {
             });
           }
           results.push("text");
-          this.log(`[tool-api] Sent text (${text.length} chars) to user ${targetUserId} (sent=${this.wechatMsgCount.get(targetUserId) ?? 0})`);
+          this.log(`[tool-api] Sent text (${text.length} chars, sent=${this.wechatMsgCount})`);
         }
 
-        // Send file if provided
+        // Send file
         if (filePath) {
-          const sent = this.wechatMsgCount.get(targetUserId) ?? 0;
-          if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
-            this.log(`[tool-api] WeChat 10-msg limit reached (sent=${sent}), caching file`);
+          if (this.wechatMsgCount >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+            this.log(`[tool-api] WeChat 10-msg limit reached (sent=${this.wechatMsgCount}), caching file`);
             const fName = path.basename(filePath);
-            const cached: PendingMessage = { kind: "tool_file", filePath, fileName: fName, mimeType, contextToken };
-            const existing = this.pendingOutbound.get(targetUserId) ?? [];
-            this.pendingOutbound.set(targetUserId, [...existing, cached]);
+            this.pendingOutbound.push({ kind: "tool_file", filePath, fileName: fName, mimeType, contextToken });
           } else {
-            // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
-            this.wechatMsgCount.set(targetUserId, sent + 1);
+            this.wechatMsgCount++;
             const fileBuffer = await fs.promises.readFile(filePath);
             const fileName = path.basename(filePath);
             const detectedMimeType = mimeType ?? this.guessMimeType(fileName);
-
             await sendMediaMessage(targetUserId, this.mimeToMediaType(detectedMimeType), fileBuffer, {
               baseUrl: this.tokenData!.baseUrl,
               token: this.tokenData!.token,
@@ -329,7 +269,7 @@ export class WeChatOpencodeBridge {
               fileName,
             });
             results.push("file");
-            this.log(`[tool-api] Sent file ${fileName} to user ${targetUserId} (sent=${this.wechatMsgCount.get(targetUserId) ?? 0})`);
+            this.log(`[tool-api] Sent file ${fileName} (sent=${this.wechatMsgCount})`);
           }
         }
 
@@ -353,26 +293,21 @@ export class WeChatOpencodeBridge {
   private guessMimeType(fileName: string): string {
     const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
     const map: Record<string, string> = {
-      // Image
       png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
       gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
       bmp: "image/bmp", ico: "image/x-icon",
-      // Video
       mp4: "video/mp4", mov: "video/quicktime", avi: "video/x-msvideo",
       mkv: "video/x-matroska", webm: "video/webm", flv: "video/x-flv",
       wmv: "video/x-ms-wmv", m4v: "video/mp4", "3gp": "video/3gpp",
-      // Audio
       mp3: "audio/mpeg", wav: "audio/wav", aac: "audio/aac",
       ogg: "audio/ogg", flac: "audio/flac", wma: "audio/x-ms-wma",
       m4a: "audio/mp4", amr: "audio/amr", opus: "audio/opus",
-      // Document
       pdf: "application/pdf", doc: "application/msword",
       docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       xls: "application/vnd.ms-excel",
       xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       ppt: "application/vnd.ms-powerpoint",
       pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      // Text / Code
       txt: "text/plain", md: "text/markdown", json: "application/json",
       js: "text/javascript", ts: "text/typescript", py: "text/x-python",
       java: "text/x-java", go: "text/x-go", rs: "text/x-rust",
@@ -383,7 +318,6 @@ export class WeChatOpencodeBridge {
       yaml: "text/yaml", yml: "text/yaml", toml: "text/toml",
       ini: "text/plain", cfg: "text/plain", conf: "text/plain",
       log: "text/plain", csv: "text/csv",
-      // Archive
       zip: "application/zip", rar: "application/vnd.rar",
       "7z": "application/x-7z-compressed", tar: "application/x-tar",
       gz: "application/gzip", bz2: "application/x-bzip2",
@@ -391,9 +325,6 @@ export class WeChatOpencodeBridge {
     return map[ext] ?? "application/octet-stream";
   }
 
-  /** Map MIME type to WeChat upload media type.
-   *  NOTE: audio/* maps to FILE, not VOICE — iLink Bot API does not support
-   *  bot-sending native voice messages (VOICE is receive-only). */
   private mimeToMediaType(mime: string): 1 | 2 | 3 | 4 {
     if (mime.startsWith("image/")) return UploadMediaType.IMAGE;
     if (mime.startsWith("video/")) return UploadMediaType.VIDEO;
@@ -410,14 +341,23 @@ export class WeChatOpencodeBridge {
     const contextToken = msg.context_token;
     if (!userId || !contextToken) return;
 
-    // User reply resets the WeChat 10-message gateway limit
-    this.wechatMsgCount.set(userId, 0);
+    // Track context token for send-wechat tool replies
+    this.currentContextToken = contextToken;
 
-    // Auto-flush pending cache on any user message (Plan A: cache priority)
-    const pending = this.pendingOutbound.get(userId);
-    if (pending && pending.length > 0 && !/^\/next\b/.test(this.extractTextFromMessage(msg)?.trim() ?? "")) {
-      this.flushPending(userId, contextToken).catch((err) => {
-        this.log(`[${userId}] auto-flush error: ${String(err)}`);
+    // Ensure user state — always set userId, loadUserState may have set it to ""
+    if (!this.userState) {
+      this.userState = { userId, sessionId: "", cwd: this.config.agent.cwd };
+    } else {
+      this.userState.userId = userId;
+    }
+
+    // User reply resets the WeChat 10-message gateway limit
+    this.wechatMsgCount = 0;
+
+    // Auto-flush pending cache on any user message
+    if (this.pendingOutbound.length > 0 && !/^\/next\b/.test(this.extractTextFromMessage(msg)?.trim() ?? "")) {
+      this.flushPending(contextToken).catch((err) => {
+        this.log(`auto-flush error: ${String(err)}`);
       });
     }
 
@@ -426,13 +366,13 @@ export class WeChatOpencodeBridge {
     const textContent = this.extractTextFromMessage(msg);
     if (textContent) {
       if (parseHelpCommand(textContent)) {
-        this.sendHelpReply(userId, contextToken).catch(() => {});
+        this.sendHelpReply(contextToken).catch(() => {});
         return;
       }
 
       const wsCmd = parseWorkspaceCommand(textContent);
       if (wsCmd) {
-        this.handleDirectoryCommand(userId, contextToken, wsCmd).catch((err) => {
+        this.handleDirectoryCommand(contextToken, wsCmd).catch((err) => {
           this.log(`Directory command error: ${String(err)}`);
         });
         return;
@@ -440,7 +380,7 @@ export class WeChatOpencodeBridge {
 
       const sCmd = parseSessionCommand(textContent);
       if (sCmd) {
-        this.handleSessionCommand(userId, contextToken, sCmd).catch((err) => {
+        this.handleSessionCommand(contextToken, sCmd).catch((err) => {
           this.log(`Session command error: ${String(err)}`);
         });
         return;
@@ -448,7 +388,7 @@ export class WeChatOpencodeBridge {
 
       const aCmd = parseAgentCommand(textContent);
       if (aCmd) {
-        this.handleAgentCommand(userId, contextToken, aCmd).catch((err) => {
+        this.handleAgentCommand(contextToken, aCmd).catch((err) => {
           this.log(`Agent command error: ${String(err)}`);
         });
         return;
@@ -456,7 +396,7 @@ export class WeChatOpencodeBridge {
 
       const mCmd = parseModelCommand(textContent);
       if (mCmd) {
-        this.handleModelCommand(userId, contextToken, mCmd).catch((err) => {
+        this.handleModelCommand(contextToken, mCmd).catch((err) => {
           this.log(`Model command error: ${String(err)}`);
         });
         return;
@@ -464,7 +404,7 @@ export class WeChatOpencodeBridge {
 
       const rCmd = parseReasoningCommand(textContent);
       if (rCmd) {
-        this.handleReasoningCommand(userId, contextToken, rCmd).catch((err) => {
+        this.handleReasoningCommand(contextToken, rCmd).catch((err) => {
           this.log(`Reasoning command error: ${String(err)}`);
         });
         return;
@@ -472,7 +412,7 @@ export class WeChatOpencodeBridge {
 
       const stCmd = parseStatusCommand(textContent);
       if (stCmd) {
-        this.handleStatusCommand(userId, contextToken, stCmd).catch((err) => {
+        this.handleStatusCommand(contextToken, stCmd).catch((err) => {
           this.log(`Status command error: ${String(err)}`);
         });
         return;
@@ -480,7 +420,7 @@ export class WeChatOpencodeBridge {
 
       const thCmd = parseThinkingCommand(textContent);
       if (thCmd) {
-        this.handleThinkingCommand(userId, contextToken, thCmd).catch((err) => {
+        this.handleThinkingCommand(contextToken, thCmd).catch((err) => {
           this.log(`Thinking command error: ${String(err)}`);
         });
         return;
@@ -488,65 +428,47 @@ export class WeChatOpencodeBridge {
 
       const stopCmd = parseStopCommand(textContent);
       if (stopCmd) {
-        this.handleStopCommand(userId, contextToken, stopCmd).catch((err) => {
+        this.handleStopCommand(contextToken, stopCmd).catch((err) => {
           this.log(`Stop command error: ${String(err)}`);
-        });
-        return;
-      }
-
-      const versionCmd = parseVersionCommand(textContent);
-      if (versionCmd) {
-        this.handleVersionCommand(userId, contextToken, versionCmd).catch((err) => {
-          this.log(`Version command error: ${String(err)}`);
-        });
-        return;
-      }
-
-      const upgradeCmd = parseUpgradeCommand(textContent);
-      if (upgradeCmd) {
-        this.handleUpgradeCommand(userId, contextToken, upgradeCmd).catch((err) => {
-          this.log(`Upgrade command error: ${String(err)}`);
         });
         return;
       }
 
       // /next — flush cached messages, do NOT forward to agent
       if (/^\/next\b/.test(textContent.trim())) {
-        this.flushPending(userId, contextToken).catch((err) => {
-          this.log(`[${userId}] /next error: ${String(err)}`);
+        this.flushPending(contextToken).catch((err) => {
+          this.log(`/next error: ${String(err)}`);
         });
         return;
       }
 
       const restartCmd = parseRestartCommand(textContent);
       if (restartCmd) {
-        this.handleRestartCommand(userId, contextToken, restartCmd).catch((err) => {
+        this.handleRestartCommand(contextToken, restartCmd).catch((err) => {
           this.log(`Restart command error: ${String(err)}`);
         });
         return;
       }
 
-      // Check for unrecognized slash commands — send hint immediately, then forward to agent
+      // Unrecognized slash commands — send hint, then forward to agent
       const slashHint = this.detectUnknownSlashCommand(textContent);
       if (slashHint) {
-        // Send hint as immediate independent reply, then enqueue message without hint
-        this.sendReply(userId, contextToken, slashHint).catch(() => {});
-        this.enqueueMessage(msg, userId, contextToken).catch((err) => {
-          this.log(`Failed to enqueue message from ${userId}: ${String(err)}`);
+        this.sendReply(contextToken, slashHint).catch(() => {});
+        this.enqueueMessage(msg, contextToken).catch((err) => {
+          this.log(`Failed to enqueue message: ${String(err)}`);
         });
         return;
       }
     }
 
-    this.enqueueMessage(msg, userId, contextToken).catch((err) => {
-      this.log(`Failed to enqueue message from ${userId}: ${String(err)}`);
+    this.enqueueMessage(msg, contextToken).catch((err) => {
+      this.log(`Failed to enqueue message: ${String(err)}`);
     });
   }
 
   // ─── Directory commands (/workspace or /ws) ───
 
   private async handleDirectoryCommand(
-    userId: string,
     contextToken: string,
     cmd: ReturnType<typeof parseWorkspaceCommand>,
   ): Promise<void> {
@@ -554,127 +476,71 @@ export class WeChatOpencodeBridge {
 
     switch (cmd!.kind) {
       case "list": {
-        // SQLite is the authoritative source for all historical sessions.
-        // ACP session/list only returns sessions known to the current agent process,
-        // which is often incomplete.
-        const sessions = listSessions().map((s) => ({ sessionId: s.id, cwd: s.directory, title: s.title }));
-        // Unique directories, preserve order (most recent first)
-        const dirs: string[] = [];
-        for (const s of sessions) {
-          if (!dirs.includes(s.cwd)) dirs.push(s.cwd);
-        }
-        if (dirs.length === 0) {
-          await this.sendReply(userId, contextToken, "No workspaces found.");
-        } else {
-          const lines = ["📂 Workspaces:"];
-          for (let i = 0; i < dirs.length; i++) {
-            lines.push(`  ${i + 1}. ${dirs[i]}`);
-          }
-          await this.sendReply(userId, contextToken, lines.join("\n"));
-        }
+        const currentCwd = this.userState?.cwd ?? this.config.agent.cwd;
+        const sessions = await this.sessionManager.listServerSessions();
+        // Derive unique workspaces from session titles (or just show current)
+        await this.sendReply(contextToken, `📂 Current workspace:\n  ${currentCwd}\n\n💡 Use /workspace switch <path> to change`);
         break;
       }
 
       case "status": {
-        const state = this.getUserState(userId);
-        await this.sendReply(userId, contextToken, `📂 ${state?.cwd ?? this.config.agent.cwd}`);
+        const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+        await this.sendReply(contextToken, `📂 ${cwd}`);
         break;
       }
 
       case "switch": {
-        // SQLite for listing (authoritative), ACP for switching
-        const sessions = listSessions().map((s) => ({ sessionId: s.id, cwd: s.directory, title: s.title }));
-        const dirs: string[] = [];
-        for (const s of sessions) {
-          if (!dirs.includes(s.cwd)) dirs.push(s.cwd);
-        }
-
-        // Try numeric index first
-        const idx = parseInt(cmd!.name!, 10);
-        if (!isNaN(idx) && idx >= 1 && idx <= dirs.length) {
-          const targetDir = dirs[idx - 1];
-          const state = this.getUserState(userId);
-          if (state && state.cwd === targetDir) {
-            await this.sendReply(userId, contextToken, `Already on ${targetDir}`);
-            return;
-          }
-          // Check if directory exists
-          if (!fs.existsSync(targetDir)) {
-            await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${targetDir}\nPlease remove this workspace or create the directory.`);
-            return;
-          }
-          // Find most recent session for this cwd
-          const recentForCwd = sessions.find((s) => s.cwd === targetDir);
-          this.setUserState(userId, recentForCwd?.sessionId ?? "", targetDir);
-          await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${targetDir}`);
-          try {
-            await this.sessionManager.switchWorkspace(userId, contextToken, targetDir, recentForCwd?.sessionId);
-            await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetDir}`);
-          } catch (err) {
-            await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
-          }
+        if (!cmd!.name) {
+          await this.sendReply(contextToken, "Usage: /workspace switch <path>");
           return;
         }
-
-        // Fallback: match by directory path
-        const target = sessions.find((s) => s.cwd === cmd!.name);
-        if (!target) {
-          await this.sendReply(userId, contextToken, `Directory "${cmd!.name}" not found. Use /workspace list to see available directories.`);
+        const targetDir = cmd!.name;
+        const state = this.userState;
+        if (state && state.cwd === targetDir) {
+          await this.sendReply(contextToken, `Already on ${targetDir}`);
           return;
         }
-        const state = this.getUserState(userId);
-        if (state && state.cwd === target.cwd) {
-          await this.sendReply(userId, contextToken, `Already on ${target.cwd}`);
+        if (!fs.existsSync(targetDir)) {
+          await this.sendReply(contextToken, `❌ Directory does not exist: ${targetDir}`);
           return;
         }
-        // Check if directory exists
-        if (!fs.existsSync(target.cwd)) {
-          await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${target.cwd}\nPlease remove this workspace or create the directory.`);
-          return;
-        }
-        // Find most recent session for this cwd
-        const recentForCwd = sessions.find((s) => s.cwd === target.cwd);
-        this.setUserState(userId, recentForCwd?.sessionId ?? "", target.cwd);
-        await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${target.cwd}`);
+        await this.sendReply(contextToken, `🔄 Switching to\n  ${targetDir}`);
         try {
-          await this.sessionManager.switchWorkspace(userId, contextToken, target.cwd, recentForCwd?.sessionId);
-          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${target.cwd}`);
+          await this.sessionManager.switchWorkspace(targetDir, undefined);
+          this.setUserState(this.sessionManager.getSessionId() ?? "", targetDir);
+          await this.sendReply(contextToken, `✅ Ready on\n  ${targetDir}`);
         } catch (err) {
-          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+          await this.sendReply(contextToken, `❌ Switch failed: ${String(err)}`);
         }
         break;
       }
 
       case "add": {
         const targetPath = cmd!.path!;
-        const state = this.getUserState(userId);
+        const state = this.userState;
         if (state && state.cwd === targetPath) {
-          await this.sendReply(userId, contextToken, `Already on ${targetPath}`);
+          await this.sendReply(contextToken, `Already on ${targetPath}`);
           return;
         }
-        // Create directory if it doesn't exist
         try {
           fs.mkdirSync(targetPath, { recursive: true });
         } catch (err) {
-          await this.sendReply(userId, contextToken, `Failed to create directory: ${String(err)}`);
+          await this.sendReply(contextToken, `Failed to create directory: ${String(err)}`);
           return;
         }
-        // Find most recent session for this cwd
-        const allSessions = listSessions().map((s) => ({ sessionId: s.id, cwd: s.directory, title: s.title }));
-        const recentForCwd = allSessions.find((s) => s.cwd === targetPath);
-        this.setUserState(userId, recentForCwd?.sessionId ?? "", targetPath);
-        await this.sendReply(userId, contextToken, `🔄 Switching to\n  ${targetPath}`);
+        await this.sendReply(contextToken, `🔄 Switching to\n  ${targetPath}`);
         try {
-          await this.sessionManager.switchWorkspace(userId, contextToken, targetPath, recentForCwd?.sessionId);
-          await this.sendReply(userId, contextToken, `✅ Ready on\n  ${targetPath}`);
+          await this.sessionManager.switchWorkspace(targetPath, undefined);
+          this.setUserState(this.sessionManager.getSessionId() ?? "", targetPath);
+          await this.sendReply(contextToken, `✅ Ready on\n  ${targetPath}`);
         } catch (err) {
-          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+          await this.sendReply(contextToken, `❌ Switch failed: ${String(err)}`);
         }
         break;
       }
 
       case "remove": {
-        await this.sendReply(userId, contextToken, "Use /workspace switch to change directories.");
+        await this.sendReply(contextToken, "Use /workspace switch to change directories.");
         break;
       }
     }
@@ -683,7 +549,6 @@ export class WeChatOpencodeBridge {
   // ─── Session commands (/session or /s) ───
 
   private async handleSessionCommand(
-    userId: string,
     contextToken: string,
     cmd: ReturnType<typeof parseSessionCommand>,
   ): Promise<void> {
@@ -691,121 +556,64 @@ export class WeChatOpencodeBridge {
 
     switch (cmd!.kind) {
       case "list": {
-        // SQLite is the authoritative source for all historical sessions.
-        let sessions = listSessions().map((s) => ({ sessionId: s.id, cwd: s.directory, title: s.title }));
-        
-        // Filter by cwd if specified
-        const filter = cmd!.cwdFilter;
-        if (filter) {
-          if (filter === "__current__") {
-            // Filter by current workspace
-            const currentCwd = this.getUserState(userId)?.cwd ?? this.config.agent.cwd;
-            sessions = sessions.filter((s) => s.cwd === currentCwd);
-          } else {
-            // Try as numeric index first (1-based into unique dirs)
-            const idx = parseInt(filter, 10);
-            if (!isNaN(idx)) {
-              const dirs: string[] = [];
-              for (const s of sessions) {
-                if (!dirs.includes(s.cwd)) dirs.push(s.cwd);
-              }
-              if (idx >= 1 && idx <= dirs.length) {
-                const targetCwd = dirs[idx - 1];
-                sessions = sessions.filter((s) => s.cwd === targetCwd);
-              }
-            } else {
-              // Try as directory path (normalize slashes for cross-platform match)
-              const normalizedFilter = filter.replace(/\\/g, "/").toLowerCase();
-              sessions = sessions.filter((s) => s.cwd.replace(/\\/g, "/").toLowerCase() === normalizedFilter);
-            }
+        try {
+          const sessions = await this.sessionManager.listServerSessions();
+          const lines: string[] = ["💬 Recent Sessions:"];
+          for (let i = 0; i < Math.min(sessions.length, 10); i++) {
+            const s = sessions[i];
+            lines.push(`  ${i + 1}. ${s.title ?? "(untitled)"}`);
           }
+          await this.sendReply(contextToken, lines.join("\n"));
+        } catch (err) {
+          await this.sendReply(contextToken, `⚠️ Failed to list sessions: ${String(err)}`);
         }
-        
-        const lines: string[] = ["💬 Recent Sessions:"];
-        for (let i = 0; i < Math.min(sessions.length, 10); i++) {
-          const s = sessions[i];
-          lines.push(`  ${i + 1}. ${s.title ?? "(untitled)"} — ${s.cwd}`);
-        }
-        await this.sendReply(userId, contextToken, lines.join("\n"));
         break;
       }
 
       case "switch": {
-        // SQLite for listing (authoritative), ACP for switching
-        const sessions = listSessions().map((s) => ({ sessionId: s.id, cwd: s.directory, title: s.title }));
-        const displaySessions = sessions.slice(0, 10);
-
-        // Try numeric index first
         const idx = parseInt(cmd!.name!, 10);
-        if (!isNaN(idx) && idx >= 1 && idx <= displaySessions.length) {
-          const target = displaySessions[idx - 1];
-          // Check if directory exists before updating state
-          if (!fs.existsSync(target.cwd)) {
-            await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${target.cwd}\nPlease remove this workspace or create the directory.`);
-            return;
-          }
-          this.setUserState(userId, target.sessionId, target.cwd);
-          await this.sendReply(userId, contextToken, `🔄 Switching to "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
-          try {
-            await this.sessionManager.switchSession(userId, contextToken, target.sessionId, target.cwd);
-            await this.sendReply(userId, contextToken, `✅ Ready on "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
-          } catch (err) {
-            await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
-          }
-          return;
-        }
-
-        // Fallback: match by slug/id/title
-        const target = displaySessions.find(
-          (s) => s.sessionId === cmd!.name || s.title?.toLowerCase() === cmd!.name!.toLowerCase(),
-        );
-        if (!target) {
-          await this.sendReply(userId, contextToken, `Session "${cmd!.name}" not found. Use /session list to see available sessions.`);
-          return;
-        }
-
-        // Check if directory exists before updating state
-        if (!fs.existsSync(target.cwd)) {
-          await this.sendReply(userId, contextToken, `❌ Directory does not exist: ${target.cwd}\nPlease remove this workspace or create the directory.`);
-          return;
-        }
-        this.setUserState(userId, target.sessionId, target.cwd);
-        await this.sendReply(userId, contextToken, `🔄 Switching to "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
         try {
-          await this.sessionManager.switchSession(userId, contextToken, target.sessionId, target.cwd);
-          await this.sendReply(userId, contextToken, `✅ Ready on "${target.title ?? "(untitled)"}"\n  ${target.cwd}`);
+          const sessions = await this.sessionManager.listServerSessions();
+          if (!isNaN(idx) && idx >= 1 && idx <= sessions.length) {
+            const target = sessions[idx - 1];
+            const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+            await this.sendReply(contextToken, `🔄 Switching to "${target.title ?? "(untitled)"}"`);
+            await this.sessionManager.switchSession(target.sessionId, cwd);
+            this.setUserState(target.sessionId, cwd);
+            await this.sendReply(contextToken, `✅ Ready`);
+          } else {
+            await this.sendReply(contextToken, `Session "${cmd!.name}" not found. Use /session list to see available sessions.`);
+          }
         } catch (err) {
-          await this.sendReply(userId, contextToken, `❌ Switch failed: ${String(err)}`);
+          await this.sendReply(contextToken, `❌ Switch failed: ${String(err)}`);
         }
         break;
       }
 
       case "status": {
-        const state = this.getUserState(userId);
-        if (state && state.sessionId) {
-          const allSessions = listSessions();
-          const current = allSessions.find((s) => s.id === state.sessionId);
-          if (current) {
-            await this.sendReply(userId, contextToken, `💬 ${current.title}\n  ${current.directory}`);
-            break;
-          }
+        const sid = this.sessionManager.getSessionId();
+        if (sid) {
+          await this.sendReply(contextToken, `💬 Session: ${sid}`);
+        } else {
+          const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+          await this.sendReply(contextToken, `📂 ${cwd}`);
         }
-        await this.sendReply(userId, contextToken, `📂 ${this.getUserState(userId)?.cwd ?? this.config.agent.cwd}`);
         break;
       }
 
       case "new": {
-        const cwd = this.userStates.get(userId)?.cwd ?? this.config.agent.cwd;
-        const currentMode = this.sessionManager.getActiveMode(userId);
-        const currentModel = this.sessionManager.getCurrentModel(userId);
-        await this.sessionManager.createNewSession(userId, contextToken, cwd);
-        const agentInfo = currentMode ? ` (${currentMode}${currentModel ? ` / ${currentModel}` : ""})` : "";
-        await this.sendReply(userId, contextToken, `✅ Session restarted. Context cleared.${agentInfo}`);
+        const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+        try {
+          await this.sessionManager.createNewSession(cwd);
+          await this.sendReply(contextToken, "✅ Session restarted. Context cleared.");
+        } catch (err) {
+          await this.sendReply(contextToken, `⚠️ Failed: ${String(err)}`);
+        }
         break;
       }
 
       case "remove": {
-        await this.sendReply(userId, contextToken, "Sessions are managed by OpenCode.");
+        await this.sendReply(contextToken, "Sessions are managed by OpenCode.");
         break;
       }
     }
@@ -814,7 +622,6 @@ export class WeChatOpencodeBridge {
   // ─── Agent commands (/agent or /a) ───
 
   private async handleAgentCommand(
-    userId: string,
     contextToken: string,
     cmd: ReturnType<typeof parseAgentCommand>,
   ): Promise<void> {
@@ -822,77 +629,62 @@ export class WeChatOpencodeBridge {
 
     switch (cmd!.kind) {
       case "list": {
-        const currentMode = this.sessionManager.getActiveMode(userId);
-        const availableModes = this.sessionManager.getAvailableModes(userId);
+        // Ensure agents are fetched (they load on session creation, but may still be in-flight)
+        if (this.sessionManager.getAvailableModes().length === 0) {
+          // Try refreshing once
+          try {
+            await this.sessionManager.refreshAgents();
+          } catch { /* ignore */ }
+        }
+        const currentMode = this.sessionManager.getActiveMode();
+        const availableModes = this.sessionManager.getAvailableModes();
         const lines = ["🤖 Agent (mode):"];
-        if (availableModes && availableModes.length > 0) {
+        if (availableModes.length > 0) {
           for (let i = 0; i < availableModes.length; i++) {
             const m = availableModes[i];
             const marker = m.id === currentMode ? " ✅" : "";
             lines.push(`  ${i + 1}. ${m.name}${marker}`);
           }
         } else {
-          lines.push("  (OpenCode 未返回可用模式)");
+          lines.push("  (no available modes)");
         }
         lines.push("");
-        lines.push(`💡 使用 /agent switch <name|序号> 切换`);
-        await this.sendReply(userId, contextToken, lines.join("\n"));
+        lines.push("💡 Use /agent switch <name|n> to switch");
+        await this.sendReply(contextToken, lines.join("\n"));
         break;
       }
 
       case "switch": {
-        const availableModes = this.sessionManager.getAvailableModes(userId);
         const input = cmd!.name!.trim();
-
-        // Try numeric index first
+        const availableModes = this.sessionManager.getAvailableModes();
         const index = parseInt(input, 10);
-        if (!isNaN(index) && index >= 1 && index <= (availableModes?.length ?? 0)) {
-          const m = availableModes![index - 1];
-          const current = this.sessionManager.getActiveMode(userId);
-          if (current === m.id) {
-            await this.sendReply(userId, contextToken, `已在 ${m.name} mode，无需切换`);
+        let targetMode: string;
+
+        if (!isNaN(index) && index >= 1 && index <= availableModes.length) {
+          targetMode = availableModes[index - 1].id;
+        } else {
+          const match = availableModes.find(
+            (m) => m.name.toLowerCase() === input.toLowerCase() || m.id.toLowerCase() === input.toLowerCase(),
+          );
+          if (!match) {
+            await this.sendReply(contextToken, `⚠️ "${input}" not found`);
             return;
           }
-          try {
-            await this.sessionManager.switchAgent(userId, m.id);
-            await this.sendReply(userId, contextToken, `✅ Agent 已切换至 ${m.name}`);
-          } catch (err) {
-            await this.sendReply(userId, contextToken, `⚠️ 切换失败: ${String(err)}`);
-          }
-          return;
+          targetMode = match.id;
         }
 
-        // Try matching by name (exact, case-insensitive)
-        const matchingMode = availableModes?.find(
-          (m) => m.name.toLowerCase() === input.toLowerCase() || m.id.toLowerCase() === input.toLowerCase(),
-        );
-        if (!matchingMode) {
-          const count = availableModes?.length ?? 0;
-          await this.sendReply(userId, contextToken, `⚠️ 未找到 "${input}"，可用模式数: ${count}`);
-          return;
-        }
-        const current = this.sessionManager.getActiveMode(userId);
-        if (current === matchingMode.id) {
-          await this.sendReply(userId, contextToken, `已在 ${matchingMode.name} mode，无需切换`);
-          return;
-        }
         try {
-          await this.sessionManager.switchAgent(userId, matchingMode.id);
-          await this.sendReply(userId, contextToken, `✅ Agent 已切换至 ${matchingMode.name}`);
+          await this.sessionManager.switchAgent(targetMode);
+          await this.sendReply(contextToken, `✅ Agent switched to ${targetMode}`);
         } catch (err) {
-          await this.sendReply(userId, contextToken, `⚠️ 切换失败: ${String(err)}`);
+          await this.sendReply(contextToken, `⚠️ Switch failed: ${String(err)}`);
         }
         break;
       }
 
       case "status": {
-        const mode = this.sessionManager.getActiveMode(userId);
-        if (mode) {
-          const matching = this.sessionManager.getAvailableModes(userId)?.find((m) => m.id === mode);
-          await this.sendReply(userId, contextToken, `🤖 当前 Agent: ${matching?.name ?? mode}`);
-        } else {
-          await this.sendReply(userId, contextToken, `🤖 Agent: (未设置)`);
-        }
+        const mode = this.sessionManager.getActiveMode();
+        await this.sendReply(contextToken, `🤖 Current Agent: ${mode ?? "(not set)"}`);
         break;
       }
     }
@@ -901,7 +693,6 @@ export class WeChatOpencodeBridge {
   // ─── Model commands (/model) ───
 
   private async handleModelCommand(
-    userId: string,
     contextToken: string,
     cmd: ReturnType<typeof parseModelCommand>,
   ): Promise<void> {
@@ -909,107 +700,57 @@ export class WeChatOpencodeBridge {
 
     switch (cmd!.kind) {
       case "list": {
-        const availableModels = this.sessionManager.getAvailableModels(userId);
-        const currentModelId = this.sessionManager.getCurrentModel(userId);
+        // Ensure models are fetched
+        if (this.sessionManager.getAvailableModels().length === 0) {
+          try {
+            await this.sessionManager.refreshProviders();
+          } catch { /* ignore */ }
+        }
+        const currentModelId = this.sessionManager.getCurrentModel();
+        const allModels = this.sessionManager.getAvailableModels();
         const lines = ["📱 Models:"];
 
-        if (!availableModels || availableModels.length === 0) {
-          lines.push("  (OpenCode 未返回可用模型)");
-        } else {
-          // Extract provider from modelId (before first '/')
-          const providers = new Map<string, ModelInfo[]>();
-          for (const m of availableModels) {
-            const provider = m.modelId.split("/")[0];
-            if (!providers.has(provider)) providers.set(provider, []);
-            providers.get(provider)!.push(m);
-          }
-
-          const providerArg = cmd!.provider;
-          if (providerArg) {
-            // /model list <provider> — show models for specific provider
-            const models = providers.get(providerArg);
-            if (!models || models.length === 0) {
-              const allProviders = Array.from(providers.keys()).join(", ");
-              lines.push(`  ⚠️ 未找到 provider "${providerArg}"`);
-              lines.push(`  可用 providers: ${allProviders}`);
-            } else {
-              // Cache and show with index
-              this.sessionManager.cacheModelListForProvider(userId, providerArg, models);
-              lines.push(`  [${providerArg}]`);
-              for (let i = 0; i < models.length; i++) {
-                const m = models[i];
-                const marker = m.modelId === currentModelId ? " ✅" : "";
-                lines.push(`  ${i + 1}. ${m.modelId}${marker}`);
-              }
-              lines.push("");
-              lines.push(`💡 使用 /model switch <序号|模型名> 切换`);
-            }
-          } else {
-            // /model list — show providers and model counts
-            for (const [provider, models] of providers) {
-              const marker = currentModelId?.startsWith(`${provider}/`) ? " ✅" : "";
-              lines.push(`  ${provider} (${models.length})${marker}`);
-            }
-            lines.push("");
-            lines.push(`💡 使用 /model list <provider> 查看模型列表`);
-          }
+        // Group by provider
+        const byProvider = new Map<string, Array<{ modelId: string; name: string }>>();
+        for (const m of allModels) {
+          const provider = m.modelId.split("/")[0];
+          if (!byProvider.has(provider)) byProvider.set(provider, []);
+          byProvider.get(provider)!.push(m);
         }
-        await this.sendReply(userId, contextToken, lines.join("\n"));
+
+        if (byProvider.size === 0) {
+          lines.push(`  Current: ${currentModelId ?? "(not set)"}`);
+        } else {
+          for (const [provider, models] of byProvider) {
+            const marker = currentModelId?.startsWith(`${provider}/`) ? " ✅" : "";
+            lines.push(`  ${provider} (${models.length})${marker}`);
+          }
+          lines.push("");
+          lines.push("💡 Use /model list <provider> to list models");
+          lines.push("   Use /model switch <provider/model> to switch");
+        }
+        await this.sendReply(contextToken, lines.join("\n"));
         break;
       }
 
       case "switch": {
         const input = cmd!.name!.trim();
-        const index = parseInt(input, 10);
-
-        // If input is a number, use ONLY the last queried provider's cached models
-        if (!isNaN(index)) {
-          const cached = this.sessionManager.getCachedModelsForLastQueried(userId);
-          if (!cached || cached.length === 0) {
-            await this.sendReply(userId, contextToken, `⚠️ 索引 ${index} 无效，请先 /model list <provider> 查看`);
-            return;
-          }
-          if (index >= 1 && index <= cached.length) {
-            const m = cached[index - 1];
-            try {
-              await this.sessionManager.setModel(userId, m.modelId);
-            } catch (err) {
-              await this.sendReply(userId, contextToken, `⚠️ 切换失败: ${String(err)}`);
-              return;
-            }
-            await this.sendReply(userId, contextToken, `✅ Model 已切换至 ${m.name} (${m.modelId})`);
-          } else {
-            await this.sendReply(userId, contextToken, `⚠️ 索引 ${index} 无效，有效范围: 1-${cached.length}`);
-          }
+        if (!input.includes("/")) {
+          await this.sendReply(contextToken, `⚠️ Use full model name (provider/model), e.g. anthropic/claude-sonnet-4-5`);
           return;
         }
-
-        // Otherwise, treat as full model name
-        switch (input) {
-          default:
-            if (!input.includes("/")) {
-              await this.sendReply(userId, contextToken, `⚠️ 需要提供完整模型名 (provider/model)，如: anthropic/claude-sonnet-4-5`);
-              return;
-            }
-            try {
-              await this.sessionManager.setModel(userId, input);
-            } catch (err) {
-              await this.sendReply(userId, contextToken, `⚠️ 切换失败: ${String(err)}`);
-              return;
-            }
-            await this.sendReply(userId, contextToken, `✅ Model 已切换至 ${input}`);
-            break;
+        try {
+          await this.sessionManager.setModel(input);
+          await this.sendReply(contextToken, `✅ Model switched to ${input}`);
+        } catch (err) {
+          await this.sendReply(contextToken, `⚠️ Switch failed: ${String(err)}`);
         }
         break;
       }
 
       case "status": {
-        const model = this.sessionManager.getCurrentModel(userId);
-        if (model) {
-          await this.sendReply(userId, contextToken, `📱 当前 Model: ${model}`);
-        } else {
-          await this.sendReply(userId, contextToken, `📱 Model: (未设置)`);
-        }
+        const model = this.sessionManager.getCurrentModel();
+        await this.sendReply(contextToken, `📱 Current Model: ${model ?? "(not set)"}`);
         break;
       }
     }
@@ -1018,7 +759,6 @@ export class WeChatOpencodeBridge {
   // ─── Reasoning commands (/reasoning) ───
 
   private async handleReasoningCommand(
-    userId: string,
     contextToken: string,
     cmd: ReturnType<typeof parseReasoningCommand>,
   ): Promise<void> {
@@ -1026,40 +766,35 @@ export class WeChatOpencodeBridge {
 
     switch (cmd!.kind) {
       case "list": {
-        const levels = this.sessionManager.getReasoningLevels(userId);
-        const lines = ["🧠 推理级别:"];
+        const levels = this.sessionManager.getReasoningLevels();
+        const lines = ["🧠 Reasoning levels:"];
         if (levels.length > 0) {
           for (const lv of levels) {
             const marker = lv.current ? " ✅" : "";
             lines.push(`  ${lv.value}${marker} — ${lv.name}`);
           }
         } else {
-          lines.push("  (当前模型无推理级别选项)");
+          lines.push("  (not available)");
         }
         lines.push("");
-        lines.push(`💡 使用 /reasoning switch <level> 切换`);
-        await this.sendReply(userId, contextToken, lines.join("\n"));
+        lines.push("💡 Use /reasoning switch <level>");
+        await this.sendReply(contextToken, lines.join("\n"));
         break;
       }
 
       case "switch": {
-        const level = cmd!.name!.toLowerCase();
         try {
-          await this.sessionManager.setReasoning(userId, level);
-          await this.sendReply(userId, contextToken, `✅ 推理级别已切换至 ${level}`);
+          await this.sessionManager.setReasoning(cmd!.name!.toLowerCase());
+          await this.sendReply(contextToken, `✅ Reasoning set to ${cmd!.name}`);
         } catch (err) {
-          await this.sendReply(userId, contextToken, `⚠️ 切换失败: ${String(err)}`);
+          await this.sendReply(contextToken, `⚠️ Switch failed: ${String(err)}`);
         }
         break;
       }
 
       case "status": {
-        const reasoning = this.sessionManager.getCurrentReasoning(userId);
-        if (reasoning) {
-          await this.sendReply(userId, contextToken, `🧠 当前推理级别: ${reasoning}`);
-        } else {
-          await this.sendReply(userId, contextToken, `🧠 推理级别: (未设置)`);
-        }
+        const level = this.sessionManager.getCurrentReasoning();
+        await this.sendReply(contextToken, `🧠 Reasoning: ${level ?? "(not set)"}`);
         break;
       }
     }
@@ -1068,63 +803,35 @@ export class WeChatOpencodeBridge {
   // ─── Status command (/status) ───
 
   private async handleStatusCommand(
-    userId: string,
     contextToken: string,
     _cmd: ReturnType<typeof parseStatusCommand>,
   ): Promise<void> {
     if (!this.sessionManager) return;
 
-    const state = this.getUserState(userId);
-    const cwd = state?.cwd ?? this.config.agent.cwd;
+    const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+    const currentMode = this.sessionManager.getActiveMode();
+    const currentModel = this.sessionManager.getCurrentModel() ?? "(not set)";
+    const currentReasoning = this.sessionManager.getCurrentReasoning() ?? "(not set)";
+    const contextUsage = this.sessionManager.getContextUsage();
+    const sessionId = this.sessionManager.getSessionId();
 
-    // Session info
-    let sessionInfo: { title?: string; id: string; cwd: string } | null = null;
-    if (state?.sessionId) {
-      const allSessions = listSessions();
-      const current = allSessions.find((s) => s.id === state.sessionId);
-      if (current) {
-        sessionInfo = { title: current.title, id: current.id, cwd: current.directory };
-      } else {
-        sessionInfo = { id: state.sessionId, cwd };
-      }
-    }
-
-    // Agent
-    const currentMode = this.sessionManager.getActiveMode(userId);
-    const agentName = (() => {
-      if (!currentMode) return "(未设置)";
-      const modes = this.sessionManager.getAvailableModes(userId);
-      const matching = modes?.find((m) => m.id === currentMode);
-      return matching?.name ?? currentMode;
-    })();
-
-    // Model
-    const currentModel = this.sessionManager.getCurrentModel(userId) ?? "(未设置)";
-
-    // Reasoning
-    const currentReasoning = this.sessionManager.getCurrentReasoning(userId) ?? "(未设置)";
-
-    // Context usage
-    const contextUsage = this.sessionManager.getContextUsage(userId);
+    const sessionInfo = sessionId ? { id: sessionId, cwd } : null;
 
     const statusText = formatStatus({
       session: sessionInfo,
       workspace: cwd,
-      agent: agentName,
+      agent: currentMode ?? "(not set)",
       model: currentModel,
       reasoning: currentReasoning,
-      contextUsage: contextUsage
-        ? { used: contextUsage.totalTokens, size: contextUsage.contextSize }
-        : null,
+      contextUsage: contextUsage ? { used: contextUsage.totalTokens, size: contextUsage.contextSize } : null,
     });
 
-    await this.sendReply(userId, contextToken, statusText);
+    await this.sendReply(contextToken, statusText);
   }
 
   // ─── Thinking command (/thinking) ───
 
   private async handleThinkingCommand(
-    userId: string,
     contextToken: string,
     cmd: ReturnType<typeof parseThinkingCommand>,
   ): Promise<void> {
@@ -1132,34 +839,28 @@ export class WeChatOpencodeBridge {
 
     switch (cmd!.kind) {
       case "status": {
-        const flags = this.sessionManager.getShowFlags(userId);
-        if (!flags) {
-          await this.sendReply(userId, contextToken, "🧠 Thinking: (no active session)");
-          return;
-        }
-        const thoughtStatus = flags.showThoughts ? "✅ 开启" : "❌ 关闭";
-        const toolStatus = flags.showTools ? "✅ 开启" : "❌ 关闭";
-        await this.sendReply(userId, contextToken, `🧠 思考与工具:\n  💭 思考: ${thoughtStatus}\n  🔧 工具: ${toolStatus}`);
+        const flags = this.sessionManager.getShowFlags();
+        const thoughtStatus = flags.showThoughts ? "✅ On" : "❌ Off";
+        const toolStatus = flags.showTools ? "✅ On" : "❌ Off";
+        await this.sendReply(contextToken, `🧠 Thinking & Tools:\n  💭 Thinking: ${thoughtStatus}\n  🔧 Tools: ${toolStatus}`);
         break;
       }
 
       case "on": {
-        // Feature temporarily disabled in this version
-        await this.sendReply(userId, contextToken, "⏸️ 思考与工具显示功能已暂时关闭，未来版本可能重新启用。");
+        await this.sendReply(contextToken, "⏸️ Feature temporarily disabled.");
         break;
       }
 
       case "off": {
         if (cmd!.target === "tools") {
-          this.sessionManager.setShowFlags(userId, { showTools: false });
-          await this.sendReply(userId, contextToken, "❌ 工具调用显示已关闭");
+          this.sessionManager.setShowFlags({ showTools: false });
+          await this.sendReply(contextToken, "❌ Tool display off");
         } else if (cmd!.target === "thoughts") {
-          this.sessionManager.setShowFlags(userId, { showThoughts: false });
-          await this.sendReply(userId, contextToken, "❌ 思考过程显示已关闭");
+          this.sessionManager.setShowFlags({ showThoughts: false });
+          await this.sendReply(contextToken, "❌ Thinking display off");
         } else {
-          // No target specified: disable both
-          this.sessionManager.setShowFlags(userId, { showThoughts: false, showTools: false });
-          await this.sendReply(userId, contextToken, "❌ 思考与工具调用显示已关闭");
+          this.sessionManager.setShowFlags({ showThoughts: false, showTools: false });
+          await this.sendReply(contextToken, "❌ Thinking & tool display off");
         }
         break;
       }
@@ -1169,159 +870,63 @@ export class WeChatOpencodeBridge {
   // ─── Stop command (/stop) ───
 
   private async handleStopCommand(
-    userId: string,
     contextToken: string,
     _cmd: ReturnType<typeof parseStopCommand>,
   ): Promise<void> {
     if (!this.sessionManager) return;
 
-    const session = this.sessionManager.getSession(userId);
-    if (!session) {
-      await this.sendReply(userId, contextToken, "⚠️ 没有正在运行的 Agent会话");
-      return;
-    }
-
-    if (!session.processing) {
-      await this.sendReply(userId, contextToken, "ℹ️ Agent 当前没有正在处理的请求");
-      return;
-    }
-
     try {
-      await this.sessionManager.cancelPrompt(userId);
-      await this.sendReply(userId, contextToken, "🛑 已发送停止信号，Agent 将尽快中断");
+      await this.sessionManager.cancelPrompt();
+      await this.sendReply(contextToken, "🛑 Stop signal sent");
     } catch (err) {
-      this.log(`[${userId}] Cancel prompt error: ${String(err)}`);
-      await this.sendReply(userId, contextToken, `⚠️ 停止失败: ${String(err)}`);
-    }
-  }
-
-  // ─── Version command (/version) ───
-
-  private async handleVersionCommand(
-    userId: string,
-    contextToken: string,
-    _cmd: ReturnType<typeof parseVersionCommand>,
-  ): Promise<void> {
-    await this.sendReply(userId, contextToken, "🔍 正在查询版本信息...");
-
-    // Get installed version
-    const installed = await getInstalledVersion("opencode");
-    // Get latest version by running upgrade
-    const { installed: latestInstalled, latest } = await getLatestVersion("opencode");
-
-    const installedVer = installed ?? "(未知)";
-    const latestVer = latest ?? latestInstalled ?? "(未知)";
-
-    let msg = `📦 OpenCode 版本信息\n`;
-    msg += `  当前版本: ${installedVer}\n`;
-    msg += `  最新版本: ${latestVer}\n`;
-
-    if (latest && installed && latest !== installed) {
-      msg += `\n  🆕 有可用更新！发送 /upgrade 更新`;
-    } else if (latest && installed === latest) {
-      msg += `\n  ✅ 已是最新版本`;
-    } else {
-      msg += `\n  💡 发送 /upgrade 检查更新`;
-    }
-
-    await this.sendReply(userId, contextToken, msg);
-  }
-
-  // ─── Upgrade command (/upgrade) ───
-
-  private async handleUpgradeCommand(
-    userId: string,
-    contextToken: string,
-    _cmd: ReturnType<typeof parseUpgradeCommand>,
-  ): Promise<void> {
-    if (!this.sessionManager) return;
-
-    await this.sendReply(userId, contextToken, "⬆️ 正在更新 OpenCode，请稍候...");
-
-    const result = await upgradeOpenCode("opencode");
-
-    if (!result.success) {
-      await this.sendReply(userId, contextToken, `⚠️ 更新失败: ${result.error ?? "未知错误"}`);
-      return;
-    }
-
-    const oldVer = result.installedBefore ?? "未知版本";
-    const newVer = result.newVersion ?? "新版本";
-    await this.sendReply(userId, contextToken, `✅ 更新完成！版本: ${oldVer} → ${newVer}`);
-
-    // Only restart agent if there was an active session
-    const session = this.sessionManager.getSession(userId);
-    if (session) {
-      await this.sendReply(userId, contextToken, "🔄 正在重启 Agent...");
-      try {
-        await this.sessionManager.restartAgent(userId, contextToken);
-        await this.sendReply(userId, contextToken, "✅ Agent 已重启并恢复之前的状态");
-      } catch (err) {
-        this.log(`[${userId}] Restart after upgrade error: ${String(err)}`);
-        await this.sendReply(userId, contextToken, `⚠️ Agent 重启失败: ${String(err)}`);
-      }
-    } else {
-      await this.sendReply(userId, contextToken, "ℹ️ 无运行中的 Agent，更新完成但无需重启");
+      this.log(`Cancel error: ${String(err)}`);
+      await this.sendReply(contextToken, `⚠️ Stop failed: ${String(err)}`);
     }
   }
 
   // ─── Restart command (/restart) ───
 
   private async handleRestartCommand(
-    userId: string,
     contextToken: string,
     _cmd: ReturnType<typeof parseRestartCommand>,
   ): Promise<void> {
     if (!this.sessionManager) return;
 
-    const session = this.sessionManager.getSession(userId);
-    if (!session) {
-      await this.sendReply(userId, contextToken, "⚠️ 没有正在运行的 Agent会话");
-      return;
-    }
-
-    await this.sendReply(userId, contextToken, "🔄 正在重启 Agent...");
-
+    await this.sendReply(contextToken, "🔄 Restarting session...");
     try {
-      await this.sessionManager.restartAgent(userId, contextToken);
-      await this.sendReply(userId, contextToken, "✅ Agent 已重启并恢复之前的状态");
+      const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+      await this.sessionManager.createNewSession(cwd);
+      await this.sendReply(contextToken, "✅ Session restarted");
     } catch (err) {
-      this.log(`[${userId}] Restart error: ${String(err)}`);
-      await this.sendReply(userId, contextToken, `⚠️ Agent 重启失败: ${String(err)}`);
+      this.log(`Restart error: ${String(err)}`);
+      await this.sendReply(contextToken, `⚠️ Restart failed: ${String(err)}`);
     }
   }
 
   // ─── Helpers ───
 
-  /**
-   * Detect if text is an unrecognized slash command.
-   * Returns a hint message if it's a slash command not handled by bridge,
-   * or null if it's not a slash command at all.
-   */
   private detectUnknownSlashCommand(text: string): string | null {
     const trimmed = text.trim();
     if (!trimmed.startsWith("/")) return null;
 
-    // Extract command name (first token after /)
     const match = trimmed.match(/^\/(\w+)/);
     if (!match) return null;
 
     const cmdName = match[1].toLowerCase();
-
-    // Bridge-known commands: workspace, ws, session, s, agent, a, model, reasoning, help, h, ?, status, thinking, stop, version, upgrade, restart
-    const bridgeCommands = ["workspace", "ws", "session", "s", "agent", "a", "model", "reasoning", "help", "h", "?", "status", "thinking", "stop", "version", "upgrade", "restart", "next"];
+    const bridgeCommands = [
+      "workspace", "ws", "session", "s", "agent", "a", "model",
+      "reasoning", "help", "h", "?", "status", "thinking", "stop",
+      "restart", "next",
+    ];
     if (bridgeCommands.includes(cmdName)) return null;
 
-    return `⚠️ 指令 "/${match[1]}" 不是 Bridge 内置指令，已转交 Agent 处理。`;
+    return `⚠️ Command "/${match[1]}" is not a bridge command, forwarding to agent.`;
   }
 
-  /**
-   * Send help reply combining bridge commands + OpenCode native commands.
-   */
-  private async sendHelpReply(userId: string, contextToken: string): Promise<void> {
-    const nativeCommands = this.sessionManager?.getAvailableCommands(userId) ?? [];
+  private async sendHelpReply(contextToken: string): Promise<void> {
+    const nativeCommands = this.sessionManager?.getAvailableCommands() ?? [];
     const helpText = formatHelpWithNativeCommands(nativeCommands);
-    await this.sendReply(userId, contextToken, helpText);
+    await this.sendReply(contextToken, helpText);
   }
 
   private extractTextFromMessage(msg: WeixinMessage): string | null {
@@ -1332,43 +937,42 @@ export class WeChatOpencodeBridge {
     return null;
   }
 
-  private async enqueueMessage(msg: WeixinMessage, userId: string, contextToken: string, hint?: string): Promise<void> {
+  private async enqueueMessage(msg: WeixinMessage, contextToken: string): Promise<void> {
     const tempDir = path.join(this.config.storage.dir, "tempfile");
-    const prompt = await weixinMessageToPrompt(msg, this.config.wechat.cdnBaseUrl, this.log, tempDir);
-    await this.sessionManager!.enqueue(userId, { prompt, contextToken, hint });
+    const parts = await weixinMessageToPrompt(msg, this.config.wechat.cdnBaseUrl, this.log, tempDir);
+    await this.sessionManager!.enqueue(parts, contextToken);
   }
 
-  /** Flush cached outbound messages on /next. Respects the 10-msg limit; re-caches if exceeded. */
-  private async flushPending(userId: string, contextToken: string): Promise<void> {
-    const pending = this.pendingOutbound.get(userId);
-    if (!pending || pending.length === 0) {
-      await this.sendReply(userId, contextToken, "✅ 暂无缓存消息");
+  private async flushPending(contextToken: string): Promise<void> {
+    if (this.pendingOutbound.length === 0) {
+      await this.sendReply(contextToken, "✅ No cached messages");
       return;
     }
 
-    this.wechatMsgCount.set(userId, 0);
-    this.log(`[${userId}] /next: flushing ${pending.length} cached messages`);
+    this.wechatMsgCount = 0;
+    this.log(`/next: flushing ${this.pendingOutbound.length} cached messages`);
 
     const remaining: PendingMessage[] = [];
     let sent = 0;
 
-    for (const msg of pending) {
-      const count = this.wechatMsgCount.get(userId) ?? 0;
-      if (count >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+    for (const msg of this.pendingOutbound) {
+      if (this.wechatMsgCount >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
         remaining.push(msg);
         continue;
       }
-      this.wechatMsgCount.set(userId, count + 1);
+      this.wechatMsgCount++;
 
       try {
         const text = msg.kind === "text" || msg.kind === "tool_text" ? msg.text : "";
-        const payload = text && count >= WeChatOpencodeBridge.MSG_LIMIT_WARN
-          ? text + `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${count + 1} 条），发送 /next 可重置`
-          : text;
+        const payload =
+          text && this.wechatMsgCount > WeChatOpencodeBridge.MSG_LIMIT_WARN
+            ? text + `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${this.wechatMsgCount} 条），发送 /next 可重置`
+            : text;
 
         switch (msg.kind) {
           case "text":
-            await sendTextMessage(userId, payload || msg.text, {
+          case "tool_text":
+            await sendTextMessage(this.userState?.userId ?? "", payload || msg.text, {
               baseUrl: this.tokenData!.baseUrl,
               token: this.tokenData!.token,
               contextToken,
@@ -1376,7 +980,7 @@ export class WeChatOpencodeBridge {
             break;
           case "media":
             if (msg.block.type === "image" && msg.block.data) {
-              await sendMediaMessage(userId, UploadMediaType.IMAGE, Buffer.from(msg.block.data, "base64"), {
+              await sendMediaMessage(this.userState?.userId ?? "", UploadMediaType.IMAGE, Buffer.from(msg.block.data, "base64"), {
                 baseUrl: this.tokenData!.baseUrl,
                 token: this.tokenData!.token,
                 contextToken,
@@ -1388,7 +992,7 @@ export class WeChatOpencodeBridge {
               const mime = msg.block.resourceMimeType ?? "application/octet-stream";
               const mediaType = this.mimeToMediaType(mime);
               const fileName = msg.block.uri ? msg.block.uri.split("/").pop() : "file";
-              await sendMediaMessage(userId, mediaType, buf, {
+              await sendMediaMessage(this.userState?.userId ?? "", mediaType, buf, {
                 baseUrl: this.tokenData!.baseUrl,
                 token: this.tokenData!.token,
                 contextToken,
@@ -1398,17 +1002,10 @@ export class WeChatOpencodeBridge {
               });
             }
             break;
-          case "tool_text":
-            await sendTextMessage(userId, payload || msg.text, {
-              baseUrl: this.tokenData!.baseUrl,
-              token: this.tokenData!.token,
-              contextToken,
-            });
-            break;
           case "tool_file": {
             const buf = await fs.promises.readFile(msg.filePath);
             const mime = msg.mimeType ?? this.guessMimeType(msg.fileName);
-            await sendMediaMessage(userId, this.mimeToMediaType(mime), buf, {
+            await sendMediaMessage(this.userState?.userId ?? "", this.mimeToMediaType(mime), buf, {
               baseUrl: this.tokenData!.baseUrl,
               token: this.tokenData!.token,
               contextToken,
@@ -1421,136 +1018,128 @@ export class WeChatOpencodeBridge {
         }
         sent++;
       } catch (err) {
-        this.log(`[${userId}] /next send error: ${String(err)}`);
+        this.log(`/next send error: ${String(err)}`);
       }
     }
 
     if (remaining.length > 0) {
-      this.pendingOutbound.set(userId, remaining);
-      await this.sendReply(userId, contextToken, `✅ 已发 ${sent} 条，还有 ${remaining.length} 条缓存，再发 /next 继续`);
+      this.pendingOutbound = remaining;
+      await this.sendReply(contextToken, `✅ Sent ${sent}, ${remaining.length} cached, /next to continue`);
     } else {
-      this.pendingOutbound.delete(userId);
-      await this.sendReply(userId, contextToken, `✅ 缓存消息已全部发送完毕（${sent} 条）`);
+      this.pendingOutbound = [];
+      await this.sendReply(contextToken, `✅ All ${sent} cached messages sent`);
     }
   }
 
-  private async sendReply(userId: string, contextToken: string, text: string): Promise<void> {
+  private async sendReply(contextToken: string, text: string): Promise<void> {
     const formatted = formatForWeChat(text);
     const segments = splitText(formatted, TEXT_CHUNK_LIMIT);
 
     for (const segment of segments) {
-      const sent = this.wechatMsgCount.get(userId) ?? 0;
-
-      if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
-        this.log(`[${userId}] WeChat 10-msg limit reached (sent=${sent}), caching remaining ${segments.length - segments.indexOf(segment)} segments`);
-        // Cache remaining segments and all future calls
+      if (this.wechatMsgCount >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+        this.log(`WeChat 10-msg limit reached (sent=${this.wechatMsgCount}), caching remaining segments`);
         const remaining = segments.slice(segments.indexOf(segment));
         const cached: PendingMessage[] = remaining.map((s) => ({ kind: "text", text: s, contextToken }));
-        const existing = this.pendingOutbound.get(userId) ?? [];
-        this.pendingOutbound.set(userId, [...existing, ...cached]);
+        this.pendingOutbound = [...this.pendingOutbound, ...cached];
         break;
       }
 
-      // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
-      this.wechatMsgCount.set(userId, sent + 1);
-
+      this.wechatMsgCount++;
       let payload = segment;
-      if (sent >= WeChatOpencodeBridge.MSG_LIMIT_WARN) {
-        payload += `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${sent + 1} 条），发送 /next 可重置`;
+      if (this.wechatMsgCount > WeChatOpencodeBridge.MSG_LIMIT_WARN) {
+        payload += `\n\n⚠️ 微信限制连续发送消息数量10条（已发 ${this.wechatMsgCount} 条），发送 /next 可重置`;
       }
 
-      await sendTextMessage(userId, payload, {
+      await sendTextMessage(this.userState?.userId ?? "", payload, {
         baseUrl: this.tokenData!.baseUrl,
         token: this.tokenData!.token,
         contextToken,
       });
-      this.log(`[${userId}] Sent text (${payload.length} chars, sent=${this.wechatMsgCount.get(userId) ?? 0})`);
+      this.log(`Sent text (${payload.length} chars, sent=${this.wechatMsgCount})`);
     }
 
-    this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+    this.cancelTypingIndicator(contextToken).catch(() => {});
   }
 
-  private async sendMediaReply(userId: string, contextToken: string, blocks: MediaContent[]): Promise<void> {
+  private async sendMediaReply(contextToken: string, blocks: MediaContent[]): Promise<void> {
     for (const block of blocks) {
-      const sent = this.wechatMsgCount.get(userId) ?? 0;
-      if (sent >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
-        this.log(`[${userId}] WeChat 10-msg limit reached (sent=${sent}), caching remaining media`);
+      if (this.wechatMsgCount >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
+        this.log(`WeChat 10-msg limit reached (sent=${this.wechatMsgCount}), caching media`);
         const remaining = blocks.slice(blocks.indexOf(block));
         const cached: PendingMessage[] = remaining.map((b) => ({ kind: "media", block: b, contextToken }));
-        const existing = this.pendingOutbound.get(userId) ?? [];
-        this.pendingOutbound.set(userId, [...existing, ...cached]);
+        this.pendingOutbound = [...this.pendingOutbound, ...cached];
         break;
       }
 
-      // Reserve slot BEFORE await to prevent concurrent requests from seeing stale count
-      this.wechatMsgCount.set(userId, sent + 1);
+      this.wechatMsgCount++;
+      const targetUserId = this.userState?.userId ?? "";
 
-      const count = this.wechatMsgCount.get(userId) ?? 0;
       if (block.type === "image" && block.data) {
-        await sendMediaMessage(userId, UploadMediaType.IMAGE, Buffer.from(block.data, "base64"), {
+        await sendMediaMessage(targetUserId, UploadMediaType.IMAGE, Buffer.from(block.data, "base64"), {
           baseUrl: this.tokenData!.baseUrl,
           token: this.tokenData!.token,
           contextToken,
           cdnBaseUrl: this.config.wechat.cdnBaseUrl,
           mimeType: block.mimeType ?? "image/jpeg",
         });
-        this.log(`[${userId}] Sent image (sent=${count})`);
+        this.log(`Sent image (sent=${this.wechatMsgCount})`);
       } else if (block.type === "resource" && block.blob) {
-        const buf2 = Buffer.from(block.blob, "base64");
-        const mimeType2 = block.resourceMimeType ?? "application/octet-stream";
-        const mt = this.mimeToMediaType(mimeType2);
-        const fileName2 = block.uri ? block.uri.split("/").pop() : "file";
-        await sendMediaMessage(userId, mt, buf2, {
+        const buf = Buffer.from(block.blob, "base64");
+        const mime = block.resourceMimeType ?? "application/octet-stream";
+        const mt = this.mimeToMediaType(mime);
+        const fileName = block.uri ? block.uri.split("/").pop() : "file";
+        await sendMediaMessage(targetUserId, mt, buf, {
           baseUrl: this.tokenData!.baseUrl,
           token: this.tokenData!.token,
           contextToken,
           cdnBaseUrl: this.config.wechat.cdnBaseUrl,
-          mimeType: mimeType2,
-          fileName: fileName2,
+          mimeType: mime,
+          fileName,
         });
-        const typeLabel = mt === UploadMediaType.IMAGE ? "image" : mt === UploadMediaType.VIDEO ? "video" : mt === UploadMediaType.VOICE ? "voice" : "file";
-        this.log(`[${userId}] Sent ${typeLabel} resource (sent=${count})`);
+        const typeLabel = mt === UploadMediaType.IMAGE ? "image" : mt === UploadMediaType.VIDEO ? "video" : "file";
+        this.log(`Sent ${typeLabel} (sent=${this.wechatMsgCount})`);
       }
     }
-    this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+    this.cancelTypingIndicator(contextToken).catch(() => {});
   }
 
-  private async cancelTypingIndicator(userId: string, contextToken: string): Promise<void> {
-    const ticket = await this.getTypingTicket(userId, contextToken);
+  // ─── Typing indicator ───
+
+  private async cancelTypingIndicator(contextToken: string): Promise<void> {
+    const ticket = await this.getTypingTicket(contextToken);
     if (!ticket) return;
     await sendTyping({
       baseUrl: this.tokenData!.baseUrl,
       token: this.tokenData!.token,
-      body: { ilink_user_id: userId, typing_ticket: ticket, status: TypingStatus.CANCEL },
+      body: { ilink_user_id: this.userState?.userId ?? "", typing_ticket: ticket, status: TypingStatus.CANCEL },
     });
   }
 
-  private async sendTypingIndicator(userId: string, contextToken: string): Promise<void> {
+  private async sendTypingIndicator(contextToken: string): Promise<void> {
     try {
-      const ticket = await this.getTypingTicket(userId, contextToken);
+      const ticket = await this.getTypingTicket(contextToken);
       if (!ticket) return;
       await sendTyping({
         baseUrl: this.tokenData!.baseUrl,
         token: this.tokenData!.token,
-        body: { ilink_user_id: userId, typing_ticket: ticket, status: TypingStatus.TYPING },
+        body: { ilink_user_id: this.userState?.userId ?? "", typing_ticket: ticket, status: TypingStatus.TYPING },
       });
     } catch {
       // best-effort
     }
   }
 
-  private async getTypingTicket(userId: string, contextToken: string): Promise<string | null> {
-    const cached = this.typingTickets.get(userId);
-    if (cached && cached.expiresAt > Date.now()) return cached.ticket;
+  private async getTypingTicket(contextToken: string): Promise<string | null> {
+    if (this.typingTicket && this.typingTicket.expiresAt > Date.now()) return this.typingTicket.ticket;
     try {
       const resp = await getConfig({
         baseUrl: this.tokenData!.baseUrl,
         token: this.tokenData!.token,
-        ilinkUserId: userId,
+        ilinkUserId: this.userState?.userId ?? "",
         contextToken,
       });
       if (resp.typing_ticket) {
-        this.typingTickets.set(userId, { ticket: resp.typing_ticket, expiresAt: Date.now() + 24 * 60 * 60_000 });
+        this.typingTicket = { ticket: resp.typing_ticket, expiresAt: Date.now() + 24 * 60 * 60_000 };
         return resp.typing_ticket;
       }
     } catch {

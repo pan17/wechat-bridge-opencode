@@ -31,22 +31,38 @@ export const BUILT_IN_AGENTS: Record<string, AgentPreset> = {
   },
 };
 
+export interface ServerConfig {
+  /** URL of the opencode serve instance. */
+  url: string;
+  /** Command to spawn opencode serve as a sidecar (empty = external). */
+  command?: string;
+  args?: string[];
+}
+
 export interface WeChatOpencodeConfig {
   wechat: {
     baseUrl: string;
     cdnBaseUrl: string;
     botType: string;
   };
+  /** OpenCode Server connection config. */
+  server: ServerConfig;
   agent: {
+    /** @deprecated No longer used — OpenCode Server replaces subprocess spawning. */
     preset?: string;
+    /** @deprecated */
     command: string;
+    /** @deprecated */
     args: string[];
     cwd: string;
+    /** @deprecated */
     env?: Record<string, string>;
     showThoughts: boolean;
     showTools: boolean;
   };
+  /** @deprecated Agent presets are no longer used. */
   agents: Record<string, AgentPreset>;
+  /** @deprecated Session idle timeout is managed by the server. */
   session: {
     idleTimeoutMs: number;
   };
@@ -75,6 +91,11 @@ export function defaultConfig(): WeChatOpencodeConfig {
       baseUrl: "https://ilinkai.weixin.qq.com",
       cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
       botType: "3",
+    },
+    server: {
+      url: "http://localhost:4096",
+      command: "npx",
+      args: ["opencode-ai", "serve", "--port", "4096"],
     },
     agent: {
       preset: undefined,

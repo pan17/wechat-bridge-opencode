@@ -1,11 +1,11 @@
 /**
- * Inbound adapter: convert WeChat messages to ACP ContentBlock[].
+ * Inbound adapter: convert WeChat messages to MessagePart[].
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import type * as acp from "@agentclientprotocol/sdk";
+import type { MessagePart } from "../types.js";
 import type { WeixinMessage, MessageItem } from "../weixin/types.js";
 import { MessageItemType } from "../weixin/types.js";
 import { parseAesKey, downloadAndDecrypt } from "../weixin/media.js";
@@ -62,15 +62,15 @@ function findMediaItem(itemList?: MessageItem[]): MessageItem | undefined {
 }
 
 /**
- * Convert a WeChat message to ACP ContentBlock[] for use in session/prompt.
+ * Convert a WeChat message to MessagePart[] for use in session/prompt.
  */
 export async function weixinMessageToPrompt(
   msg: WeixinMessage,
   cdnBaseUrl: string,
   log: (msg: string) => void,
   tempDir: string,
-): Promise<acp.ContentBlock[]> {
-  const blocks: acp.ContentBlock[] = [];
+): Promise<MessagePart[]> {
+  const blocks: MessagePart[] = [];
 
   // Extract text
   const text = extractText(msg.item_list);
@@ -111,7 +111,7 @@ async function convertMediaItem(
   cdnBaseUrl: string,
   log: (msg: string) => void,
   tempDir: string,
-): Promise<acp.ContentBlock | null> {
+): Promise<MessagePart | null> {
   if (item.type === MessageItemType.IMAGE && item.image_item?.media) {
     const media = item.image_item.media;
     const aesKey = parseAesKey(media);
@@ -124,7 +124,7 @@ async function convertMediaItem(
     return {
       type: "text",
       text: `[收到图片] 文件已保存到: ${realPath}`,
-    } as acp.ContentBlock;
+    };
   }
 
   if (item.type === MessageItemType.FILE && item.file_item?.media) {
@@ -144,14 +144,14 @@ async function convertMediaItem(
       return {
         type: "text",
         text: `[收到文件: ${fileName}]\n文件路径: ${realPath}\n\n文件内容:\n${content}`,
-      } as acp.ContentBlock;
+      };
     }
 
     // Binary files: just tell agent where it is
     return {
       type: "text",
       text: `[收到文件: ${fileName}] 文件已保存到: ${realPath}\n你可以使用这个路径来读取或处理文件。`,
-    } as acp.ContentBlock;
+    };
   }
 
   if (item.type === MessageItemType.VOICE && item.voice_item?.media) {

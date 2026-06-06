@@ -1,8 +1,8 @@
 # WeChat OpenCode
 
-[中文](README.md) | [English](README_zh.md)
+[中文](README.md) | [English](README.en.md)
 
-将微信私聊消息桥接到 OpenCode，支持文本、图片、文件、音视频的双向传输。
+将微信私聊消息桥接到 OpenCode Server（HTTP API），支持文本、图片、文件、音视频的双向传输。
 
 <img src="./resources/发送.jpg" alt="发送" width="49%" /> <img src="./resources/接收.jpg" alt="接收" width="49%" />
 
@@ -13,7 +13,7 @@
 - **文件传输** — 支持任意类型文件收发
 - **音视频传输** — 完整的音频和视频消息支持
 - **二维码登录** — 终端渲染二维码，扫码登录微信
-- **独立会话** — 每个微信用户拥有独立 ACP 会话
+- **OpenCode Server** — 基于 HTTP API，不再需要 ACP 子进程
 - **后台模式** — 使用 `--daemon` 参数后台运行
 - **send-wechat 工具** — Agent 可直接发送文字、文件、图片到微信
 
@@ -22,7 +22,7 @@
 ### 方式一：一键运行（推荐）
 无需安装，`npx` 会自动下载并运行：
 ```bash
-npx wechat-bridge-opencode --agent opencode
+npx wechat-bridge-opencode
 ```
 
 ### 方式二：全局安装
@@ -31,29 +31,31 @@ npm install -g wechat-bridge-opencode
 ```
 安装完成后，可使用简写命令：
 ```bash
-wbo --agent opencode
+wbo
 ```
 
 ## 使用
 ```bash
 cd /path/to/your/project
-wbo --agent opencode
+wbo
 # 或直接使用 npx：
-# npx wechat-bridge-opencode --agent opencode
+# npx wechat-bridge-opencode
 ```
 
 首次运行会：
-1. 终端显示二维码
-2. 扫码登录微信
-3. 保存登录令牌到 `~/.wechat-bridge-opencode`
-4. 开始轮询微信私信
+1. 自动启动 `opencode serve`（HTTP Server）
+2. 终端显示二维码
+3. 扫码登录微信
+4. 保存登录令牌到 `~/.wechat-bridge-opencode`
+5. 开始轮询微信私信
 
 ## 选项
 
 | 参数 | 说明 |
 |------|------|
-| `--agent <预设\|命令>` | 内置预设或自定义命令 |
 | `--cwd <目录>` | 工作目录 |
+| `--server-url <url>` | OpenCode Server 地址（默认 http://localhost:4096） |
+| `--no-server` | 不自动启动 opencode serve（使用外部 Server） |
 | `--login` | 强制重新登录 |
 | `--daemon` | 后台运行 |
 | `--config <文件>` | JSON 配置文件 |
@@ -65,19 +67,16 @@ wbo --agent opencode
 
 | 命令 | 说明 |
 |------|------|
-| `/workspace list` | 列出所有目录 |
-| `/workspace switch <n\|路径>` | 按序号或路径切换（自动加载最近会话） |
-| `/workspace add /路径 [名称]` | 添加目录 |
-| `/workspace status` | 显示当前目录 |
+| `/workspace status` | 显示当前工作区 |
+| `/workspace switch <路径>` | 切换到指定目录 |
+| `/workspace add <路径>` | 添加并切换到目录 |
 
 ### 会话（`/session` 或 `/s`）
 
 | 命令 | 说明 |
 |------|------|
-| `/session list` | 列出最近 10 个会话 |
-| `/session list --cwd` | 列出当前工作区下的会话 |
-| `/session list <路径\|n>` | 按工作区路径或索引筛选会话 |
-| `/session switch <n\|slug>` | 按序号或 slug/标题切换 |
+| `/session list` | 列出服务器上的会话 |
+| `/session switch <n>` | 切换到指定会话 |
 | `/session new` | 新会话（清除上下文） |
 | `/session status` | 显示当前会话 |
 
@@ -93,9 +92,8 @@ wbo --agent opencode
 
 | 命令 | 说明 |
 |------|------|
-| `/model list` | 列出所有模型提供商及其模型数量 |
-| `/model list <provider>` | 列出指定提供商下的模型（带序号） |
-| `/model switch <provider/model\|n>` | 按完整模型名或序号切换模型（最后查询的提供商） |
+| `/model list` | 列出模型提供商及其数量 |
+| `/model switch <provider/model>` | 切换模型（如 anthropic/claude-sonnet-4-5） |
 | `/model status` | 显示当前模型 |
 
 ### Reasoning（`/reasoning`）
@@ -110,28 +108,21 @@ wbo --agent opencode
 
 | 命令 | 说明 |
 |------|------|
-| `/status` | 查看当前会话，工作区、Agent、模型、推理级别和上下文使用情况 |
+| `/status` | 显示当前会话、工作区、Agent、模型、推理级别和上下文使用情况 |
 
 ### 停止（`/stop`）
 
 | 命令 | 说明 |
 |------|------|
-| `/stop` | 停止正在运行的 Agent（相当于按 ESC） |
-| `/restart` | 重启 Agent（保留当前状态） |
-| `/upgrade` | 更新 OpenCode 后重启 |
-
-### 版本（`/version`）
-
-| 命令 | 说明 |
-|------|------|
-| `/version` | 查看当前版本和最新版本 |
+| `/stop` | 停止正在运行的 Agent |
+| `/restart` | 新会话（清除上下文） |
 
 ### 思考（`/thinking`）
 
 | 命令 | 说明 |
 |------|------|
-| `/thinking on` | 开启思考与工具调用显示（暂时禁用） |
-| `/thinking off` | 关闭思考与工具调用显示 |
+| `/thinking off` | 关闭思考与工具显示 |
+| `/thinking off tools` | 仅关闭工具显示 |
 | `/thinking status` | 查看当前显示设置 |
 
 ### 消息计数（`/next`）
@@ -144,7 +135,8 @@ wbo --agent opencode
 
 - Node.js 20+
 - 微信 iLink 机器人 API 访问权限
-- [OpenCode](https://github.com/anomalyco/opencode) 本地安装或通过 npx 运行
+- [OpenCode](https://github.com/anomalyco/opencode)（需支持 `opencode serve` 命令）
+- Bridge 会自动启动 `opencode serve`，也可通过 `--no-server` 使用外部实例
 
 ## 数据存储
 

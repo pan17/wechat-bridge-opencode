@@ -1,8 +1,8 @@
 # WeChat OpenCode
 
-[中文](README.md) | [English](README_zh.md)
+[中文](README.md) | [English](README.en.md)
 
-Bridge WeChat direct messages to OpenCode, with full bidirectional support for text, images, files, audio, and video.
+Bridge WeChat direct messages to OpenCode Server (HTTP API), with full bidirectional support for text, images, files, audio, and video.
 
 <img src="./resources/发送.jpg" alt="Send" width="49%" /> <img src="./resources/接收.jpg" alt="Receive" width="49%" />
 
@@ -13,7 +13,7 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 - **Files** — Send/receive files of any type
 - **Audio/Video** — Full audio and video message support
 - **QR Login** — Terminal QR code rendering for WeChat login
-- **One Session Per User** — Dedicated ACP session for each WeChat user
+- **OpenCode Server** — HTTP API based, no ACP subprocess required
 - **Daemon Mode** — Run in background with `--daemon`
 - **send-wechat Tool** — Agents can send text, files, and images back to WeChat
 
@@ -22,7 +22,7 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 ### Method 1: One-click run (Recommended)
 No installation required, `npx` will download and run automatically:
 ```bash
-npx wechat-bridge-opencode --agent opencode
+npx wechat-bridge-opencode
 ```
 
 ### Method 2: Global install
@@ -31,28 +31,31 @@ npm install -g wechat-bridge-opencode
 ```
 After installation, use the shorthand command:
 ```bash
-wbo --agent opencode
+wbo
 ```
 
 ## Usage
 ```bash
 cd /path/to/your/project
-wbo --agent opencode
+wbo
 # or use npx directly:
-# npx wechat-bridge-opencode --agent opencode
+# npx wechat-bridge-opencode
 ```
 
 First run will:
-1. Show QR code in terminal
-2. Save login token to `~/.wechat-bridge-opencode`
-3. Start polling WeChat DMs
+1. Auto-start `opencode serve` (HTTP Server)
+2. Show QR code in terminal
+3. Scan QR with WeChat
+4. Save login token to `~/.wechat-bridge-opencode`
+5. Start polling WeChat DMs
 
 ## Options
 
 | Flag | Description |
 |------|-------------|
-| `--agent <preset\|cmd>` | Built-in preset or raw command |
 | `--cwd <dir>` | Working directory |
+| `--server-url <url>` | OpenCode Server URL (default: http://localhost:4096) |
+| `--no-server` | Don't auto-start opencode serve (use external Server) |
 | `--login` | Force re-login |
 | `--daemon` | Run in background |
 | `--config <file>` | JSON config file |
@@ -64,19 +67,16 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/workspace list` | List all directories |
-| `/workspace switch <n\|path>` | Switch by index or path (loads most recent session) |
-| `/workspace add /path [name]` | Add directory |
-| `/workspace status` | Show current directory |
+| `/workspace status` | Show current workspace |
+| `/workspace switch <path>` | Switch to directory by path |
+| `/workspace add <path>` | Add and switch to directory |
 
 ### Session (`/session` or `/s`)
 
 | Command | Description |
 |---------|-------------|
-| `/session list` | List recent 10 sessions |
-| `/session list --cwd` | List sessions in current workspace |
-| `/session list <path\|n>` | List sessions by workspace path or index |
-| `/session switch <n\|slug>` | Switch by index or slug/title |
+| `/session list` | List sessions on the server |
+| `/session switch <n>` | Switch to session by index |
 | `/session new` | New session (clear context) |
 | `/session status` | Show current session |
 
@@ -92,9 +92,8 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/model list` | List all providers with model counts |
-| `/model list <provider>` | List models for a specific provider (with index) |
-| `/model switch <provider/model\|n>` | Switch model by full name or index (last queried provider) |
+| `/model list` | List providers with model counts |
+| `/model switch <provider/model>` | Switch model (e.g. anthropic/claude-sonnet-4-5) |
 | `/model status` | Show current model |
 
 ### Reasoning (`/reasoning`)
@@ -115,22 +114,15 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/stop` | Stop the running agent (equivalent to pressing ESC) |
-| `/restart` | Restart agent (preserve current state) |
-| `/upgrade` | Update OpenCode then restart |
-
-### Version (`/version`)
-
-| Command | Description |
-|---------|-------------|
-| `/version` | Show current version and latest version |
+| `/stop` | Stop the running agent |
+| `/restart` | New session (clear context) |
 
 ### Thinking (`/thinking`)
 
 | Command | Description |
 |---------|-------------|
-| `/thinking on` | Enable thinking & tool display (temporarily disabled) |
 | `/thinking off` | Disable thinking & tool display |
+| `/thinking off tools` | Disable tool display only |
 | `/thinking status` | Show current thinking & tool display settings |
 
 ### Message Limit (`/next`)
@@ -143,7 +135,8 @@ First run will:
 
 - Node.js 20+
 - WeChat iLink bot API access
-- [OpenCode](https://github.com/anomalyco/opencode) installed locally or via npx
+- [OpenCode](https://github.com/anomalyco/opencode) (requires `opencode serve` support)
+- Bridge auto-starts `opencode serve`; use `--no-server` for external instances
 
 ## Storage
 

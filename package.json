@@ -29,7 +29,6 @@
     "postinstall": "node scripts/install-tool.mjs"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^0.16.1",
     "better-sqlite3": "^12.8.0",
     "qrcode-terminal": "^0.12.0"
   },

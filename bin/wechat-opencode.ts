@@ -3,51 +3,44 @@
 /**
  * wechat-opencode CLI entry point.
  *
+ * Spawns opencode serve as a sidecar, then starts the WeChat bridge.
+ *
  * Usage:
- *   wechat-opencode --agent "claude code"
- *   wechat-opencode --agent "gemini" --cwd /path/to/project
- *   wechat-opencode --agent "npx tsx ./agent.ts" --login
- *   wechat-opencode --agent "claude code" --daemon
- *   wechat-opencode stop
- *   wechat-opencode status
+ *   wbo                          (default: uses opencode serve)
+ *   wbo --cwd /path/to/project
+ *   wbo --server-url http://localhost:4096  (external server)
+ *   wbo --no-server                         (external, don't spawn)
+ *   wbo --login
+ *   wbo --daemon
+ *   wbo stop
+ *   wbo status
  */
 
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import qrcodeTerminal from "qrcode-terminal";
 import { WeChatOpencodeBridge } from "../src/bridge.js";
-import {
-  defaultConfig,
-  listBuiltInAgents,
-  resolveAgentSelection,
-} from "../src/config.js";
+import { defaultConfig } from "../src/config.js";
 import type { WeChatOpencodeConfig } from "../src/config.js";
 
 function usage(): void {
-  const presets = listBuiltInAgents()
-    .map(({ id }) => id)
-    .join(", ");
-
   console.log(`
-wbo — Bridge WeChat to OpenCode
+wbo — Bridge WeChat to OpenCode (OpenCode Server)
 
 Usage:
-  wbo --agent <preset|command>  [options]
-  wbo agents                        List built-in agent presets
+  wbo [options]
   wbo stop                          Stop a running daemon
   wbo status                        Check daemon status
 
 Options:
-  --agent <value>     Built-in preset name or raw agent command
-                      Presets: ${presets}
-                      Examples: "opencode"
   --cwd <dir>         Working directory for agent (default: current dir)
+  --server-url <url>  OpenCode Server URL (default: http://localhost:4096)
+  --no-server         Don't start opencode serve (use external server)
   --login             Force re-login (new QR code)
   --daemon            Run in background after login
   --config <file>     Config file path (JSON)
   --idle-timeout <m>  Session idle timeout in minutes (default: 1440)
-                      Use 0 to disable idle cleanup
   -v, --verbose       Verbose logging
   -h, --help          Show this help
 `);
@@ -55,8 +48,9 @@ Options:
 
 function parseArgs(argv: string[]): {
   command?: string;
-  agent?: string;
   cwd?: string;
+  serverUrl?: string;
+  noServer: boolean;
   forceLogin: boolean;
   daemon: boolean;
   configFile?: string;
@@ -67,6 +61,7 @@ function parseArgs(argv: string[]): {
   const result = {
     forceLogin: false,
     daemon: false,
+    noServer: false,
     verbose: false,
     help: false,
   } as ReturnType<typeof parseArgs>;
@@ -83,11 +78,14 @@ function parseArgs(argv: string[]): {
   while (i < args.length) {
     const arg = args[i];
     switch (arg) {
-      case "--agent":
-        result.agent = args[++i];
-        break;
       case "--cwd":
         result.cwd = args[++i];
+        break;
+      case "--server-url":
+        result.serverUrl = args[++i];
+        break;
+      case "--no-server":
+        result.noServer = true;
         break;
       case "--login":
         result.forceLogin = true;
@@ -126,16 +124,7 @@ function loadConfigFile(filePath: string): Partial<WeChatOpencodeConfig> {
   return JSON.parse(content) as Partial<WeChatOpencodeConfig>;
 }
 
-function handleAgents(config: WeChatOpencodeConfig): void {
-  console.log("Built-in ACP agent presets:\n");
-  for (const { id, preset } of listBuiltInAgents(config.agents)) {
-    const commandLine = [preset.command, ...preset.args].join(" ");
-    console.log(`${id.padEnd(10)} ${commandLine}`);
-    if (preset.description) {
-      console.log(`           ${preset.description}`);
-    }
-  }
-}
+// ─── Daemon management ───
 
 function handleStop(config: WeChatOpencodeConfig): void {
   const pidFile = config.daemon.pidFile;
@@ -186,7 +175,6 @@ function daemonize(config: WeChatOpencodeConfig): void {
   const out = fs.openSync(logFile, "a");
   const err = fs.openSync(logFile, "a");
 
-  // Re-run ourselves with --no-daemon (internal flag) as a detached process
   const args = process.argv.slice(1).filter((a) => a !== "--daemon");
   const child = spawn(process.execPath, args, {
     detached: true,
@@ -202,11 +190,72 @@ function daemonize(config: WeChatOpencodeConfig): void {
   process.exit(0);
 }
 
+// ─── Sidecar management ───
+
+let serverProcess: ChildProcess | null = null;
+
+async function startServer(config: WeChatOpencodeConfig): Promise<void> {
+  const cmd = config.server.command ?? "npx";
+  const args = config.server.args ?? ["opencode-ai", "serve", "--port", "4096"];
+  const useShell = process.platform === "win32";
+  const log = (msg: string) => console.log(`[server] ${msg}`);
+
+  log(`Starting: ${cmd} ${args.join(" ")} (shell=${useShell})`);
+
+  serverProcess = spawn(cmd, args, {
+    stdio: ["ignore", "pipe", "inherit"],
+    env: { ...process.env },
+    shell: useShell,
+  });
+
+  serverProcess.stdout?.on("data", (data: Buffer) => {
+    for (const line of data.toString().split("\n").filter(Boolean)) {
+      log(line);
+    }
+  });
+
+  serverProcess.on("exit", (code, signal) => {
+    log(`Exited: code=${code} signal=${signal}`);
+    serverProcess = null;
+  });
+
+  serverProcess.on("error", (err) => {
+    log(`Error: ${String(err)}`);
+  });
+
+  // Wait for server to be ready
+  const serverUrl = config.server.url;
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
+      if (res.ok) {
+        log("Server is ready");
+        return;
+      }
+    } catch {
+      // Not ready yet
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  log("Warning: server may not be ready yet, continuing...");
+}
+
+function stopServer(): void {
+  if (serverProcess && !serverProcess.killed) {
+    serverProcess.kill("SIGTERM");
+    serverProcess = null;
+  }
+}
+
+// ─── QR rendering ───
+
 function renderQrInTerminal(url: string): void {
   qrcodeTerminal.generate(url, { small: true }, (qr: string) => {
     console.log(qr);
   });
 }
+
+// ─── Main ───
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
@@ -222,18 +271,21 @@ async function main(): Promise<void> {
   if (args.configFile) {
     const fileConfig = loadConfigFile(args.configFile);
     Object.assign(config.wechat, fileConfig.wechat ?? {});
+    Object.assign(config.server, fileConfig.server ?? {});
     Object.assign(config.agent, fileConfig.agent ?? {});
-    Object.assign(config.agents, fileConfig.agents ?? {});
-    Object.assign(config.session, fileConfig.session ?? {});
     Object.assign(config.daemon, fileConfig.daemon ?? {});
     Object.assign(config.storage, fileConfig.storage ?? {});
   }
 
-  // Handle subcommands
-  if (args.command === "agents") {
-    handleAgents(config);
-    return;
+  // CLI overrides
+  if (args.cwd) config.agent.cwd = path.resolve(args.cwd);
+  if (args.serverUrl) config.server.url = args.serverUrl;
+  if (args.idleTimeout !== undefined) {
+    config.session.idleTimeoutMs = args.idleTimeout * 60_000;
   }
+  config.daemon.enabled = args.daemon;
+
+  // Handle subcommands
   if (args.command === "stop") {
     handleStop(config);
     return;
@@ -243,40 +295,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  const agentSelection = args.agent ?? config.agent.preset;
-
-  // Require preset or raw command
-  if (!agentSelection && !config.agent.command) {
-    console.error("Error: --agent is required\n");
-    usage();
-    process.exit(1);
-  }
-
-  if (agentSelection) {
-    const resolvedAgent = resolveAgentSelection(agentSelection, config.agents);
-    config.agent.preset = resolvedAgent.id;
-    config.agent.command = resolvedAgent.command;
-    config.agent.args = resolvedAgent.args;
-    if (resolvedAgent.env) {
-      config.agent.env = { ...(config.agent.env ?? {}), ...resolvedAgent.env };
-    }
-  }
-
-  if (args.cwd) config.agent.cwd = path.resolve(args.cwd);
-  if (args.idleTimeout !== undefined) {
-    if (!Number.isFinite(args.idleTimeout) || args.idleTimeout < 0) {
-      console.error("Error: invalid --idle-timeout value");
-      console.error('Use a non-negative integer minute value, where "0" means unlimited.');
-      process.exit(1);
-    }
-    config.session.idleTimeoutMs = args.idleTimeout * 60_000;
-  }
-  config.daemon.enabled = args.daemon;
-
   // Handle daemon mode
   if (args.daemon && !process.env.WECHAT_OPENCODE_DAEMON) {
     daemonize(config);
     return;
+  }
+
+  // Start opencode serve sidecar (unless --no-server)
+  if (!args.noServer) {
+    await startServer(config);
   }
 
   // Create and start bridge
@@ -285,9 +312,9 @@ async function main(): Promise<void> {
     console.log(`[${ts}] ${msg}`);
   });
 
-  // Handle graceful shutdown
   const shutdown = async () => {
     await bridge.stop();
+    stopServer();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown());
