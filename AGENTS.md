@@ -188,7 +188,7 @@ src/weixin/
 | `/stop` | Cancel the running agent |
 | `/restart` | New session (clear context) |
 
-### Thinking (/thinking)
+### Thinking (/thought)
 | Command | Description |
 |---------|-------------|
 | `/thought on` | Enable thinking & tool display |

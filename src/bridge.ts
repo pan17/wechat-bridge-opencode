@@ -190,7 +190,16 @@ export class WeChatOpencodeBridge {
       fs.writeFileSync(
         stateFile,
         JSON.stringify(
-          { sessionId: this.userState.sessionId, cwd: this.userState.cwd, updatedAt: new Date().toISOString() },
+          {
+            users: [
+              {
+                userId: this.userState.userId,
+                sessionId: this.userState.sessionId,
+                cwd: this.userState.cwd,
+              },
+            ],
+            updatedAt: new Date().toISOString(),
+          },
           null,
           2,
         ),
@@ -361,6 +370,7 @@ export class WeChatOpencodeBridge {
     } else {
       this.userState.userId = userId;
     }
+    this.saveUserState();
 
     // User reply resets the WeChat 10-message gateway limit
     this.wechatMsgCount = 0;

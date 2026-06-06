@@ -120,7 +120,7 @@ First run will:
 | `/stop` | Stop the running agent |
 | `/restart` | New session (clear context) |
 
-### Thinking (`/thinking`)
+### Thinking (`/thought`)
 
 | Command | Description |
 |---------|-------------|
