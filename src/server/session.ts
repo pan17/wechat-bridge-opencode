@@ -1107,10 +1107,19 @@ export class SessionManager {
     }));
   }
 
-  /** List all sessions across all workspaces, most recent first. */
+  /**
+   * List root (user-facing) sessions across all workspaces, most recent first.
+   *
+   * Subagent/sub-sessions — those spawned by the agent's `task` tool — are
+   * filtered out because they have a `parentID` pointing to the primary
+   * session that spawned them. They are internal to the agent workflow and
+   * not user-interactable. To inspect a specific session by ID, use
+   * `switchSession` directly.
+   */
   async listServerSessions(): Promise<Array<{ sessionId: string; cwd?: string; title?: string; updatedAt?: number }>> {
     const sessions = await this.client.listSessionsV2(50);
     return sessions
+      .filter((s) => !s.parentID)
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
       .map((s) => ({
         sessionId: s.id,

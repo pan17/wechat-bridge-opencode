@@ -605,8 +605,8 @@ export class WeChatOpencodeBridge {
           const count = Math.min(sessions.length, 20);
           for (let i = 0; i < count; i++) {
             const s = sessions[i];
-            lines.push(`  ${i + 1}. ${s.title ?? "(untitled)"}`);
-            if (s.cwd) lines.push(`     📂 ${s.cwd}`);
+            const cwdSuffix = s.cwd ? `  📂 ${s.cwd}` : "";
+            lines.push(`  ${i + 1}. ${s.title ?? "(untitled)"}${cwdSuffix}`);
           }
           if (count === 0) {
             lines.push("  (no sessions)");

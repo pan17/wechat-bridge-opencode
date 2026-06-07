@@ -59,28 +59,64 @@ export class OpenCodeServerClient {
     title?: string;
     directory?: string;
     updatedAt?: number;
+    parentID?: string;
   }>> {
+    /**
+     * Follow the server's `cursor.next` token until the response is exhausted,
+     * so we collect root sessions regardless of where they fall in the
+     * server's chronological ordering. Without pagination, the first page is
+     * dominated by recent subagent/sub-sessions and older root sessions get
+     * dropped before the parentID filter runs.
+     *
+     * Safety cap: at most `maxPages` requests to prevent runaway loops if
+     * the server returns a cyclic cursor.
+     */
+    const pageSize = limit ?? 200;
+    const maxPages = 50;
+    const all: Array<{
+      id: string;
+      title?: string;
+      location?: { directory?: string };
+      time?: { updated?: number };
+      parentID?: string;
+    }> = [];
+
     try {
-      const params = limit ? `?roots=true&limit=${limit}` : "?roots=true";
-      const res = await this.fetch(`/api/session${params}`, { method: "GET" });
-      if (!res.ok) return [];
-      const body = await res.json() as {
-        data?: Array<{
-          id: string;
-          title?: string;
-          location?: { directory?: string };
-          time?: { updated?: number };
-        }>;
-      };
-      return (body.data ?? []).map((s) => ({
-        id: s.id,
-        title: s.title,
-        directory: s.location?.directory,
-        updatedAt: s.time?.updated,
-      }));
+      let cursor: string | undefined;
+      for (let page = 0; page < maxPages; page++) {
+        const params = new URLSearchParams();
+        params.set("roots", "true");
+        params.set("limit", String(pageSize));
+        if (cursor) params.set("cursor", cursor);
+        const res = await this.fetch(`/api/session?${params.toString()}`, { method: "GET" });
+        if (!res.ok) break;
+        const body = await res.json() as {
+          data?: Array<{
+            id: string;
+            title?: string;
+            location?: { directory?: string };
+            time?: { updated?: number };
+            parentID?: string;
+          }>;
+          cursor?: { next?: string | null };
+        };
+        const data = body.data ?? [];
+        all.push(...data);
+        const next = body.cursor?.next;
+        if (!next) break;
+        cursor = next;
+      }
     } catch {
       return [];
     }
+
+    return all.map((s) => ({
+      id: s.id,
+      title: s.title,
+      directory: s.location?.directory,
+      updatedAt: s.time?.updated,
+      parentID: s.parentID,
+    }));
   }
 
   // ─── Projects ───
