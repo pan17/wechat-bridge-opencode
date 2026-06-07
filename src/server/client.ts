@@ -273,6 +273,23 @@ export class OpenCodeServerClient {
     }
   }
 
+  // ─── Slash commands ───
+
+  /**
+   * List native OpenCode slash commands (e.g. /init, /undo, /share, /compact).
+   * Each entry has a `name` (without the leading `/`) and a `description`.
+   */
+  async listCommands(): Promise<Array<{ name: string; description?: string }>> {
+    try {
+      const res = await this.fetch("/command", { method: "GET" });
+      if (!res.ok) return [];
+      const body = await res.json() as Array<{ name: string; description?: string; source?: string; template?: string }>;
+      return body.map((c) => ({ name: c.name, description: c.description }));
+    } catch {
+      return [];
+    }
+  }
+
   // ─── Config / Providers ───
 
   async listProviders(): Promise<Array<{ id: string; name: string; models?: Array<{ id: string; name: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> }>> {

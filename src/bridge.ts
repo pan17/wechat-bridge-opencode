@@ -1007,7 +1007,7 @@ export class WeChatOpencodeBridge {
   }
 
   private async sendHelpReply(contextToken: string): Promise<void> {
-    const nativeCommands = this.sessionManager?.getAvailableCommands() ?? [];
+    const nativeCommands = (await this.sessionManager?.getAvailableCommands()) ?? [];
     const helpText = formatHelpWithNativeCommands(nativeCommands);
     await this.sendReply(contextToken, helpText);
   }

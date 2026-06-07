@@ -38,19 +38,32 @@ const TURN_STUCK_TIMEOUT_MS = 5 * 60_000;
 
 // ─── Helpers ───
 
-/**
- * Parse a model ID string like "anthropic/claude-sonnet-4-5" into a ModelRef.
- * Falls back to reasonable defaults.
- */
-function parseModelId(modelId: string): ModelRef {
-  const slash = modelId.indexOf("/");
-  if (slash > 0) {
-    return {
-      providerID: modelId.slice(0, slash),
-      modelID: modelId.slice(slash + 1),
-    };
+  /**
+   * Parse a model ID string like "anthropic/claude-sonnet-4-5" into a ModelRef.
+   * Falls back to reasonable defaults.
+   */
+  function parseModelId(modelId: string): ModelRef {
+    const slash = modelId.indexOf("/");
+    if (slash > 0) {
+      return {
+        providerID: modelId.slice(0, slash),
+        modelID: modelId.slice(slash + 1),
+      };
+    }
+    return { providerID: "anthropic", modelID: modelId };
   }
-  return { providerID: "anthropic", modelID: modelId };
+
+/**
+ * Trim an OpenCode command description to a short, single-line form suitable
+ * for the /help output. Strips internal source tags like `(builtin)` /
+ * `(user - Skill)` and truncates with an ellipsis past 60 characters.
+ */
+function shortenCommandDescription(desc: string | undefined): string {
+  if (!desc) return "";
+  const cleaned = desc.replace(/^\((?:builtin|user - Skill|opencode - Skill|skill|mcp|command)\)\s*/, "");
+  const firstLine = cleaned.split("\n", 1)[0] ?? "";
+  if (firstLine.length > 60) return firstLine.slice(0, 57) + "…";
+  return firstLine;
 }
 
 // ─── Types ───
@@ -1054,10 +1067,22 @@ export class SessionManager {
     return { totalTokens: this.totalTokens, contextSize: this.contextWindowSize };
   }
 
-  getAvailableCommands(): Array<{ name: string; description: string }> {
-    // OpenCode Server handles slash commands server-side
-    // Return empty for now — bridge commands are handled by workspace-cmd.ts
-    return [];
+  /**
+   * Fetch native OpenCode slash commands from the server.
+   * Returns an empty array if the server is unreachable or returns an error.
+   * Each entry's `description` is the first line, stripped of internal source
+   * tags like "(builtin)" / "(user - Skill)".
+   */
+  async getAvailableCommands(): Promise<Array<{ name: string; description: string }>> {
+    try {
+      const cmds = await this.client.listCommands();
+      return cmds
+        .filter((c) => c.name)
+        .map((c) => ({ name: c.name, description: shortenCommandDescription(c.description) }));
+    } catch (err) {
+      this.log(`Failed to fetch commands: ${String(err)}`);
+      return [];
+    }
   }
 
   /** Sync local agent/model/reasoning state from the server's last message metadata. */

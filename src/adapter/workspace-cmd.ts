@@ -556,7 +556,8 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
   if (nativeCommands.length > 0) {
     lines.push("", "── OpenCode 指令 ──");
     for (const cmd of nativeCommands) {
-      lines.push(`  /${cmd.name}`);
+      const desc = cmd.description ? `  ${cmd.description}` : "";
+      lines.push(`  /${cmd.name}${desc}`);
     }
   }
 
