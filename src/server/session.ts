@@ -922,13 +922,40 @@ export class SessionManager {
 
   // ─── Agent mode ───
 
+  /**
+   * Built-in OpenCode utility agents that the server returns from `/agent`
+   * with `mode: "primary"` and `builtIn: false`, so the regular
+   * `mode === "primary" && !builtIn` filter doesn't catch them. They are
+   * internal helpers (context compaction, session summarization, title
+   * generation) that the user should never see in `/agent list` or
+   * accidentally switch to. If OpenCode adds more, append them here.
+   */
+  private static readonly HIDDEN_AGENT_NAMES: ReadonlySet<string> = new Set([
+    "compaction",
+    "summary",
+    "title",
+  ]);
+
   /** Fetch available agents from the server and cache them. */
   async refreshAgents(): Promise<void> {
     try {
       const agents = await this.client.listAgents();
-      // Show only primary non-built-in agents (subagents and system agents are internal)
+      // User-switchable agents are anything that is NOT mode: "subagent".
+      // OpenCode has three modes: "primary" (Tab-switchable only), "subagent"
+      // (invoked via @-mention or by other agents — never directly), and
+      // "all" (both — this is also the DEFAULT when a custom agent's markdown
+      // file omits `mode:`, so all user-defined custom agents land here).
+      // We want to show both "primary" and "all" in `/agent list` and hide
+      // only "subagent" entries. Also drop OpenCode's built-in utility
+      // agents (compaction/summary/title) which slip through because the
+      // server reports them as primary+non-builtIn even though they're internal.
       this.availableModes = agents
-        .filter((a) => a.mode === "primary" && !a.builtIn)
+        .filter(
+          (a) =>
+            a.mode !== "subagent" &&
+            !a.builtIn &&
+            !SessionManager.HIDDEN_AGENT_NAMES.has(a.name),
+        )
         .map((a) => ({
           id: a.name, // Server uses agent name as the switchable value
           name: a.name,
@@ -1158,5 +1185,19 @@ export class SessionManager {
   async checkHealth(): Promise<boolean> {
     const h = await this.client.health();
     return h.ok;
+  }
+
+  /**
+   * Return the running server's version string (from /global/health), or null
+   * if the server is unreachable or does not report a version. Used by the
+   * `/version` and `/upgrade` commands.
+   */
+  async getServerVersion(): Promise<string | null> {
+    try {
+      const h = await this.client.health();
+      return h.ok && h.version ? h.version : null;
+    } catch {
+      return null;
+    }
   }
 }

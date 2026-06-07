@@ -8,6 +8,8 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { login, loadToken, type TokenData } from "./weixin/auth.js";
 import { startMonitor } from "./weixin/monitor.js";
 import { sendTextMessage, sendMediaMessage, splitText } from "./weixin/send.js";
@@ -28,6 +30,8 @@ import {
   parseThinkingCommand,
   parseStopCommand,
   parseRestartCommand,
+  parseVersionCommand,
+  parseUpgradeCommand,
   parseHelpCommand,
   formatHelpWithNativeCommands,
   formatStatus,
@@ -38,6 +42,145 @@ import type { WeChatOpencodeConfig } from "./config.js";
 const TEXT_CHUNK_LIMIT = 4000;
 const TOOL_API_PORT = 18792;
 const TOOL_API_HOST = "127.0.0.1";
+
+/**
+ * Read the bridge's own version from the nearest package.json. The compiled
+ * output lives at `dist/src/bridge.js` (package.json is two levels up), but
+ * when running TypeScript sources directly (e.g. via tsx) it lives at
+ * `src/bridge.ts` (package.json is one level up). We try both candidates.
+ */
+const BRIDGE_VERSION: string = (() => {
+  const require_ = createRequire(import.meta.url);
+  const candidates = ["../../package.json", "../package.json"];
+  for (const c of candidates) {
+    try {
+      const pkg = require_(c) as { name?: string; version?: string };
+      if (pkg?.name === "wechat-bridge-opencode" && pkg.version) return pkg.version;
+    } catch {
+      // try next
+    }
+  }
+  return "unknown";
+})();
+
+/**
+ * Spawn a child process and collect stdout/stderr to completion (or timeout).
+ * Used by the `/version` and `/upgrade` commands to invoke the OpenCode CLI.
+ */
+function spawnAndCollect(
+  cmd: string,
+  args: string[],
+  timeoutMs: number,
+  log: (msg: string) => void,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const useShell = process.platform === "win32";
+    log(`[cli] spawn: ${cmd} ${args.join(" ")} (shell=${useShell})`);
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(cmd, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: useShell,
+        env: { ...process.env },
+      });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    proc.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+    const timer = setTimeout(() => {
+      log(`[cli] timeout after ${timeoutMs}ms, killing`);
+      proc.kill();
+      reject(new Error(`Command timed out after ${timeoutMs}ms: ${cmd} ${args.join(" ")}`));
+    }, timeoutMs);
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Build the `<cmd> <args>` pair for invoking `opencode upgrade` from a
+ * server-spawn configuration.
+ *
+ * Heuristic: when the server command is `npx`, treat the first non-flag
+ * arg as the package name (skipping any leading flags like `-y`). For
+ * any other command, assume the binary itself accepts `upgrade` as a
+ * subcommand directly.
+ *
+ * Examples:
+ *   npx opencode-ai serve --port 4096  →  npx opencode-ai upgrade
+ *   opencode serve --port 4096         →  opencode upgrade
+ *   npx -y opencode-ai@0.5.0 serve …   →  npx opencode-ai@0.5.0 upgrade
+ */
+function buildUpgradeCommand(
+  serverCommand: string,
+  serverArgs: string[],
+): { cmd: string; args: string[] } {
+  if (serverCommand === "npx" && serverArgs.length > 0) {
+    const pkgIdx = serverArgs.findIndex((a) => !a.startsWith("-"));
+    if (pkgIdx !== -1) {
+      return { cmd: serverCommand, args: [serverArgs[pkgIdx]!, "upgrade"] };
+    }
+  }
+  return { cmd: serverCommand, args: ["upgrade"] };
+}
+
+/**
+ * Resolve the npm package name used to install OpenCode, derived from the
+ * server-spawn configuration. Used by `/version` to query the npm registry
+ * for the latest available version.
+ *
+ * Defaults to `opencode-ai` for the typical npx or direct-binary install.
+ * For npx invocations, returns the first non-flag arg with any `@version`
+ * pin stripped. Handles both `opencode-ai@1.0.0` and scoped `@scope/pkg@1.0.0`.
+ */
+function resolveOpencodePackageName(
+  serverCommand: string,
+  serverArgs: string[],
+): string {
+  if (serverCommand === "npx" && serverArgs.length > 0) {
+    const pkgIdx = serverArgs.findIndex((a) => !a.startsWith("-"));
+    if (pkgIdx !== -1) {
+      const arg = serverArgs[pkgIdx]!;
+      // For scoped packages ("@scope/pkg"), the first "@" is at index 0 and
+      // is part of the name; the version separator is the SECOND "@".
+      // For unscoped packages, the first "@" is the version separator.
+      const atIdx = arg.startsWith("@") ? arg.indexOf("@", 1) : arg.indexOf("@");
+      if (atIdx > 0) return arg.slice(0, atIdx);
+      return arg;
+    }
+  }
+  return "opencode-ai";
+}
+
+/**
+ * Compare two semver-ish strings and return true if `latest` is strictly
+ * newer than `current`. Both arguments may have a `v` prefix; pre-release
+ * tags (e.g. `-rc.1`) are ignored — we only compare `major.minor.patch`.
+ * Returns false on parse failure.
+ */
+function isNewerSemver(latest: string, current: string): boolean {
+  const parse = (v: string): [number, number, number] | null => {
+    const m = v.replace(/^v/, "").split(/[-+]/)[0]?.match(/^(\d+)\.(\d+)\.(\d+)$/);
+    if (!m) return null;
+    return [Number(m[1]), Number(m[2]), Number(m[3])];
+  };
+  const l = parse(latest);
+  const c = parse(current);
+  if (!l || !c) return false;
+  if (l[0] !== c[0]) return l[0] > c[0];
+  if (l[1] !== c[1]) return l[1] > c[1];
+  return l[2] > c[2];
+}
 
 /** A message cached when WeChat 10-msg limit is reached, flushed on /next. */
 type PendingMessage =
@@ -489,6 +632,22 @@ export class WeChatOpencodeBridge {
       if (restartCmd) {
         this.handleRestartCommand(contextToken, restartCmd).catch((err) => {
           this.log(`Restart command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const vCmd = parseVersionCommand(textContent);
+      if (vCmd) {
+        this.handleVersionCommand(contextToken, vCmd).catch((err) => {
+          this.log(`Version command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const upCmd = parseUpgradeCommand(textContent);
+      if (upCmd) {
+        this.handleUpgradeCommand(contextToken, upCmd).catch((err) => {
+          this.log(`Upgrade command error: ${String(err)}`);
         });
         return;
       }
@@ -1072,6 +1231,162 @@ export class WeChatOpencodeBridge {
     return sessionId;
   }
 
+  // ─── Version command (/version) ───
+
+  private async handleVersionCommand(
+    contextToken: string,
+    _cmd: ReturnType<typeof parseVersionCommand>,
+  ): Promise<void> {
+    const lines: string[] = ["📦 Versions:"];
+
+    // Bridge version (always available — read from package.json at module load)
+    lines.push(`  🌉 Bridge: v${BRIDGE_VERSION}`);
+
+    // OpenCode Server version (from /global/health — doesn't require a session)
+    const serverVersion = this.sessionManager
+      ? await this.sessionManager.getServerVersion()
+      : null;
+    if (serverVersion) {
+      lines.push(`  🖥️  Server: v${serverVersion}`);
+    } else {
+      lines.push(`  🖥️  Server: (unreachable at ${this.config.server.url})`);
+    }
+
+    // Latest version from the npm registry (best-effort — never fail the
+    // command if the registry is unreachable).
+    const pkgName = resolveOpencodePackageName(
+      this.config.server.command ?? "npx",
+      this.config.server.args ?? [],
+    );
+    const latestVersion = await this.getLatestNpmVersion(pkgName);
+    if (latestVersion) {
+      const upgradeHint =
+        serverVersion && isNewerSemver(latestVersion, serverVersion)
+          ? "  ⬆️ 有新版本可用 `/upgrade`"
+          : "";
+      lines.push(`  📡 Latest: v${latestVersion}  (${pkgName})${upgradeHint}`);
+    } else {
+      lines.push(`  📡 Latest: (unable to query npm registry)`);
+    }
+
+    await this.sendReply(contextToken, lines.join("\n"));
+  }
+
+  /**
+   * Fetch the `version` field from `https://registry.npmjs.org/<pkg>/latest`.
+   * Returns null on any failure (network, timeout, 404, malformed JSON) so
+   * the `/version` command stays usable offline.
+   */
+  private async getLatestNpmVersion(pkgName: string): Promise<string | null> {
+    try {
+      const url = `https://registry.npmjs.org/${encodeURIComponent(pkgName)}/latest`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) {
+        this.log(`npm registry ${res.status} for ${pkgName}`);
+        return null;
+      }
+      const data = (await res.json()) as { version?: string };
+      return typeof data.version === "string" ? data.version : null;
+    } catch (err) {
+      this.log(`npm registry fetch failed: ${String(err)}`);
+      return null;
+    }
+  }
+
+  // ─── Upgrade command (/upgrade) ───
+
+  private async handleUpgradeCommand(
+    contextToken: string,
+    _cmd: ReturnType<typeof parseUpgradeCommand>,
+  ): Promise<void> {
+    // External-server mode: we don't own the server process, so we can't
+    // upgrade it in-place. Tell the user to upgrade on the server host.
+    if (!this.restartServer) {
+      await this.sendReply(
+        contextToken,
+        "⚠️ 当前为外部 server 模式，无法通过桥接升级 OpenCode；请在运行 server 的机器上执行 `opencode upgrade` 后重启 server",
+      );
+      return;
+    }
+    if (!this.sessionManager) return;
+
+    // Capture the running version BEFORE we start, so we can report the delta.
+    const oldVersion = await this.sessionManager.getServerVersion().catch(() => null);
+    const cmd = this.config.server.command ?? "npx";
+    const args = this.config.server.args ?? [];
+    const { cmd: upCmd, args: upArgs } = buildUpgradeCommand(cmd, args);
+
+    await this.sendReply(
+      contextToken,
+      `🔄 开始升级 OpenCode${oldVersion ? `（当前 v${oldVersion}）` : ""}...\n  ${upCmd} ${upArgs.join(" ")}`,
+    );
+
+    // Run the upgrade command with a 2-minute timeout. If it times out
+    // (likely because it tried to prompt interactively — e.g. the opencode
+    // binary's auto-detected install method is "unknown"), we still proceed
+    // to restart the server: for npx-style launches npx will fetch the
+    // latest package on next invocation, so a restart is itself an upgrade.
+    let upgradeNote = "";
+    try {
+      const { code, stdout, stderr } = await spawnAndCollect(upCmd, upArgs, 120_000, this.log);
+      const combined = stdout + (stderr ? `\n${stderr}` : "");
+      if (code === 0) {
+        this.log(`OpenCode upgrade completed (code=0)`);
+        const tail = combined.split("\n").filter(Boolean).slice(-3).join("\n");
+        if (tail) upgradeNote = `\n  ${tail}`;
+      } else {
+        this.log(`OpenCode upgrade exited with code=${code}; proceeding to restart anyway`);
+        upgradeNote = `\n  （升级命令退出码 ${code}，将重启 server 加载最新版本）`;
+      }
+    } catch (err) {
+      this.log(`OpenCode upgrade error/timeout: ${String(err)}; proceeding to restart anyway`);
+      const firstLine = String(err).split("\n")[0] ?? String(err);
+      upgradeNote = `\n  （升级命令异常/超时：${firstLine}，将重启 server 加载最新版本）`;
+    }
+
+    // Restart the server (same flow as /restart).
+    await this.sendReply(contextToken, `🔄 重启 OpenCode Server...${upgradeNote}`);
+    const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+    const previousSessionId = this.userState?.sessionId ?? this.sessionManager.getSessionId();
+
+    try {
+      // 1. Cancel any in-flight prompt (best-effort — server may be unresponsive soon)
+      await this.sessionManager.cancelPrompt().catch((err) => {
+        this.log(`Cancel prompt during upgrade (ignored): ${String(err)}`);
+      });
+
+      // 2. Tear down the SSE event pipeline (the old SSE connection is dead)
+      await this.sessionManager.stopEventPipeline();
+
+      // 3. Restart the server (CLI does stop + start + wait-for-health)
+      const t0 = Date.now();
+      await this.restartServer();
+      this.log(`Server restart took ${Date.now() - t0}ms`);
+
+      // 4. Restore the previous session on the fresh server
+      const restoredId = await this.restoreOrCreateSession(previousSessionId, cwd);
+
+      // 5. Re-establish the SSE pipeline against the new server
+      await this.sessionManager.startEventPipeline(cwd);
+
+      // 6. Verify the new version is now active
+      const newVersion = await this.sessionManager.getServerVersion().catch(() => null);
+      const versionInfo = newVersion
+        ? oldVersion
+          ? `v${oldVersion} → v${newVersion}`
+          : `v${newVersion}`
+        : "（无法读取新版本）";
+      const tag = restoredId === previousSessionId ? "已恢复" : "旧会话不存在，已创建新会话";
+      await this.sendReply(
+        contextToken,
+        `✅ 升级完成 (${versionInfo})\nServer 已重启，会话${tag}\n  ${restoredId}`,
+      );
+    } catch (err) {
+      this.log(`Upgrade restart error: ${String(err)}`);
+      await this.sendReply(contextToken, `⚠️ 重启失败: ${String(err)}`);
+    }
+  }
+
   // ─── Helpers ───
 
   private detectUnknownSlashCommand(text: string): string | null {
@@ -1085,7 +1400,7 @@ export class WeChatOpencodeBridge {
     const bridgeCommands = [
       "workspace", "ws", "session", "s", "agent", "a", "model",
       "reasoning", "help", "h", "?", "status", "thinking", "stop",
-      "restart", "next",
+      "restart", "next", "version", "upgrade",
     ];
     if (bridgeCommands.includes(cmdName)) return null;
 

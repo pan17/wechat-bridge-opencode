@@ -127,6 +127,13 @@ First run will:
 | `/thought off` | Disable thinking & tool display |
 | `/thought status` | Show current thinking & tool display settings |
 
+### System (`/version`, `/upgrade`)
+
+| Command | Description |
+|---------|-------------|
+| `/version` | Show Bridge, OpenCode Server, and the latest version published to npm; hints `/upgrade` if a newer version is available |
+| `/upgrade` | Run `opencode upgrade` and auto-restart the server (unavailable in external-server mode; in npx mode a restart is itself an upgrade) |
+
 ### Message Limit (`/next`)
 
 | Command | Description |

@@ -187,6 +187,78 @@ function daemonize(config: WeChatOpencodeConfig): void {
 
 let serverProcess: ChildProcess | null = null;
 
+/**
+ * Wait for the server's TCP port to actually be free. After a process tree
+ * kill, the OS may briefly keep the listening socket in TIME_WAIT before
+ * releasing it; polling the health endpoint (which will refuse connections
+ * while the port is free, and succeed while it's occupied) is a reliable
+ * way to know the new server can bind.
+ */
+async function waitForPortFree(serverUrl: string, timeoutMs: number, log: (msg: string) => void): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(500) });
+      if (!res.ok) {
+        // Port responded with non-2xx (e.g. another service moved in) — not our
+        // server anymore, treat as free.
+        log("Port no longer serves the opencode server");
+        return;
+      }
+      // Port still serving the opencode server — wait and retry.
+    } catch {
+      // Connection refused / timeout — port is free.
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  log(`Warning: port did not become free within ${timeoutMs}ms; starting new server anyway`);
+}
+
+/**
+ * Kill the entire process tree rooted at `pid`.
+ *
+ * On Windows, `ChildProcess.kill()` calls `TerminateProcess()`, which only
+ * kills the parent (npx) and leaves children (opencode-ai.exe) orphaned and
+ * still listening on the port. The fix is `taskkill /F /T` which terminates
+ * the parent AND all descendants.
+ *
+ * On Unix, we rely on the parent having been spawned with `detached: true`
+ * so it has its own process group; killing `-pid` sends the signal to every
+ * process in the group.
+ */
+async function killProcessTree(pid: number, log: (msg: string) => void): Promise<void> {
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve) => {
+      const tk = spawn("taskkill", ["/pid", String(pid), "/f", "/t"], {
+        stdio: "ignore",
+        shell: true,
+      });
+      tk.on("exit", (code) => {
+        log(`taskkill exited with code=${code}`);
+        resolve();
+      });
+      tk.on("error", (err) => {
+        log(`taskkill error: ${String(err)}`);
+        resolve();
+      });
+    });
+  } else {
+    // SIGTERM the whole group, then SIGKILL after a grace period.
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch (err) {
+      log(`SIGTERM group failed: ${String(err)}`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // Group may already be gone — that's fine.
+    }
+  }
+}
+
 async function startServer(config: WeChatOpencodeConfig): Promise<void> {
   const cmd = config.server.command ?? "npx";
   const args = config.server.args ?? ["opencode-ai", "serve", "--port", "4096"];
@@ -199,6 +271,16 @@ async function startServer(config: WeChatOpencodeConfig): Promise<void> {
     stdio: ["ignore", "pipe", "inherit"],
     env: { ...process.env },
     shell: useShell,
+    // `detached: true` is required on Unix to put the child in its own
+    // process group so we can kill the whole tree with
+    // `process.kill(-pid, ...)` — otherwise the negative-PID kill would
+    // also terminate the bridge itself (which shares the default group).
+    //
+    // On Windows we MUST NOT pass `detached: true`: combined with
+    // `shell: true` it spawns the child in a new console window, which
+    // is jarring UX. Tree-kill on Windows goes through `taskkill /F /T`
+    // instead, which works for any process regardless of `detached`.
+    detached: process.platform !== "win32",
   });
 
   serverProcess.stdout?.on("data", (data: Buffer) => {
@@ -233,11 +315,30 @@ async function startServer(config: WeChatOpencodeConfig): Promise<void> {
   log("Warning: server may not be ready yet, continuing...");
 }
 
-function stopServer(): void {
-  if (serverProcess && !serverProcess.killed) {
-    serverProcess.kill("SIGTERM");
-    serverProcess = null;
+async function stopServer(config: WeChatOpencodeConfig): Promise<void> {
+  const log = (msg: string) => console.log(`[server] ${msg}`);
+  if (!serverProcess || serverProcess.killed) return;
+  const proc = serverProcess;
+  const pid = proc.pid;
+  // Detach the local reference BEFORE the kill so the eventual `exit` event
+  // (which arrives asynchronously) doesn't try to clear an already-null
+  // variable or, worse, race with the kill.
+  serverProcess = null;
+
+  if (pid === undefined) {
+    log("stopServer: serverProcess has no pid; skipping kill");
+    return;
   }
+
+  log(`Stopping server (pid=${pid})...`);
+  await killProcessTree(pid, log);
+
+  // Wait for the port to actually be released before returning. If we don't,
+  // the new server's npx child will fail to bind and exit, but the polling
+  // health check in startServer will be lied to by the still-listening old
+  // opencode-ai.exe and return success immediately (15ms, as the bug
+  // surfaced in production).
+  await waitForPortFree(config.server.url, 5_000, log);
 }
 
 // ─── QR rendering ───
@@ -314,14 +415,14 @@ async function main(): Promise<void> {
     args.serverUrl
       ? undefined
       : async () => {
-          stopServer();
+          await stopServer(config);
           await startServer(config);
         },
   );
 
   const shutdown = async () => {
     await bridge.stop();
-    stopServer();
+    await stopServer(config);
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown());

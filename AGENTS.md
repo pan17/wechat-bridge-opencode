@@ -195,6 +195,17 @@ src/weixin/
 | `/thought off` | Disable thinking & tool display |
 | `/thought status` | Show current thinking & tool display settings |
 
+### System
+| Command | Description |
+|---------|-------------|
+| `/version` | Show Bridge, OpenCode Server, and the latest version published to npm; hints `/upgrade` if a newer version is available |
+| `/upgrade` | Run `opencode upgrade` and auto-restart the server (unavailable in external-server mode; in npx mode a restart is itself an upgrade) |
+
+### Message Limit (/next)
+| Command | Description |
+|---------|-------------|
+| `/next` | WeChat limits bots to 10 consecutive messages; user reply required to continue. Send `/next` to reset the counter without forwarding to the agent |
+
 ### Help
 | Command | Description |
 |---------|-------------|

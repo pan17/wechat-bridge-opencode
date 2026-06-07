@@ -127,6 +127,13 @@ wbo
 | `/thought off` | 关闭思考与工具显示 |
 | `/thought status` | 查看当前显示设置 |
 
+### 系统（`/version`、`/upgrade`）
+
+| 命令 | 说明 |
+|------|------|
+| `/version` | 查询 Bridge、OpenCode Server 与 npm 上最新版本；如有新版会提示 `/upgrade` |
+| `/upgrade` | 运行 `opencode upgrade` 升级 OpenCode 并自动重启 server（外部 server 模式不可用，npx 模式下重启即升级） |
+
 ### 消息计数（`/next`）
 
 | 命令 | 说明 |

@@ -260,11 +260,15 @@ export class OpenCodeServerClient {
       const res = await this.fetch("/agent", { method: "GET" });
       if (!res.ok) return [];
       const raw = await res.json() as Array<{ id?: string; name: string; mode?: string; description?: string; builtIn?: boolean }>;
-      // Server returns agents with `name` as the switchable value and `mode` for primary/subagent
+      // Server returns agents with `name` as the switchable value and `mode`
+      // of "primary" / "subagent" / "all" (the last being OpenCode's default
+      // when an agent's markdown file omits `mode:`). We default to "all" to
+      // match the server's behavior so the downstream filter treats
+      // unspecified-mode custom agents as user-switchable.
       return raw.map((a) => ({
         id: a.id || a.name,
         name: a.name,
-        mode: a.mode ?? "primary",
+        mode: a.mode ?? "all",
         description: a.description,
         builtIn: a.builtIn ?? false,
       }));
