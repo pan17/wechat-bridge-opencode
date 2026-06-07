@@ -307,10 +307,23 @@ async function main(): Promise<void> {
   }
 
   // Create and start bridge
-  const bridge = new WeChatOpencodeBridge(config, (msg) => {
-    const ts = new Date().toISOString().substring(11, 19);
-    console.log(`[${ts}] ${msg}`);
-  });
+  const bridge = new WeChatOpencodeBridge(
+    config,
+    (msg) => {
+      const ts = new Date().toISOString().substring(11, 19);
+      console.log(`[${ts}] ${msg}`);
+    },
+    // `/restart` callback: stop the opencode serve sidecar, spawn a fresh one,
+    // and wait for it to be healthy before returning. The bridge will create
+    // a new session and re-attach the SSE pipeline after this resolves.
+    // Only registered when WE own the server (i.e. not --no-server).
+    args.noServer
+      ? undefined
+      : async () => {
+          stopServer();
+          await startServer(config);
+        },
+  );
 
   const shutdown = async () => {
     await bridge.stop();

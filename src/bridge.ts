@@ -68,10 +68,32 @@ export class WeChatOpencodeBridge {
   private static readonly MSG_LIMIT_WARN = 7;
   private static readonly MSG_LIMIT_MAX = 10;
   private log: (msg: string) => void;
+  private restartServer?: () => Promise<void>;
 
-  constructor(config: WeChatOpencodeConfig, log?: (msg: string) => void) {
+  constructor(
+    config: WeChatOpencodeConfig,
+    log?: (msg: string) => void,
+    /**
+     * Optional callback invoked by the `/restart` command. When provided, the
+     * bridge will tear down its SSE event pipeline + cancel in-flight work,
+     * then call this to restart the opencode serve subprocess, then re-attach
+     * to the previous session (or create a new one if it's gone) and resume
+     * the SSE pipeline.
+     *
+     * The callback is responsible for killing the old server and starting a
+     * new one, and it MUST NOT return until the new server is reachable
+     * (e.g. `/global/health` returns 200). The bridge will fail subsequent
+     * session re-attach if the server is not actually up.
+     *
+     * When not provided (e.g. with `--no-server` / external server), `/restart`
+     * falls back to re-attaching to the previous session on the existing
+     * server.
+     */
+    restartServer?: () => Promise<void>,
+  ) {
     this.config = config;
     this.log = log ?? ((msg: string) => console.log(`[wechat-opencode] ${msg}`));
+    this.restartServer = restartServer;
   }
 
   // ─── Lifecycle ───
@@ -975,15 +997,79 @@ export class WeChatOpencodeBridge {
   ): Promise<void> {
     if (!this.sessionManager) return;
 
-    await this.sendReply(contextToken, "🔄 Restarting session...");
+    const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+    // Capture BEFORE any destructive operation — once we cancel/stop/restart
+    // the original sessionId is still valid (server storage persists it),
+    // and we want to re-attach to it.
+    const previousSessionId = this.userState?.sessionId ?? this.sessionManager.getSessionId();
+
+    // External-server mode (--no-server) — we don't own the server process,
+    // so we can only re-attach to the existing session. Tell the user.
+    if (!this.restartServer) {
+      await this.sendReply(contextToken, "⚠️ 当前为外部 server 模式，无法重启 server；尝试恢复之前的会话");
+      await this.restoreOrCreateSession(previousSessionId, cwd);
+      return;
+    }
+
+    // We own the server — do a full restart: kill server, spawn new one,
+    // wait for ready, then restore the previous session and resume SSE.
+    await this.sendReply(contextToken, "🔄 重启 OpenCode Server...");
     try {
-      const cwd = this.userState?.cwd ?? this.config.agent.cwd;
-      await this.sessionManager.createNewSession(cwd);
-      await this.sendReply(contextToken, "✅ Session restarted");
+      // 1. Cancel any in-flight prompt (best-effort — server may be unresponsive soon)
+      await this.sessionManager.cancelPrompt().catch((err) => {
+        this.log(`Cancel prompt during restart (ignored): ${String(err)}`);
+      });
+
+      // 2. Tear down the SSE event pipeline (the old SSE connection is dead)
+      await this.sessionManager.stopEventPipeline();
+
+      // 3. Restart the server (CLI does stop + start + wait-for-health)
+      const t0 = Date.now();
+      await this.restartServer!();
+      this.log(`Server restart took ${Date.now() - t0}ms`);
+
+      // 4. Restore the previous session on the fresh server
+      const restoredId = await this.restoreOrCreateSession(previousSessionId, cwd);
+
+      // 5. Re-establish the SSE pipeline against the new server
+      await this.sessionManager.startEventPipeline(cwd);
+
+      const tag = restoredId === previousSessionId ? "已恢复" : "旧会话不存在，已创建新会话";
+      await this.sendReply(contextToken, `✅ Server 已重启，会话${tag}\n  ${restoredId}`);
     } catch (err) {
       this.log(`Restart error: ${String(err)}`);
-      await this.sendReply(contextToken, `⚠️ Restart failed: ${String(err)}`);
+      await this.sendReply(contextToken, `⚠️ 重启失败: ${String(err)}`);
     }
+  }
+
+  /**
+   * Try to re-attach to `previousSessionId` on the current server. If the
+   * session no longer exists (e.g. server data dir was wiped between
+   * restarts), create a fresh one. Updates `userState.sessionId` and
+   * reports back the resulting session id.
+   */
+  private async restoreOrCreateSession(
+    previousSessionId: string | null,
+    cwd: string,
+  ): Promise<string> {
+    if (!this.sessionManager) throw new Error("No session manager");
+
+    let sessionId: string;
+    if (previousSessionId) {
+      try {
+        await this.sessionManager.switchSession(previousSessionId, cwd);
+        sessionId = previousSessionId;
+        this.log(`Restored session ${previousSessionId}`);
+      } catch (err) {
+        this.log(`Previous session ${previousSessionId} not found, creating new: ${String(err)}`);
+        sessionId = await this.sessionManager.createNewSession(cwd);
+      }
+    } else {
+      sessionId = await this.sessionManager.createNewSession(cwd);
+    }
+
+    if (this.userState) this.userState.sessionId = sessionId;
+    return sessionId;
   }
 
   // ─── Helpers ───
