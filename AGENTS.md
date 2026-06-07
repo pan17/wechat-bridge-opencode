@@ -28,7 +28,7 @@ npm run prepack      # Runs build before npm publish
 npm run build
 node dist/bin/wechat-opencode.js --help
 node dist/bin/wechat-opencode.js          # auto-starts opencode serve
-node dist/bin/wechat-opencode.js --no-server  # uses external server
+node dist/bin/wechat-opencode.js --server-url http://localhost:4096  # uses external server
 ```
 
 ## Architecture

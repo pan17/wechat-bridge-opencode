@@ -6,10 +6,9 @@
  * Spawns opencode serve as a sidecar, then starts the WeChat bridge.
  *
  * Usage:
- *   wbo                          (default: uses opencode serve)
+ *   wbo                          (default: auto-starts opencode serve sidecar)
+ *   wbo --server-url <url>       (use external opencode serve; do not auto-start)
  *   wbo --cwd /path/to/project
- *   wbo --server-url http://localhost:4096  (external server)
- *   wbo --no-server                         (external, don't spawn)
  *   wbo --login
  *   wbo --daemon
  *   wbo stop
@@ -35,8 +34,7 @@ Usage:
 
 Options:
   --cwd <dir>         Working directory for agent (default: current dir)
-  --server-url <url>  OpenCode Server URL (default: http://localhost:4096)
-  --no-server         Don't start opencode serve (use external server)
+  --server-url <url>  Use external opencode serve at <url> (skip auto-start)
   --login             Force re-login (new QR code)
   --daemon            Run in background after login
   --config <file>     Config file path (JSON)
@@ -50,7 +48,6 @@ function parseArgs(argv: string[]): {
   command?: string;
   cwd?: string;
   serverUrl?: string;
-  noServer: boolean;
   forceLogin: boolean;
   daemon: boolean;
   configFile?: string;
@@ -61,7 +58,6 @@ function parseArgs(argv: string[]): {
   const result = {
     forceLogin: false,
     daemon: false,
-    noServer: false,
     verbose: false,
     help: false,
   } as ReturnType<typeof parseArgs>;
@@ -83,9 +79,6 @@ function parseArgs(argv: string[]): {
         break;
       case "--server-url":
         result.serverUrl = args[++i];
-        break;
-      case "--no-server":
-        result.noServer = true;
         break;
       case "--login":
         result.forceLogin = true;
@@ -301,8 +294,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Start opencode serve sidecar (unless --no-server)
-  if (!args.noServer) {
+  // Start opencode serve sidecar unless an external server URL was given.
+  if (!args.serverUrl) {
     await startServer(config);
   }
 
@@ -316,8 +309,9 @@ async function main(): Promise<void> {
     // `/restart` callback: stop the opencode serve sidecar, spawn a fresh one,
     // and wait for it to be healthy before returning. The bridge will create
     // a new session and re-attach the SSE pipeline after this resolves.
-    // Only registered when WE own the server (i.e. not --no-server).
-    args.noServer
+    // Only registered when WE own the server (i.e. external --server-url was
+    // NOT used).
+    args.serverUrl
       ? undefined
       : async () => {
           stopServer();

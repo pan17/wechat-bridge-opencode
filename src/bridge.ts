@@ -85,9 +85,9 @@ export class WeChatOpencodeBridge {
      * (e.g. `/global/health` returns 200). The bridge will fail subsequent
      * session re-attach if the server is not actually up.
      *
-     * When not provided (e.g. with `--no-server` / external server), `/restart`
-     * falls back to re-attaching to the previous session on the existing
-     * server.
+     * When not provided (e.g. with `--server-url` to use an external
+     * server), `/restart` falls back to re-attaching to the previous
+     * session on the existing server.
      */
     restartServer?: () => Promise<void>,
   ) {
@@ -1003,8 +1003,8 @@ export class WeChatOpencodeBridge {
     // and we want to re-attach to it.
     const previousSessionId = this.userState?.sessionId ?? this.sessionManager.getSessionId();
 
-    // External-server mode (--no-server) — we don't own the server process,
-    // so we can only re-attach to the existing session. Tell the user.
+    // External-server mode (--server-url was used) — we don't own the
+    // server process, so we can only re-attach to the existing session.
     if (!this.restartServer) {
       await this.sendReply(contextToken, "⚠️ 当前为外部 server 模式，无法重启 server；尝试恢复之前的会话");
       await this.restoreOrCreateSession(previousSessionId, cwd);

@@ -54,8 +54,7 @@ First run will:
 | Flag | Description |
 |------|-------------|
 | `--cwd <dir>` | Working directory |
-| `--server-url <url>` | OpenCode Server URL (default: http://localhost:4096) |
-| `--no-server` | Don't auto-start opencode serve (use external Server) |
+| `--server-url <url>` | Connect to external OpenCode Server; skip auto-start |
 | `--login` | Force re-login |
 | `--daemon` | Run in background |
 | `--config <file>` | JSON config file |
@@ -139,7 +138,7 @@ First run will:
 - Node.js 20+
 - WeChat iLink bot API access
 - [OpenCode](https://github.com/anomalyco/opencode) (requires `opencode serve` support)
-- Bridge auto-starts `opencode serve`; use `--no-server` for external instances
+- Bridge auto-starts `opencode serve`; use `--server-url <url>` to connect to an external instance instead
 
 ## Storage
 

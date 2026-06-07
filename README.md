@@ -54,8 +54,7 @@ wbo
 | 参数 | 说明 |
 |------|------|
 | `--cwd <目录>` | 工作目录 |
-| `--server-url <url>` | OpenCode Server 地址（默认 http://localhost:4096） |
-| `--no-server` | 不自动启动 opencode serve（使用外部 Server） |
+| `--server-url <url>` | 连接外部 OpenCode Server，跳过自动启动 |
 | `--login` | 强制重新登录 |
 | `--daemon` | 后台运行 |
 | `--config <文件>` | JSON 配置文件 |
@@ -139,7 +138,7 @@ wbo
 - Node.js 20+
 - 微信 iLink 机器人 API 访问权限
 - [OpenCode](https://github.com/anomalyco/opencode)（需支持 `opencode serve` 命令）
-- Bridge 会自动启动 `opencode serve`，也可通过 `--no-server` 使用外部实例
+- Bridge 会自动启动 `opencode serve`；通过 `--server-url <url>` 可改连外部实例
 
 ## 数据存储
 
