@@ -557,7 +557,12 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     lines.push("", "── OpenCode 指令 ──");
     for (const cmd of nativeCommands) {
       const desc = cmd.description ? `  ${cmd.description}` : "";
-      lines.push(`  /${cmd.name}${desc}`);
+      // WeChat private messages do NOT render Markdown bold (`**…**`) or any
+      // other inline color/font formatting — those characters appear as
+      // literal text. The conventional way to give a command name visual
+      // emphasis in Chinese WeChat is full-width brackets 【…】, which look
+      // like a header/button and render identically in every client.
+      lines.push(`  【/${cmd.name}】${desc}`);
     }
   }
 
