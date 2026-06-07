@@ -244,12 +244,27 @@ export class SessionManager {
 
   /**
    * Create a completely new session (resets context).
+   *
+   * Agent / model / reasoning are deliberately NOT reset — they live on the
+   * SessionManager instance, not the server session, so the next prompt on
+   * the new session will carry them in the body. This means `/session new`
+   * behaves like "fresh context, same configuration". Callers that need to
+   * see what was inherited can read `getActiveMode` / `getCurrentModel` /
+   * `getCurrentReasoning` before/after the call.
    */
   async createNewSession(cwd: string): Promise<string> {
     this.log(`Creating new session (cwd: ${cwd})`);
     const info = await this.client.createSession(undefined, undefined, cwd);
     this.sessionId = info.id;
     this.cwd = cwd;
+    // Fresh context: the previous session's token count no longer applies.
+    this.totalTokens = 0;
+    this.log(
+      `Inherited state for new session ${info.id}: ` +
+        `agent=${this.currentMode ?? "(default)"} ` +
+        `model=${this.currentModelId ?? "(default)"} ` +
+        `reasoning=${this.currentReasoning ?? "(default)"}`,
+    );
     this.onSessionReady?.(info.id);
     // Fetch defaults from server for the new session
     this.refreshAgents().catch(() => {});
@@ -316,11 +331,15 @@ export class SessionManager {
   /** Fire-and-forget prompt via /session/:id/prompt_async. Response via SSE. */
   private async sendPromptAsync(item: QueueItem): Promise<void> {
     const modelRef = this.currentModelId ? parseModelId(this.currentModelId) : undefined;
-    this.log(`[event] Sending async prompt (mode=${this.currentMode ?? "default"}, model=${this.currentModelId ?? "default"})...`);
+    this.log(`[event] Sending async prompt (mode=${this.currentMode ?? "default"}, model=${this.currentModelId ?? "default"}, variant=${this.currentReasoning ?? "default"})...`);
     await this.client.sendMessageAsync(this.sessionId!, item.parts, {
       agent: this.currentMode,
       model: modelRef,
       directory: this.cwd,
+      // OpenCode Server treats `variant` as one-shot per message. Sending it
+      // on every prompt keeps the model in the requested reasoning level —
+      // omitting it reverts the next response to the default variant.
+      variant: this.currentReasoning,
     });
   }
 
@@ -329,13 +348,19 @@ export class SessionManager {
     this.sendTyping(item.contextToken).catch(() => {});
 
     const modelRef = this.currentModelId ? parseModelId(this.currentModelId) : undefined;
-    this.log(`Sending prompt to agent (sync, mode=${this.currentMode ?? "default"}, model=${this.currentModelId ?? "default"})...`);
+    this.log(`Sending prompt to agent (sync, mode=${this.currentMode ?? "default"}, model=${this.currentModelId ?? "default"}, variant=${this.currentReasoning ?? "default"})...`);
 
     try {
       const response = await this.client.sendMessage(
         this.sessionId!,
         item.parts,
-        { agent: this.currentMode, model: modelRef, directory: this.cwd },
+        {
+          agent: this.currentMode,
+          model: modelRef,
+          directory: this.cwd,
+          // See sendPromptAsync() for why we always pass variant when set.
+          variant: this.currentReasoning,
+        },
       );
 
       if (response.info?.tokens?.total) {
@@ -635,6 +660,14 @@ export class SessionManager {
         this.currentModelId = `${info.model.providerID}/${info.model.modelID}`;
         const mod = this.availableModels.find((m) => m.modelId === this.currentModelId);
         if (mod?.contextSize) this.contextWindowSize = mod.contextSize;
+      }
+      // Sync reasoning variant back from server. The server's Assistant
+      // message carries the variant that was actually applied (so even if
+      // our local currentReasoning got stale, /status now reflects ground
+      // truth). Guard against undefined so a missing field doesn't wipe a
+      // value the user set locally but hasn't sent yet.
+      if (info.variant) {
+        this.currentReasoning = info.variant;
       }
       // Now that we know the assistant's message ID, flush any text parts
       // that were buffered while waiting. User-input parts (different
@@ -960,6 +993,12 @@ export class SessionManager {
           id: a.name, // Server uses agent name as the switchable value
           name: a.name,
           description: a.description,
+          // Carry the agent's own default model/variant so /agent switch can
+          // sync bridge state. If the server didn't return them (older
+          // OpenCode), they're undefined and switchAgent keeps the user's
+          // previous choice — see switchAgent() for the policy.
+          model: a.model,
+          variant: a.variant,
         }));
       // Set default agent if none set
       if (!this.currentMode && this.availableModes.length > 0) {
@@ -979,9 +1018,80 @@ export class SessionManager {
     return this.availableModes;
   }
 
-  async switchAgent(modeId: string): Promise<void> {
+  /**
+   * Switch to a different primary agent.
+   *
+   * Syncs local model / reasoning state with the agent's per-agent config:
+   *   - Agent has `model` → adopt it as `currentModelId`.
+   *   - Agent has `variant` → adopt it as `currentReasoning` (when valid).
+   *   - Agent lacks either → keep whatever the user previously selected.
+   *
+   * The "adopt on present, keep on absent" policy matches the user mental
+   * model: "switching agent picks up that agent's defaults, but doesn't
+   * trample on choices I made for myself when the agent has no opinion".
+   */
+  async switchAgent(modeId: string): Promise<{ modeId: string; note?: string }> {
     this.log(`Switching agent mode to: ${modeId}`);
+    const agent = this.availableModes.find((m) => m.id === modeId);
+
+    // If we don't know this agent (cache cold or stale), still set currentMode
+    // so prompts carry the new agent — we'll learn the per-agent config next
+    // time refreshAgents() lands.
+    if (!agent) {
+      this.currentMode = modeId;
+      return { modeId };
+    }
+
     this.currentMode = modeId;
+    const changes: string[] = [];
+
+    // Model
+    if (agent.model) {
+      const newModelId = `${agent.model.providerID}/${agent.model.modelID}`;
+      if (newModelId !== this.currentModelId) {
+        const previousModel = this.currentModelId ?? "(default)";
+        this.currentModelId = newModelId;
+        // Update context window size from the new model
+        const cached = this.availableModels.find((m) => m.modelId === newModelId);
+        if (cached?.contextSize) this.contextWindowSize = cached.contextSize;
+        changes.push(`Model: ${previousModel} → ${newModelId}`);
+      }
+    }
+
+    // Variant. We need the new model's variants table to validate the value.
+    // Re-resolve after the model change above so we look at the right model.
+    if (agent.variant !== undefined) {
+      const newModel = this.availableModels.find((m) => m.modelId === this.currentModelId);
+      const variants = newModel?.variants;
+      const variantIsValid = variants
+        ? Object.keys(variants).some((k) => k === agent.variant)
+        : true; // unknown model → trust the agent's config
+      if (!variantIsValid) {
+        // Agent declared a variant the new model doesn't expose. Treat as
+        // "agent has no opinion" — keep user's current reasoning.
+        this.log(`Agent "${modeId}" variant "${agent.variant}" not on ${this.currentModelId}; keeping user's choice`);
+      } else if (agent.variant !== this.currentReasoning) {
+        const previousReasoning = this.currentReasoning ?? "(default)";
+        this.currentReasoning = agent.variant;
+        changes.push(`Reasoning: ${previousReasoning} → ${agent.variant}`);
+      }
+    }
+
+    // Reasoning may need a second-pass reconciliation when we changed the
+    // model (the old variant might not exist on the new model's variants).
+    // Reuse the same logic setModel() uses so /status can't get out of sync.
+    const newLevels = this.getReasoningLevels();
+    if (newLevels.length === 0) {
+      if (this.currentReasoning !== undefined) {
+        this.log(`Clearing reasoning: ${this.currentModelId ?? "(no model)"} exposes no variants`);
+        this.currentReasoning = undefined;
+      }
+    } else if (!newLevels.some((lv) => lv.value === this.currentReasoning)) {
+      this.log(`Reasoning "${this.currentReasoning}" not available; snapping to "${newLevels[0].value}"`);
+      this.currentReasoning = newLevels[0].value;
+    }
+
+    return { modeId, ...(changes.length > 0 ? { note: changes.join("; ") } : {}) };
   }
 
   // ─── Model ───
@@ -1033,7 +1143,7 @@ export class SessionManager {
     return this.availableModels;
   }
 
-  async setModel(modelId: string): Promise<void> {
+  async setModel(modelId: string): Promise<{ modelId: string; note?: string }> {
     this.log(`Switching model to: ${modelId}`);
     this.currentModelId = modelId;
     // Update context window size from model info
@@ -1041,37 +1151,145 @@ export class SessionManager {
     if (model?.contextSize) {
       this.contextWindowSize = model.contextSize;
     }
+
+    // Reasoning levels are model-scoped: the previous variant may not be
+    // valid for the new model. Reconcile before the next prompt goes out
+    // so we don't ship a `variant` the server can't honour, and so /status
+    // reflects what will actually be sent.
+    const previous = this.currentReasoning;
+    const newLevels = this.getReasoningLevels();
+    let note: string | undefined;
+    if (newLevels.length === 0) {
+      // New model exposes no reasoning variants (either `reasoning: false`
+      // or no `variants` table). Clear so the outgoing prompt omits
+      // `variant` entirely and the server picks its default.
+      if (previous !== undefined) {
+        this.log(`Clearing reasoning: ${modelId} exposes no variants (was "${previous}")`);
+        note = `Reasoning cleared (was "${previous}"); ${modelId} exposes no reasoning levels`;
+      }
+      this.currentReasoning = undefined;
+    } else if (!newLevels.some((lv) => lv.value === previous)) {
+      // Current variant isn't valid for the new model — snap to the first
+      // available level so /reasoning list shows a usable value.
+      const next = newLevels[0].value;
+      this.log(`Resetting reasoning: "${previous}" not available on ${modelId}, using "${next}"`);
+      this.currentReasoning = next;
+      note = previous !== undefined
+        ? `Reasoning reset from "${previous}" to "${next}" (first level on ${modelId})`
+        : `Reasoning set to "${next}"`;
+    }
+    return { modelId, ...(note !== undefined ? { note } : {}) };
   }
 
   // ─── Reasoning ───
+
+  /**
+   * Resolve a human-friendly display name for a variant value.
+   *
+   * OpenCode models can expose variants with arbitrary keys. The key alone is
+   * often opaque — e.g. a provider may expose reasoning levels as "1", "2",
+   * "3" while the inner `reasoningEffort` field is the meaningful name
+   * ("low"/"medium"/"high"). Prefer `reasoningEffort` when present, and fall
+   * back to a capitalized variant key otherwise.
+   */
+  private resolveReasoningName(
+    value: string,
+    currentModel:
+      | { variants?: Record<string, { reasoningEffort?: string }> }
+      | null
+      | undefined,
+  ): string {
+    const variant = currentModel?.variants?.[value];
+    const effort = variant?.reasoningEffort;
+    if (effort) {
+      // Capitalize first letter for display (low → Low).
+      return effort.charAt(0).toUpperCase() + effort.slice(1);
+    }
+    return value.charAt(0).toUpperCase() + value.slice(1);
+  }
+
+  /** Resolve the current model's variant record (or undefined if no model). */
+  private getCurrentReasoningModel():
+    | {
+        reasoning?: boolean;
+        variants?: Record<string, { reasoningEffort?: string }>;
+      }
+    | undefined {
+    if (!this.currentModelId) return undefined;
+    return this.availableModels.find((m) => m.modelId === this.currentModelId);
+  }
 
   getCurrentReasoning(): string | undefined {
     return this.currentReasoning;
   }
 
-    getReasoningLevels(): Array<{ value: string; name: string; current: boolean }> {
-        // Use the current model's variants to determine available reasoning levels
-        const currentModel = this.currentModelId
-            ? this.availableModels.find((m) => m.modelId === this.currentModelId)
-            : null;
+  /**
+   * Human-friendly display name for the current reasoning level, resolved
+   * through the model's `reasoningEffort`. Falls back to the raw value.
+   */
+  getCurrentReasoningDisplay(): string {
+    if (!this.currentReasoning) return "(not set)";
+    return this.resolveReasoningName(this.currentReasoning, this.getCurrentReasoningModel());
+  }
 
-        if (!currentModel) return [];
-        if (currentModel.reasoning === false) return [];
+  getReasoningLevels(): Array<{ value: string; name: string; current: boolean }> {
+    // Use the current model's variants to determine available reasoning levels
+    const currentModel = this.getCurrentReasoningModel();
 
-        const levels = currentModel.variants
-            ? Object.keys(currentModel.variants).filter((k) => currentModel.variants![k]?.reasoningEffort)
-            : [];
+    if (!currentModel) return [];
+    if (currentModel.reasoning === false) return [];
 
-        return levels.map((v) => ({
-            value: v,
-            name: v.charAt(0).toUpperCase() + v.slice(1),
-            current: v === this.currentReasoning,
-        }));
-    }
+    const variants = currentModel.variants ?? {};
+    const levels = Object.keys(variants).filter((k) => variants[k]?.reasoningEffort);
+
+    return levels.map((v) => ({
+      value: v,
+      name: this.resolveReasoningName(v, currentModel),
+      current: v === this.currentReasoning,
+    }));
+  }
 
   async setReasoning(level: string): Promise<void> {
     this.log(`Setting reasoning level to: ${level}`);
-    this.currentReasoning = level;
+    const normalized = level.toLowerCase();
+
+    // "default" is a sentinel meaning "let the server pick" — clear the
+    // local value so the outgoing prompt omits `variant` entirely.
+    // OpenCode Server treats literal "default" as a no-op variant, so we
+    // must not pass it through.
+    if (normalized === "default") {
+      if (this.currentReasoning !== undefined) {
+        this.log(`Reasoning reset to server default (was "${this.currentReasoning}")`);
+      }
+      this.currentReasoning = undefined;
+      return;
+    }
+
+    // Validate against the current model's known variants. Accept either the
+    // raw variant key or a matching reasoningEffort name (case-insensitive)
+    // so users can type "low" / "high" instead of an opaque "1" / "2".
+    const currentModel = this.getCurrentReasoningModel();
+    const variants = currentModel?.variants;
+    if (variants) {
+      const known = Object.keys(variants).filter((k) => variants[k]?.reasoningEffort);
+      const matchedByValue = known.find((k) => k.toLowerCase() === normalized);
+      const matchedByEffort = known.find(
+        (k) => variants[k]?.reasoningEffort?.toLowerCase() === normalized,
+      );
+      if (!matchedByValue && !matchedByEffort) {
+        const available = known
+          .map((k) => `${k} (${variants[k]?.reasoningEffort ?? ""})`)
+          .join(", ");
+        throw new Error(
+          `Unknown reasoning level "${level}" for ${this.currentModelId ?? "current model"}. Available: ${available}`,
+        );
+      }
+      this.currentReasoning = matchedByValue ?? level;
+    } else {
+      // No variants cached yet (e.g. before refreshProviders). Store verbatim
+      // and let the next sync re-validate.
+      this.currentReasoning = level;
+    }
     // TODO: translate reasoning level to model suffix or config option
     // as appropriate for the server API
   }

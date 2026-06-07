@@ -83,6 +83,13 @@ export interface MessageInfo {
   time?: { created?: number; completed?: number };
   agent?: string;
   model?: { providerID: string; modelID: string };
+  /**
+   * Reasoning / effort variant key (e.g. "low", "medium", "high", or a provider-
+   * specific opaque key such as "1"). One-shot per message in OpenCode Server;
+   * the bridge must include it on every prompt to keep the model in the
+   * desired variant — see https://github.com/anomalyco/opencode/issues/24299.
+   */
+  variant?: string;
   /** For assistant: total tokens used. */
   tokens?: { input?: number; output?: number; total?: number; reasoning?: number; cache?: { read?: number; write?: number } };
   /** For assistant: cost. */

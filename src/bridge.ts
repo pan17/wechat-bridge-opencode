@@ -836,7 +836,21 @@ export class WeChatOpencodeBridge {
         const cwd = this.userState?.cwd ?? this.config.agent.cwd;
         try {
           await this.sessionManager.createNewSession(cwd);
-          await this.sendReply(contextToken, "✅ Session restarted. Context cleared.");
+          // Show what carried over so the user can confirm inheritance at a
+          // glance. /status will reflect the same values; this message just
+          // makes the transition explicit.
+          const agent = this.sessionManager.getActiveMode() ?? "(default)";
+          const model = this.sessionManager.getCurrentModel() ?? "(default)";
+          const reasoning = this.sessionManager.getCurrentReasoningDisplay();
+          await this.sendReply(
+            contextToken,
+            [
+              "✅ Session restarted. Context cleared.",
+              `🤖 Agent: ${agent}`,
+              `📱 Model: ${model}`,
+              `🧠 Reasoning: ${reasoning}`,
+            ].join("\n"),
+          );
         } catch (err) {
           await this.sendReply(contextToken, `⚠️ Failed: ${String(err)}`);
         }
@@ -874,7 +888,12 @@ export class WeChatOpencodeBridge {
           for (let i = 0; i < availableModes.length; i++) {
             const m = availableModes[i];
             const marker = m.id === currentMode ? " ✅" : "";
-            lines.push(`  ${i + 1}. ${m.name}${marker}`);
+            // Show each agent's per-agent model/variant so users can see at
+            // a glance which model and reasoning level switching to it
+            // will adopt. Empty fields render as "(default)".
+            const modelPart = m.model ? `${m.model.providerID}/${m.model.modelID}` : "(default)";
+            const variantPart = m.variant ?? "(default)";
+            lines.push(`  ${i + 1}. ${m.name}${marker} — ${modelPart} / ${variantPart}`);
           }
         } else {
           lines.push("  (no available modes)");
@@ -905,8 +924,12 @@ export class WeChatOpencodeBridge {
         }
 
         try {
-          await this.sessionManager.switchAgent(targetMode);
-          await this.sendReply(contextToken, `✅ Agent switched to ${targetMode}`);
+          const result = await this.sessionManager.switchAgent(targetMode);
+          // switchAgent may also adopt the agent's per-agent model/variant.
+          // Surface that so the user knows what just happened to /status.
+          const lines = [`✅ Agent switched to ${result.modeId}`];
+          if (result.note) lines.push(`ℹ️ ${result.note}`);
+          await this.sendReply(contextToken, lines.join("\n"));
         } catch (err) {
           await this.sendReply(contextToken, `⚠️ Switch failed: ${String(err)}`);
         }
@@ -992,8 +1015,13 @@ export class WeChatOpencodeBridge {
           return;
         }
         try {
-          await this.sessionManager.setModel(input);
-          await this.sendReply(contextToken, `✅ Model switched to ${input}`);
+          const result = await this.sessionManager.setModel(input);
+          // setModel may have cleared or reset the reasoning variant because
+          // the previous one isn't valid on the new model. Surface that to
+          // the user so they know what just happened to /status.
+          const lines = [`✅ Model switched to ${result.modelId}`];
+          if (result.note) lines.push(`ℹ️ ${result.note}`);
+          await this.sendReply(contextToken, lines.join("\n"));
         } catch (err) {
           await this.sendReply(contextToken, `⚠️ Switch failed: ${String(err)}`);
         }
@@ -1037,7 +1065,24 @@ export class WeChatOpencodeBridge {
       case "switch": {
         try {
           await this.sessionManager.setReasoning(cmd!.name!.toLowerCase());
-          await this.sendReply(contextToken, `✅ Reasoning set to ${cmd!.name}`);
+          const raw = this.sessionManager.getCurrentReasoning();
+          if (!raw) {
+            // Either the user picked "default" or setReasoning cleared the
+            // value because the requested level isn't valid. Either way,
+            // the next prompt will go out without a `variant` field.
+            const requested = cmd!.name!.toLowerCase();
+            if (requested === "default") {
+              await this.sendReply(contextToken, `✅ Reasoning reset to server default (no variant will be sent)`);
+            } else {
+              await this.sendReply(contextToken, `✅ Reasoning cleared (will use server default)`);
+            }
+          } else {
+            const display = this.sessionManager.getCurrentReasoningDisplay();
+            const confirm = raw.toLowerCase() !== display.toLowerCase()
+              ? `✅ Reasoning set to ${display} (${raw})`
+              : `✅ Reasoning set to ${display}`;
+            await this.sendReply(contextToken, confirm);
+          }
         } catch (err) {
           await this.sendReply(contextToken, `⚠️ Switch failed: ${String(err)}`);
         }
@@ -1045,8 +1090,14 @@ export class WeChatOpencodeBridge {
       }
 
       case "status": {
-        const level = this.sessionManager.getCurrentReasoning();
-        await this.sendReply(contextToken, `🧠 Reasoning: ${level ?? "(not set)"}`);
+        const display = this.sessionManager.getCurrentReasoningDisplay();
+        const raw = this.sessionManager.getCurrentReasoning();
+        // When the displayed name differs from the raw key (e.g. numeric key
+        // "1" → "Low"), append the raw value so the user knows the variant id.
+        const line = raw && raw.toLowerCase() !== display.toLowerCase()
+          ? `🧠 Reasoning: ${display} (${raw})`
+          : `🧠 Reasoning: ${display}`;
+        await this.sendReply(contextToken, line);
         break;
       }
     }
@@ -1072,14 +1123,12 @@ export class WeChatOpencodeBridge {
 
     const currentMode = this.sessionManager.getActiveMode();
     const currentModel = this.sessionManager.getCurrentModel() ?? "(not set)";
-    let currentReasoning = this.sessionManager.getCurrentReasoning();
-    if (!currentReasoning) {
+    let currentReasoning = this.sessionManager.getCurrentReasoningDisplay();
+    if (currentReasoning === "(not set)") {
       // Default to the first reasoning level of the current model
       const levels = this.sessionManager.getReasoningLevels();
       if (levels.length > 0) {
-        currentReasoning = levels[0].value;
-      } else {
-        currentReasoning = "(not set)";
+        currentReasoning = levels[0].name;
       }
     }
     const contextUsage = this.sessionManager.getContextUsage();

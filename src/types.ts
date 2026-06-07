@@ -92,6 +92,10 @@ export interface SessionMode {
   id: string;
   name: string;
   description?: string;
+  /** Agent-configured default model (from `agent.<name>.model`). */
+  model?: { providerID: string; modelID: string };
+  /** Agent-configured default reasoning variant (from `agent.<name>.variant`). */
+  variant?: string;
 }
 
 /** Context usage info. */

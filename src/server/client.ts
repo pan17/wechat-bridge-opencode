@@ -179,11 +179,15 @@ export class OpenCodeServerClient {
   async sendMessage(
     sessionId: string,
     parts: MessagePart[],
-    opts?: { agent?: string; model?: ModelRef; directory?: string },
+    opts?: { agent?: string; model?: ModelRef; directory?: string; variant?: string },
   ): Promise<MessageResponse> {
     const body: Record<string, unknown> = { parts };
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.model) body.model = opts.model;
+    // OpenCode Server: `variant` is a top-level optional string on the prompt
+    // body (mirrors PromptInput.variant in @opencode/server). It's one-shot —
+    // omitting it on the next message causes the server to revert to default.
+    if (opts?.variant) body.variant = opts.variant;
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (opts?.directory) headers["x-opencode-directory"] = opts.directory;
@@ -213,11 +217,13 @@ export class OpenCodeServerClient {
   async sendMessageAsync(
     sessionId: string,
     parts: MessagePart[],
-    opts?: { agent?: string; model?: ModelRef; directory?: string },
+    opts?: { agent?: string; model?: ModelRef; directory?: string; variant?: string },
   ): Promise<{ accepted: boolean; status: number }> {
     const body: Record<string, unknown> = { parts };
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.model) body.model = opts.model;
+    // See sendMessage() for why variant goes on every prompt.
+    if (opts?.variant) body.variant = opts.variant;
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (opts?.directory) headers["x-opencode-directory"] = opts.directory;
@@ -255,11 +261,40 @@ export class OpenCodeServerClient {
 
   // ─── Agents ───
 
-  async listAgents(): Promise<Array<{ id: string; name: string; mode: string; description?: string; builtIn: boolean }>> {
+  async listAgents(): Promise<
+    Array<{
+      id: string;
+      name: string;
+      mode: string;
+      description?: string;
+      builtIn: boolean;
+      /**
+       * Agent-configured default model. Comes from each agent's
+       * `opencode.json` `agent.<name>.model` (parsed by OpenCode into
+       * `{ providerID, modelID }`). The bridge uses this when `/agent
+       * switch` runs to keep model state in sync with the agent.
+       */
+      model?: { providerID: string; modelID: string };
+      /**
+       * Agent-configured default reasoning variant. From
+       * `agent.<name>.variant`. Not in the public SDK type, but OpenCode's
+       * `/agent` endpoint returns it (see opencode/src/agent/agent.ts).
+       */
+      variant?: string;
+    }>
+  > {
     try {
       const res = await this.fetch("/agent", { method: "GET" });
       if (!res.ok) return [];
-      const raw = await res.json() as Array<{ id?: string; name: string; mode?: string; description?: string; builtIn?: boolean }>;
+      const raw = await res.json() as Array<{
+        id?: string;
+        name: string;
+        mode?: string;
+        description?: string;
+        builtIn?: boolean;
+        model?: { providerID: string; modelID: string };
+        variant?: string;
+      }>;
       // Server returns agents with `name` as the switchable value and `mode`
       // of "primary" / "subagent" / "all" (the last being OpenCode's default
       // when an agent's markdown file omits `mode:`). We default to "all" to
@@ -271,6 +306,8 @@ export class OpenCodeServerClient {
         mode: a.mode ?? "all",
         description: a.description,
         builtIn: a.builtIn ?? false,
+        model: a.model,
+        variant: a.variant,
       }));
     } catch {
       return [];
