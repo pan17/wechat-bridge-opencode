@@ -109,3 +109,21 @@ export interface ShowFlags {
   showThoughts: boolean;
   showTools: boolean;
 }
+
+/**
+ * MCP server status from `GET /mcp`. Discriminated union — only the variant
+ * matching `status` is valid. `failed` and `needs_client_registration`
+ * carry an `error` string explaining what went wrong; the other variants
+ * have no extra fields.
+ *
+ * See https://opencode.ai/docs/server/ (LSP, Formatters & MCP section).
+ */
+export type McpServerStatus =
+  | { status: "connected" }
+  | { status: "disabled" }
+  | { status: "failed"; error: string }
+  | { status: "needs_auth" }
+  | { status: "needs_client_registration"; error: string };
+
+/** Response from `GET /mcp`: a name → status map. */
+export type McpStatusMap = Record<string, McpServerStatus>;

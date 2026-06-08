@@ -16,6 +16,8 @@
  *   status                        — Show current session info
  */
 
+import type { McpServerStatus } from "../types.js";
+
 export interface WorkspaceCommand {
   kind: "list" | "add" | "switch" | "remove" | "status";
   path?: string;
@@ -377,6 +379,13 @@ export function formatStatus(opts: {
   model: string;
   reasoning: string;
   contextUsage: { used: number; size: number } | null;
+  /**
+   * MCP server status map (name → status). Omit (or pass `null`) to skip
+   * the MCP section entirely — useful when the call hasn't been made yet
+   * or the server doesn't expose the endpoint. Sorted by status (problems
+   * first) then alphabetically for stable output.
+   */
+  mcpStatus?: Record<string, McpServerStatus> | null;
 }): string {
   const lines: string[] = ["📊 Status:"];
 
@@ -400,6 +409,29 @@ export function formatStatus(opts: {
   // Reasoning
   lines.push(`  🧠 Reasoning: ${opts.reasoning}`);
 
+  // MCP servers (show all so the user can see what's loaded, with failures
+  // surfaced prominently). Disabled servers are skipped — they're off by
+  // configuration and not actionable.
+  if (opts.mcpStatus) {
+    const entries = Object.entries(opts.mcpStatus)
+      .filter(([, s]) => s.status !== "disabled")
+      .sort(([aName, aStatus], [bName, bStatus]) => {
+        // Problems (failed/needs_auth/needs_client_registration) first so
+        // the user notices them at a glance; otherwise alphabetical.
+        const aBad = isProblemStatus(aStatus) ? 0 : 1;
+        const bBad = isProblemStatus(bStatus) ? 0 : 1;
+        return aBad - bBad || aName.localeCompare(bName);
+      });
+    if (entries.length === 0) {
+      lines.push("  🧩 MCP: (none enabled)");
+    } else {
+      lines.push(`  🧩 MCP (${entries.length}):`);
+      for (const [name, status] of entries) {
+        lines.push(`     ${formatMcpLine(name, status)}`);
+      }
+    }
+  }
+
   // Context usage
   if (opts.contextUsage && opts.contextUsage.size > 0) {
     const pct = Math.min(Math.round((opts.contextUsage.used / opts.contextUsage.size) * 100), 100);
@@ -414,6 +446,35 @@ export function formatStatus(opts: {
   }
 
   return lines.join("\n");
+}
+
+function isProblemStatus(s: McpServerStatus): boolean {
+  return (
+    s.status === "failed" ||
+    s.status === "needs_auth" ||
+    s.status === "needs_client_registration"
+  );
+}
+
+function formatMcpLine(name: string, status: McpServerStatus): string {
+  switch (status.status) {
+    case "connected":
+      return `✅ ${name}`;
+    case "failed":
+      return `❌ ${name} — ${truncate(status.error, 80)}`;
+    case "needs_auth":
+      return `🔐 ${name} — needs auth`;
+    case "needs_client_registration":
+      return `🔐 ${name} — ${truncate(status.error, 80)}`;
+    case "disabled":
+      // Filtered out by the caller; unreachable.
+      return `⏸ ${name}`;
+  }
+}
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + "…";
 }
 
 function formatProgressBar(pct: number): string {

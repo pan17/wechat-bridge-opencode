@@ -201,6 +201,14 @@ export class WeChatOpencodeBridge {
   private sessionManager: SessionManager | null = null;
   private tokenData: TokenData | null = null;
   private userState: UserState | null = null;
+  /**
+   * Cwd filter from the most recent `/session list`. `undefined` means the
+   * last list was unfiltered (or no list has run); a string means the
+   * next `/session switch <n>` should look up against that filtered list,
+   * so the number the user sees in the list matches the number they type.
+   * Reset on every `/session list` call.
+   */
+  private lastSessionListFilter: string | undefined = undefined;
   private currentContextToken: string | null = null;
   private typingTicket: { ticket: string; expiresAt: number } | null = null;
   private toolApiServer: http.Server | null = null;
@@ -270,6 +278,28 @@ export class WeChatOpencodeBridge {
 
     // 2. Load saved user state
     this.loadUserState();
+
+    // Reset stale user state when the saved cwd no longer matches the
+    // directory the bridge was started from. Without this, /status reports
+    // the old cwd while the SessionManager and the actual opencode server
+    // session use config.agent.cwd — so the agent runs in a different
+    // directory than what the user sees. The user's last sessionId is
+    // dropped too: it's tied to the old cwd and may not exist on the
+    // server (or may belong to a different workspace's worktree).
+    if (this.userState && this.userState.cwd !== this.config.agent.cwd) {
+      this.log(
+        `Discarding stale user state: saved cwd=${this.userState.cwd} ` +
+          `does not match start cwd=${this.config.agent.cwd}`,
+      );
+      this.userState = null;
+      // Persist the cleared state so subsequent reads stay consistent.
+      try {
+        const stateFile = path.join(this.config.storage.dir, ".wechat-bridge-state.json");
+        fs.writeFileSync(stateFile, JSON.stringify({}, null, 2), "utf-8");
+      } catch {
+        // Best effort
+      }
+    }
 
     // 3. Create SessionManager (HTTP-based, no subprocess)
     this.sessionManager = new SessionManager({
@@ -670,6 +700,33 @@ export class WeChatOpencodeBridge {
 
   // ─── Directory commands (/workspace or /ws) ───
 
+  /**
+   * Build the sorted workspace list used by `/workspace list` and the
+   * index-based `/workspace switch <n>`. Always includes the current
+   * workspace. Order matches the displayed numbering.
+   */
+  private async getSortedWorkspaces(
+    currentCwd: string,
+  ): Promise<Array<{ cwd: string }>> {
+    if (!this.sessionManager) return [{ cwd: currentCwd }];
+    // Fetch projects (they have time.updated for recency sorting)
+    const projects = await this.sessionManager.listServerProjects();
+    // Deduplicate by worktree, keep the most recent updatedAt
+    const wsMap = new Map<string, number>();
+    for (const p of projects) {
+      const existing = wsMap.get(p.worktree) ?? 0;
+      if (p.updatedAt > existing) wsMap.set(p.worktree, p.updatedAt);
+    }
+    // Always include current workspace
+    if (!wsMap.has(currentCwd)) {
+      wsMap.set(currentCwd, 0);
+    }
+    // Sort by recency descending, then by path for ties
+    return [...wsMap.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([cwd]) => ({ cwd }));
+  }
+
   private async handleDirectoryCommand(
     contextToken: string,
     cmd: ReturnType<typeof parseWorkspaceCommand>,
@@ -679,22 +736,7 @@ export class WeChatOpencodeBridge {
     switch (cmd!.kind) {
       case "list": {
         const currentCwd = this.userState?.cwd ?? this.config.agent.cwd;
-        // Fetch projects (they have time.updated for recency sorting)
-        const projects = await this.sessionManager.listServerProjects();
-        // Deduplicate by worktree, keep the most recent updatedAt
-        const wsMap = new Map<string, number>();
-        for (const p of projects) {
-          const existing = wsMap.get(p.worktree) ?? 0;
-          if (p.updatedAt > existing) wsMap.set(p.worktree, p.updatedAt);
-        }
-        // Always include current workspace
-        if (!wsMap.has(currentCwd)) {
-          wsMap.set(currentCwd, 0);
-        }
-        // Sort by recency descending, then by path for ties
-        const workspaces = [...wsMap.entries()]
-          .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-          .map(([cwd]) => ({ cwd }));
+        const workspaces = await this.getSortedWorkspaces(currentCwd);
         await this.sendReply(contextToken, formatWorkspaceList(workspaces, currentCwd));
         break;
       }
@@ -710,7 +752,27 @@ export class WeChatOpencodeBridge {
           await this.sendReply(contextToken, "Usage: /workspace switch <path>");
           return;
         }
-        const targetDir = cmd!.name;
+        const currentCwd = this.userState?.cwd ?? this.config.agent.cwd;
+        const target = cmd!.name;
+
+        // Resolve numeric index against the same sorted list that /workspace
+        // list shows, so `/workspace switch 5` matches the 5th entry.
+        const idx = parseInt(target, 10);
+        let targetDir: string;
+        if (/^\d+$/.test(target) && !isNaN(idx)) {
+          const workspaces = await this.getSortedWorkspaces(currentCwd);
+          if (idx < 1 || idx > workspaces.length) {
+            await this.sendReply(
+              contextToken,
+              `❌ Index out of range: ${idx} (1..${workspaces.length})`,
+            );
+            return;
+          }
+          targetDir = workspaces[idx - 1]!.cwd;
+        } else {
+          targetDir = target;
+        }
+
         const state = this.userState;
         if (state && state.cwd === targetDir) {
           await this.sendReply(contextToken, `Already on ${targetDir}`);
@@ -782,6 +844,15 @@ export class WeChatOpencodeBridge {
               : cmd!.cwdFilter;
             sessions = allSessions.filter((s) => s.cwd === filterCwd);
           }
+          // Stash the resolved filter so the next /session switch <n> uses
+          // the same index space the user just saw. Set to the *resolved*
+          // cwd (or undefined for unfiltered) so the switch handler doesn't
+          // need to re-resolve "__current__".
+          this.lastSessionListFilter = cmd!.cwdFilter
+            ? cmd!.cwdFilter === "__current__"
+              ? (this.userState?.cwd ?? this.config.agent.cwd)
+              : cmd!.cwdFilter
+            : undefined;
           const lines: string[] = [cmd!.cwdFilter ? `💬 Sessions in current workspace:` : "💬 Recent Sessions:"];
           const count = Math.min(sessions.length, 20);
           for (let i = 0; i < count; i++) {
@@ -804,7 +875,16 @@ export class WeChatOpencodeBridge {
       case "switch": {
         const idx = parseInt(cmd!.name!, 10);
         try {
-          const sessions = await this.sessionManager.listServerSessions();
+          const allSessions = await this.sessionManager.listServerSessions();
+          // Apply the same filter as the most recent /session list so the
+          // number the user sees matches the number they type. Without this,
+          // /session list current followed by /session switch 1 silently
+          // hits session 1 of the *unfiltered* list (which can live in a
+          // different workspace) instead of session 1 of the filtered list
+          // the user just looked at.
+          const sessions = this.lastSessionListFilter
+            ? allSessions.filter((s) => s.cwd === this.lastSessionListFilter)
+            : allSessions;
           if (!isNaN(idx) && idx >= 1 && idx <= sessions.length) {
             const target = sessions[idx - 1];
             const newCwd = target.cwd ?? this.userState?.cwd ?? this.config.agent.cwd;
@@ -813,7 +893,13 @@ export class WeChatOpencodeBridge {
             this.setUserState(target.sessionId, newCwd);
             await this.sendReply(contextToken, `✅ Ready on ${newCwd}`);
           } else {
-            await this.sendReply(contextToken, `Session "${cmd!.name}" not found. Use /session list to see available sessions.`);
+            const hint = this.lastSessionListFilter
+              ? ` (filter: ${this.lastSessionListFilter})`
+              : "";
+            await this.sendReply(
+              contextToken,
+              `Session "${cmd!.name}" not found in ${sessions.length} sessions${hint}. Use /session list to refresh.`,
+            );
           }
         } catch (err) {
           await this.sendReply(contextToken, `❌ Switch failed: ${String(err)}`);
@@ -1137,6 +1223,15 @@ export class WeChatOpencodeBridge {
     const sessionTitle = sessionId ? await this.sessionManager.getSessionTitle(sessionId).catch(() => undefined) : undefined;
     const sessionInfo = sessionId ? { id: sessionId, cwd, title: sessionTitle } : null;
 
+    // Fetch MCP status. Failures are swallowed (the network call goes to
+    // the local opencode server) and the section is omitted in that case.
+    let mcpStatus: Record<string, import("./types.js").McpServerStatus> | null = null;
+    try {
+      mcpStatus = await this.sessionManager.getMcpStatus();
+    } catch {
+      // Server doesn't expose /mcp, or call failed — just skip the section.
+    }
+
     const statusText = formatStatus({
       session: sessionInfo,
       workspace: cwd,
@@ -1144,6 +1239,7 @@ export class WeChatOpencodeBridge {
       model: currentModel,
       reasoning: currentReasoning,
       contextUsage: contextUsage ? { used: contextUsage.totalTokens, size: contextUsage.contextSize } : null,
+      mcpStatus,
     });
 
     await this.sendReply(contextToken, statusText);

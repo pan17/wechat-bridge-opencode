@@ -18,7 +18,7 @@
 
 import { OpenCodeServerClient } from "./client.js";
 import { EventPipeline } from "./event-pipeline.js";
-import type { MessagePart, MediaContent, ContextUsage, SessionMode, ModelRef } from "../types.js";
+import type { MessagePart, MediaContent, ContextUsage, SessionMode, ModelRef, McpStatusMap } from "../types.js";
 import type {
   AccumulatedTurn,
   MessagePartDeltaEvent,
@@ -130,6 +130,10 @@ export class SessionManager {
   private availableModes: SessionMode[] = [];
   private availableModels: Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> = [];
 
+  // MCP status (TTL-cached for /status; invalidated by `force: true`, TTL
+  // expiry, or workspace switch — the `cwd` key makes the latter implicit).
+  private mcpStatusCache: { cwd: string; value: McpStatusMap; expiresAt: number } | null = null;
+
   // ─── Event-driven turn accumulation (Phase 1 MVP) ───
   private useEventStream: boolean;
   private eventPipeline: EventPipeline | null = null;
@@ -222,6 +226,13 @@ export class SessionManager {
     }
     this.cwd = cwd;
     this.onSessionReady?.(this.sessionId);
+    // The new workspace may define its own agents / providers in
+    // opencode.json; refresh so /agent list and /model list reflect them
+    // instead of whatever was cached from the previous cwd. createNewSession
+    // does the same — we just forgot to do it here, so the agent list
+    // appeared to be global-only after `/workspace switch`.
+    this.refreshAgents().catch(() => {});
+    this.refreshProviders().catch(() => {});
   }
 
   /**
@@ -240,6 +251,10 @@ export class SessionManager {
     this.onSessionReady?.(sessionId);
     // Sync agent/model from the session's last message
     await this.syncStateFromServer(sessionId);
+    // Same reasoning as switchWorkspace: the new session lives in a
+    // different workspace than the one whose agents/providers are cached.
+    this.refreshAgents().catch(() => {});
+    this.refreshProviders().catch(() => {});
   }
 
   /**
@@ -972,7 +987,11 @@ export class SessionManager {
   /** Fetch available agents from the server and cache them. */
   async refreshAgents(): Promise<void> {
     try {
-      const agents = await this.client.listAgents();
+      // Scope to the current workspace so custom agents defined in the
+      // project's opencode.json are included — without `directory` the
+      // server returns the global agent list only and workspace-only
+      // agents (which the agent itself can see) would be missing here.
+      const agents = await this.client.listAgents(this.cwd);
       // User-switchable agents are anything that is NOT mode: "subagent".
       // OpenCode has three modes: "primary" (Tab-switchable only), "subagent"
       // (invoked via @-mention or by other agents — never directly), and
@@ -1099,7 +1118,9 @@ export class SessionManager {
   /** Fetch providers and their models from the server, cache for listing. */
   async refreshProviders(): Promise<void> {
     try {
-      const providers = await this.client.listProviders();
+      // Scope to the current workspace so project-level provider config
+      // (e.g. custom endpoints in the workspace's opencode.json) is honored.
+      const providers = await this.client.listProviders(this.cwd);
       const models: Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> = [];
       for (const p of providers) {
         for (const m of p.models ?? []) {
@@ -1320,7 +1341,9 @@ export class SessionManager {
    */
   async getAvailableCommands(): Promise<Array<{ name: string; description: string }>> {
     try {
-      const cmds = await this.client.listCommands();
+      // Scope to the current workspace so project-defined slash commands
+      // (from .opencode/command/ in the workspace) are included.
+      const cmds = await this.client.listCommands(this.cwd);
       return cmds
         .filter((c) => c.name)
         .map((c) => ({ name: c.name, description: shortenCommandDescription(c.description) }));
@@ -1345,8 +1368,12 @@ export class SessionManager {
           return;
         }
       }
-      // No messages yet — fall back to server config defaults
-      const config = await this.client.getConfig();
+      // No messages yet — fall back to server config defaults. Scope to the
+      // current workspace so the workspace's `model:` override in
+      // opencode.json wins over the global default; without `directory` the
+      // server returns the global config and the user sees a model they
+      // didn't ask for in /status.
+      const config = await this.client.getConfig(this.cwd);
       if (config.model && !this.currentModelId) {
         this.currentModelId = config.model;
         const mod = this.availableModels.find((m) => m.modelId === this.currentModelId);
@@ -1417,5 +1444,33 @@ export class SessionManager {
     } catch {
       return null;
     }
+  }
+
+  // ─── MCP status (with short TTL cache) ───
+
+  /**
+   * Cached MCP server status for `/status`. Caches for 10s to avoid
+   * hammering the server when a user spams /status; the network call is
+   * cheap but the server may have to probe npx-downloaded MCPs on each
+   * request, which can be slow. Pass `force: true` to bypass the cache
+   * (e.g. right after a workspace switch where MCPs may reload).
+   *
+   * Cache is keyed by `this.cwd` so workspace switches naturally invalidate
+   * stale entries — no need for an explicit invalidation hook.
+   */
+  async getMcpStatus(opts: { force?: boolean } = {}): Promise<McpStatusMap> {
+    const TTL_MS = 10_000;
+    const now = Date.now();
+    if (
+      !opts.force &&
+      this.mcpStatusCache &&
+      this.mcpStatusCache.cwd === this.cwd &&
+      this.mcpStatusCache.expiresAt > now
+    ) {
+      return this.mcpStatusCache.value;
+    }
+    const value = await this.client.getMcpStatus(this.cwd);
+    this.mcpStatusCache = { cwd: this.cwd, value, expiresAt: now + TTL_MS };
+    return value;
   }
 }

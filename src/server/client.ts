@@ -5,7 +5,7 @@
  * See https://opencode.ai/docs/server/ for API reference.
  */
 
-import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef } from "../types.js";
+import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef, McpStatusMap } from "../types.js";
 
 export interface OpenCodeServerClientOpts {
   baseUrl: string;
@@ -42,11 +42,37 @@ export class OpenCodeServerClient {
 
   // ─── Config ───
 
-  async getConfig(): Promise<{ model?: string; agent?: string }> {
+  async getConfig(directory?: string): Promise<{ model?: string; agent?: string }> {
     try {
-      const res = await this.fetch("/config", { method: "GET" });
+      const res = await this.fetch(this.withDirectory("/config", directory), { method: "GET" });
       if (!res.ok) return {};
       return res.json() as Promise<{ model?: string }>;
+    } catch {
+      return {};
+    }
+  }
+
+  // ─── MCP ───
+
+  /**
+   * Fetch MCP server status from `GET /mcp`. Returns a name → status map
+   * (e.g. `{ github: { status: "connected" }, fetch: { status: "failed", error: "..." } }`),
+   * or an empty object if the server doesn't support the endpoint or the
+   * request fails.
+   *
+   * Pass `directory` to scope the response to a project — without it the
+   * server returns the global MCP config and workspace-level entries
+   * (from `opencode.json` at the project root) are missing.
+   *
+   * Used by /status to surface MCPs that haven't finished loading
+   * (especially npx-downloaded ones) so the user knows whether they're
+   * available to the agent.
+   */
+  async getMcpStatus(directory?: string): Promise<McpStatusMap> {
+    try {
+      const res = await this.fetch(this.withDirectory("/mcp", directory), { method: "GET" });
+      if (!res.ok) return {};
+      return res.json() as Promise<McpStatusMap>;
     } catch {
       return {};
     }
@@ -261,7 +287,7 @@ export class OpenCodeServerClient {
 
   // ─── Agents ───
 
-  async listAgents(): Promise<
+  async listAgents(directory?: string): Promise<
     Array<{
       id: string;
       name: string;
@@ -284,7 +310,7 @@ export class OpenCodeServerClient {
     }>
   > {
     try {
-      const res = await this.fetch("/agent", { method: "GET" });
+      const res = await this.fetch(this.withDirectory("/agent", directory), { method: "GET" });
       if (!res.ok) return [];
       const raw = await res.json() as Array<{
         id?: string;
@@ -320,9 +346,9 @@ export class OpenCodeServerClient {
    * List native OpenCode slash commands (e.g. /init, /undo, /share, /compact).
    * Each entry has a `name` (without the leading `/`) and a `description`.
    */
-  async listCommands(): Promise<Array<{ name: string; description?: string }>> {
+  async listCommands(directory?: string): Promise<Array<{ name: string; description?: string }>> {
     try {
-      const res = await this.fetch("/command", { method: "GET" });
+      const res = await this.fetch(this.withDirectory("/command", directory), { method: "GET" });
       if (!res.ok) return [];
       const body = await res.json() as Array<{ name: string; description?: string; source?: string; template?: string }>;
       return body.map((c) => ({ name: c.name, description: c.description }));
@@ -333,9 +359,9 @@ export class OpenCodeServerClient {
 
   // ─── Config / Providers ───
 
-  async listProviders(): Promise<Array<{ id: string; name: string; models?: Array<{ id: string; name: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> }>> {
+  async listProviders(directory?: string): Promise<Array<{ id: string; name: string; models?: Array<{ id: string; name: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> }>> {
     try {
-      const res = await this.fetch("/config/providers", { method: "GET" });
+      const res = await this.fetch(this.withDirectory("/config/providers", directory), { method: "GET" });
       if (!res.ok) return [];
       const body = await res.json() as {
         providers?: Array<{
@@ -372,6 +398,25 @@ export class OpenCodeServerClient {
   }
 
   // ─── Internal ───
+
+  /**
+   * Append `?directory=<path>` to a path when `directory` is set. The
+   * OpenCode server scopes many read endpoints (mcp, agent, config,
+   * command, providers) by this query parameter; without it the server
+   * returns the global config and the workspace-level entries (e.g. an
+   * `opencode.json` at the project root that defines MCPs or custom
+   * agents) are silently dropped — which is why the agent, which runs
+   * with a directory-scoped session, can see tools that `/agent list`
+   * and `/status` cannot.
+   *
+   * The path is `encodeURIComponent`'d so Windows backslashes, colons,
+   * and spaces survive transit.
+   */
+  private withDirectory(path: string, directory?: string): string {
+    if (!directory) return path;
+    const sep = path.includes("?") ? "&" : "?";
+    return `${path}${sep}directory=${encodeURIComponent(directory)}`;
+  }
 
   /**
    * Internal fetch wrapper.
