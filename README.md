@@ -68,7 +68,7 @@ wbo
 |------|------|
 | `/workspace list` | 列出所有工作区，按最近活跃度排序，带序号 |
 | `/workspace status` | 显示当前工作区 |
-| `/workspace switch <路径>` | 切换到指定目录 |
+| `/workspace switch <路径\|编号>` | 切换到指定目录（`/workspace list` 中的编号也可） |
 | `/workspace add <路径>` | 添加并切换到目录 |
 
 ### 会话（`/session` 或 `/s`）
@@ -110,7 +110,7 @@ wbo
 
 | 命令 | 说明 |
 |------|------|
-| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量。Agent/Model/Reasoning 从服务器获取，无历史消息时取配置默认值 |
+| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量，以及**当前工作区配置的 MCP servers 状态**（含失败原因）。Agent/Model/Reasoning/MCP 从当前工作区获取，无历史消息时取配置默认值 |
 
 ### 停止（`/stop`）
 

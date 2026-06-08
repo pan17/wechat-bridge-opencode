@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-08
+
+### Added
+- `/status` 新增 MCP 段：列出当前工作区配置的 MCP servers 状态（✅ connected / ❌ failed 带 error 详情 / 🔐 needs_auth / 🔐 needs_client_registration），失败和需认证的优先排序，方便排查 npx 下载失败的 MCP
+- `/workspace switch <n>` 支持 `/workspace list` 中的编号（之前只接受路径）
+- `/version` 显示 Bridge、OpenCode Server、npm 上最新版本；`/upgrade` 升级 OpenCode 并自动重启 server
+- `/help` 显示 OpenCode 原生 slash commands（来自 `/command` 端点）
+- `/s list` 隐藏 subsessions，只显示根 session 并内联显示 cwd
+- 推理级别（reasoning variant）端到端支持：显示、发送、切换时同步
+
+### Changed
+- **架构迁移**：从 ACP 子进程改为 OpenCode Server HTTP API（移除 `src/acp/`，新增 `src/server/` 和 `src/types/`、`src/types/events.ts`）。无 ACP 连接管理、无 subprocess 启停
+- `--server-url` 语义调整：现在表示连接外部 `opencode serve`，并跳过自动启动 sidecar（移除 `--no-server`）
+- `/restart` 现在真正重启 `opencode serve` 进程并恢复上一个 session（之前仅清空上下文）
+- `/help` 中 OpenCode 命令改用全角括号显示
+
+### Fixed
+- 启动时若保存的 `userState.cwd` 与本次启动 cwd 不一致，丢弃过期的 userState（避免 `/status` 显示旧路径但 agent 实际跑在新目录）
+- `/status` 和 `/agent list` 的读取调用（`/mcp`、`/agent`、`/config`、`/config/providers`、`/command`）现在传 `?directory=<cwd>`，确保返回工作区级配置而非全局。之前导致 `/status` 显示的 MCP/agent/model 与 agent 实际运行环境不一致
+- `/workspace switch` / `/session switch` 切换后立即刷新 agents 和 providers 缓存（`/session new` 一直会刷，切换路径之前漏了）
+- `syncStateFromServer` 里的 `getConfig()` 也按当前工作区限定（之前 fallback 用全局默认 model，覆盖了工作区的 `model:` 配置）
+- `/session switch <n>` 现在沿用最近一次 `/session list` 的 cwd filter，确保 list 中看到的编号 = switch 中输入的编号（之前 list 用过滤列表、switch 用全集，导致切到错的 session）
+- MCP 状态缓存按 cwd 做 key，工作区切换自动失效
+
 ## [0.3.10] - 2026-06-05
 
 ### Fixed

@@ -68,7 +68,7 @@ First run will:
 |---------|-------------|
 | `/workspace list` | List all workspaces sorted by recent activity, numbered |
 | `/workspace status` | Show current workspace |
-| `/workspace switch <path>` | Switch to directory by path |
+| `/workspace switch <path\|n>` | Switch to directory by path (or by index from `/workspace list`) |
 | `/workspace add <path>` | Add and switch to directory |
 
 ### Session (`/session` or `/s`)
@@ -110,7 +110,7 @@ First run will:
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage. Agent/model/reasoning fetched from server; defaults from config when no history |
+| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, and **MCP servers configured in the current workspace** (with failure reasons). Agent/model/reasoning/MCP fetched from the current workspace; defaults from config when no history |
 
 ### Stop (`/stop`)
 
