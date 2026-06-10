@@ -139,8 +139,24 @@ export class SessionManager {
   private eventPipeline: EventPipeline | null = null;
   /** Currently-accumulating assistant turn. Null when no turn is active. */
   private currentTurn: AccumulatedTurn | null = null;
-  /** Messages queued while a turn is busy with background tasks. */
-  private pendingAssistant: QueueItem | null = null;
+  /**
+   * FIFO queue of contextTokens for prompts that have been sent via
+   * `prompt_async` but whose SSE echo hasn't been processed yet.
+   *
+   * When `handleMessageUpdated` sees a user-message echo with an ID
+   * different from the current turn's `userMessageId`, it shifts one
+   * entry off this queue and uses that contextToken to `beginTurn` for
+   * the existing user message on the server (NO re-send — the server
+   * already created the user message when it accepted the prompt).
+   *
+   * Why a FIFO queue (not a single slot): when the user sends multiple
+   * messages in quick succession, all of them are sent immediately and
+   * their echoes arrive in the same order. The first echo must use the
+   * contextToken of the first sent prompt, the second echo the second
+   * contextToken, etc. A single slot would lose this ordering and route
+   * replies to the wrong WeChat user.
+   */
+  private pendingEchoes: string[] = [];
   /** Set true when the server reports session.status=busy. */
   private isSessionBusy = false;
   /** Timer for the post-delta debounce before finalizing a turn. */
@@ -318,21 +334,42 @@ export class SessionManager {
       const item = this.queue.shift()!;
 
       if (this.useEventStream) {
+        // Send the prompt immediately — the server queues messages in
+        // order and the agent processes them sequentially, so holding
+        // the prompt on our side would only delay the user without any
+        // benefit. The previous design did hold it (in `pendingAssistant`)
+        // and then re-dispatched it from `finalizeTurn`, which caused
+        // duplicate `prompt_async` calls: the server already created
+        // the user message when it accepted the prompt, but the bridge
+        // would re-enqueue the same parts and POST again.
+        //
+        // Two prep steps before the await:
+        //   - If a turn is active: remember the contextToken in
+        //     `pendingEchoes` so the echo (which will arrive shortly)
+        //     can `beginTurn` for the existing user message on the
+        //     server — using the right contextToken for the WeChat
+        //     reply, and crucially WITHOUT re-sending.
+        //   - If no turn is active: `beginTurn` NOW, so the echo is
+        //     captured as the current turn's `userMessageId` instead
+        //     of triggering the implicit-turn fallback in
+        //     `ensureTurnForEvent`.
+        if (this.currentTurn) {
+          this.pendingEchoes.push(item.contextToken);
+          this.log(`Turn busy; sent prompt for contextToken=${item.contextToken.slice(0, 8)}…`);
+        } else {
+          this.beginTurn(item);
+        }
         try {
           await this.sendPromptAsync(item);
-          // The reply will arrive via the event pipeline. continue to next item.
-          // If a previous turn is still active, the new item is held in
-          // `pendingAssistant` and dispatched when the prior turn finalizes.
-          if (this.currentTurn) {
-            this.pendingAssistant = item;
-            this.log(`Turn busy; queued prompt for contextToken=${item.contextToken.slice(0, 8)}…`);
-            return;
-          }
-          // start the turn tracking
-          this.beginTurn(item);
-          return;
         } catch (err) {
-          // prompt_async may be unsupported on some server versions — fall back to sync
+          // The HTTP call failed. Roll back the bookkeeping we just
+          // did — no echo will come for this prompt. Falling back to
+          // the synchronous send path next: that path doesn't use
+          // `pendingEchoes` or `currentTurn` for delivery, so we can
+          // leave the (now-stale) turn in place; it'll be replaced the
+          // next time we successfully send.
+          const top = this.pendingEchoes[this.pendingEchoes.length - 1];
+          if (top === item.contextToken) this.pendingEchoes.pop();
           this.log(`sendMessageAsync failed (${String(err)}), falling back to synchronous sendMessage`);
           await this.sendPromptSync(item);
           continue;
@@ -689,27 +726,57 @@ export class SessionManager {
       // messageID) are dropped inside maybeSendTextPart.
       this.flushPendingTextParts(turn);
     } else if (info.role === "user") {
-      // Critical: a `message.updated role=user` event is the SERVER's echo
-      // of the user message that triggered this turn (delivered via SSE
-      // after `prompt_async` returns). It can also be RE-DELIVERED if the
-      // SSE stream reconnects and replays history with Last-Event-ID. We
-      // must NOT treat it as a new user message / interrupt.
+      // A `message.updated role=user` event is normally the SERVER's
+      // echo of a user message that was just created by our
+      // `prompt_async` call (delivered via SSE after the HTTP request
+      // returned). It can also be re-delivered if the SSE stream
+      // reconnects and replays history with Last-Event-ID.
       //
-      // Strategy:
-      //   - First user message echo after beginTurn: capture its ID as
-      //     `turn.userMessageId`.
-      //   - Subsequent echoes with the same ID: ignore.
-      //   - A user message with a DIFFERENT ID: this is a real new user
-      //     message sent while the previous turn was still running.
-      //     Interrupt the current turn.
+      // Three cases:
+      //   - `turn.userMessageId === null`: first echo for this turn
+      //     (initial capture, or the echo of a prompt we just sent and
+      //     `beginTurn`-ed for). Capture it.
+      //   - Same ID as the current turn's userMessageId: re-delivery
+      //     (SSE replay). Ignore.
+      //   - DIFFERENT ID: this is the echo of a SECOND prompt we sent
+      //     while the previous turn was still running. The server
+      //     already created that user message — we just need to start
+      //     tracking it. Shift the matching contextToken off
+      //     `pendingEchoes` (FIFO) so the new turn uses the right
+      //     WeChat context, and `beginTurn` WITHOUT re-sending.
       if (turn.userMessageId === null) {
         turn.userMessageId = info.id;
         this.log(`[event] captured trigger userMessageId=${info.id.slice(0, 8)}…`);
       } else if (turn.userMessageId === info.id) {
         this.log(`[event] ignored re-delivered user message ${info.id.slice(0, 8)}…`);
       } else {
-        this.log(`[turn] interrupted by new user message ${info.id.slice(0, 8)}… (was tracking ${turn.userMessageId.slice(0, 8)}…)`);
+        this.log(`[turn] new user message ${info.id.slice(0, 8)}… (was tracking ${turn.userMessageId.slice(0, 8)}…)`);
+        const pendingCtx = this.pendingEchoes.shift();
         this.finalizeTurn("interrupted");
+        if (pendingCtx !== undefined) {
+          // Our own echo of a prompt we already sent via `prompt_async`.
+          // The user message is already on the server — beginTurn wires
+          // the current turn up to it without re-sending. The FIFO
+          // queue ensures this contextToken matches the prompt that
+          // produced this echo (in send-order, which the server echoes
+          // back in the same order).
+          this.beginTurn({
+            parts: [],
+            contextToken: pendingCtx,
+            hint: undefined,
+          });
+          if (this.currentTurn) {
+            this.currentTurn.userMessageId = info.id;
+          }
+        } else {
+          // `pendingEchoes` is empty: this is an unexpected user-message
+          // event we can't account for (e.g. an echo from a prompt sent
+          // before the current bridge instance, or a server-side quirk).
+          // Don't finalize-replace — just log and let the bridge keep
+          // the freshly-finalized state. The next WeChat message from
+          // the user will start a new turn normally.
+          this.log(`[turn] no pending echo for new user message; turn finalized without replacement`);
+        }
       }
     }
   }
@@ -875,17 +942,11 @@ export class SessionManager {
 
     this.currentTurn = null;
 
-    // If a prompt was queued while the prior turn was busy, dispatch it now.
-    if (this.pendingAssistant) {
-      const pending = this.pendingAssistant;
-      this.pendingAssistant = null;
-      // Use a microtask to break the call stack
-      queueMicrotask(() => {
-        this.enqueue(pending.parts, pending.contextToken, pending.hint).catch((err) => {
-          this.log(`Failed to dispatch pending prompt: ${String(err)}`);
-        });
-      });
-    }
+    // Note: we no longer re-dispatch queued prompts from here. Prompts
+    // are now sent immediately in `processQueue` and the corresponding
+    // SSE echo handles turn transitions. Any in-flight `pendingEchoes`
+    // entries belong to user messages the server has already created;
+    // they don't need to be re-sent.
   }
 
   /**
@@ -935,17 +996,13 @@ export class SessionManager {
    * (e.g. a delta that arrives after the prior turn finalized, in response
    * to a background sub-agent completion).
    *
-   * Priority:
-   *   1. The contextToken of the most recently enqueued message
-   *      (`pendingAssistant`) — if the user sent a new message while the
-   *      prior turn was busy.
-   *   2. The most recent contextToken from any enqueue() call
-   *      (`lastEnqueuedContextToken`) — used when no new enqueue happened
-   *      and the agent is producing a follow-up response (sub-agent case).
-   *   3. Empty string — the reply will be skipped.
+   * With the new "send immediately" design, every enqueued prompt is sent
+   * right away in `processQueue` (no per-bridge hold), so the most recent
+   * `enqueue()` call is the right reference point for any implicit turn.
+   * If it's empty, the reply is skipped.
    */
   private currentContextToken(): string {
-    return this.pendingAssistant?.contextToken ?? this.lastEnqueuedContextToken ?? "";
+    return this.lastEnqueuedContextToken ?? "";
   }
 
   // ─── Cancel ───
@@ -961,7 +1018,11 @@ export class SessionManager {
     }
     // Clear queue
     this.queue = [];
-    this.pendingAssistant = null;
+    // Drop any in-flight echoes. Their user messages may still arrive
+    // on the SSE stream (the server has already created them) but the
+    // user is about to send something new — discarding the queue keeps
+    // those echoes from being mis-attributed to a later turn.
+    this.pendingEchoes = [];
     // Finalize any in-flight turn as interrupted
     if (this.currentTurn) {
       this.finalizeTurn("interrupted");
