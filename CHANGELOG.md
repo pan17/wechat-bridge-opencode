@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-06-10
+
+### Fixed
+- 用户在 Agent 处理中发送新微信消息时，同一 user message 被 `prompt_async` 重复发送多次（session 中出现 2-3 条重复消息，且 SSE 处理级联）。`processQueue` 改为立即发送并新增 `pendingEchoes` FIFO 队列记录 in-flight contextToken，SSE echo 到来时 shift 出来给新 turn 用，不再 re-enqueue
+
 ## [1.0.0] - 2026-06-08
 
 ### Added
