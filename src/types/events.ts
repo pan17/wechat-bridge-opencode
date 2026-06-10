@@ -189,6 +189,8 @@ export interface EventPipelineOpts {
   url: string;
   /** Directory header for per-directory filtering (optional). */
   directory?: string;
+  /** Additional headers for authenticated server deployments. */
+  headers?: Record<string, string>;
   log?: (msg: string) => void;
   /** Called for every parsed event. Must be non-throwing. */
   onEvent: (event: OpenCodeEvent) => void;

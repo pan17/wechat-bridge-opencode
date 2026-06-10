@@ -14,17 +14,30 @@ export interface OpenCodeServerClientOpts {
 
 export class OpenCodeServerClient {
   private baseUrl: string;
+  private authHeaders: Record<string, string> = {};
   private log: (msg: string) => void;
 
   constructor(opts: OpenCodeServerClientOpts) {
-    // Strip trailing slash
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    const parsed = new URL(opts.baseUrl);
+    if (parsed.username || parsed.password) {
+      const credentials = `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`;
+      this.authHeaders.Authorization = `Basic ${Buffer.from(credentials).toString("base64")}`;
+      parsed.username = "";
+      parsed.password = "";
+    }
+    // Strip trailing slash.
+    this.baseUrl = parsed.toString().replace(/\/+$/, "");
     this.log = opts.log ?? (() => {});
   }
 
   /** Base URL of the opencode server (used by the SSE event pipeline). */
   getBaseUrl(): string {
     return this.baseUrl;
+  }
+
+  /** Headers required to authenticate against the opencode server. */
+  getAuthHeaders(): Record<string, string> {
+    return { ...this.authHeaders };
   }
 
   // ─── Health ───
@@ -435,7 +448,10 @@ export class OpenCodeServerClient {
     this.log(`[server] ${init.method ?? "GET"} ${url}`);
 
     const { timeoutMs, ...rest } = init;
-    const finalInit: RequestInit = { ...rest };
+    const finalInit: RequestInit = {
+      ...rest,
+      headers: { ...this.authHeaders, ...(rest.headers ?? {}) },
+    };
     if (timeoutMs !== undefined && timeoutMs > 0) {
       finalInit.signal = AbortSignal.timeout(timeoutMs);
     }

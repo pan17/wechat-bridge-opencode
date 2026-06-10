@@ -469,6 +469,7 @@ export class SessionManager {
     this.eventPipeline = new EventPipeline({
       url,
       directory,
+      headers: this.client.getAuthHeaders(),
       log: this.log,
       onEvent: (event) => this.handleEvent(event),
       onStatusChange: (status) => {
