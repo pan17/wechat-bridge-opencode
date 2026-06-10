@@ -33,6 +33,7 @@ const CONNECT_TIMEOUT_MS = 15_000;
 export class EventPipeline {
   private url: string;
   private directory: string | undefined;
+  private extraHeaders: Record<string, string>;
   private log: (msg: string) => void;
   private onEvent: (event: OpenCodeEvent) => void;
   private onStatusChange?: (status: EventPipelineStatus) => void;
@@ -48,6 +49,7 @@ export class EventPipeline {
   constructor(opts: EventPipelineOpts) {
     this.url = opts.url;
     this.directory = opts.directory;
+    this.extraHeaders = opts.headers ?? {};
     this.log = opts.log ?? (() => {});
     this.onEvent = opts.onEvent;
     this.onStatusChange = opts.onStatusChange;
@@ -105,6 +107,7 @@ export class EventPipeline {
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
       "Cache-Control": "no-cache",
+      ...this.extraHeaders,
     };
     if (this.lastEventId) {
       headers["Last-Event-ID"] = this.lastEventId;
