@@ -476,10 +476,17 @@ export class SessionManager {
     if (this.eventPipeline) return;
     const url = `${this.client.getBaseUrl()}/global/event`;
     this.log(`[event] starting pipeline: ${url}`);
+    // Reuse the client's pre-computed `Authorization` header so the SSE
+    // stream authenticates identically to the JSON API. Without this, the
+    // pipeline's fetch() lives outside the client and would 401 against
+    // any server that requires auth (e.g. OpenCode desktop with
+    // OPENCODE_SERVER_PASSWORD set).
+    const authHeader = this.client.getAuthHeader();
     this.eventPipeline = new EventPipeline({
       url,
       directory,
       log: this.log,
+      authHeader,
       onEvent: (event) => this.handleEvent(event),
       onStatusChange: (status) => {
         this.log(`[event] pipeline status: ${status}`);

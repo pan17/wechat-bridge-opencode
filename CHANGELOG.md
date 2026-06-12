@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-06-12
+
+### Fixed
+- 外部 server 认证失效：SSE event pipeline 的 `/global/event` 长连接在 `event-pipeline.ts` 自己用裸 `fetch()`，绕过了 `OpenCodeServerClient.fetch()` 的 `Authorization` 头注入路径，导致 v1.1.0 在任何需要认证的 server（包括 OpenCode 桌面版）上持续 401 重连。EventPipeline 现在通过新加的 `getAuthHeader()` getter 复用 client 预计算的 `Authorization` 头
+
 ## [1.1.0] - 2026-06-12
 
 ### Added

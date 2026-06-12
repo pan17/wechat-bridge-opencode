@@ -33,6 +33,7 @@ const CONNECT_TIMEOUT_MS = 15_000;
 export class EventPipeline {
   private url: string;
   private directory: string | undefined;
+  private authHeader: string | null;
   private log: (msg: string) => void;
   private onEvent: (event: OpenCodeEvent) => void;
   private onStatusChange?: (status: EventPipelineStatus) => void;
@@ -48,6 +49,7 @@ export class EventPipeline {
   constructor(opts: EventPipelineOpts) {
     this.url = opts.url;
     this.directory = opts.directory;
+    this.authHeader = opts.authHeader ?? null;
     this.log = opts.log ?? (() => {});
     this.onEvent = opts.onEvent;
     this.onStatusChange = opts.onStatusChange;
@@ -111,6 +113,14 @@ export class EventPipeline {
     }
     if (this.directory) {
       headers["x-opencode-directory"] = this.directory;
+    }
+    // Inject server auth on the SSE stream. The pipeline's fetch() lives
+    // outside OpenCodeServerClient so it can't piggy-back on the client's
+    // auth-injection path — we accept a pre-built `Authorization` value
+    // at construction time. Logged as `[event-pipeline] GET <url>` (URL
+    // only) to keep secrets out of the log.
+    if (this.authHeader) {
+      headers["Authorization"] = this.authHeader;
     }
 
     try {

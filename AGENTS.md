@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-bridge-opencode` v1.1.0 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-bridge-opencode` v1.1.1 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -217,6 +217,8 @@ src/weixin/
   The AI agent this project bridges to. Source for OpenCode Server HTTP API.
 - **OpenCode Server Docs** — https://opencode.ai/docs/server/
   Official documentation for the OpenCode Server REST API and SSE event stream.
+- **OpenCode Server Docs (中文)** — https://opencode.ai/docs/zh-cn/server/
+  OpenCode Server REST API 与 SSE 事件流的中文文档。
 - **OpenCode SDK** — https://opencode.ai/docs/sdk/
   TypeScript SDK for interacting with OpenCode Server (`@opencode-ai/sdk`).
 - **OpenClaw Weixin** — https://github.com/Tencent/openclaw-weixin

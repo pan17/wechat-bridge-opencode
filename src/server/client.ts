@@ -65,6 +65,16 @@ export class OpenCodeServerClient {
     return this.baseUrl;
   }
 
+  /**
+   * Pre-computed `Authorization` header value, or null when unauthenticated.
+   * Exposed so the SSE event pipeline (which lives in a separate file and
+   * can't be funneled through `fetch()`) can inject the same header on its
+   * long-lived `/global/event` connection without re-deriving it.
+   */
+  getAuthHeader(): string | null {
+    return this.authHeader;
+  }
+
   // ─── Health ───
 
   async health(): Promise<{ ok: boolean; version?: string }> {

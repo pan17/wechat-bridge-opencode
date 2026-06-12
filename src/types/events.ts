@@ -194,6 +194,13 @@ export interface EventPipelineOpts {
   onEvent: (event: OpenCodeEvent) => void;
   onStatusChange?: (status: EventPipelineStatus) => void;
   onError?: (err: Error) => void;
+  /**
+   * Pre-computed `Authorization` header value (e.g. `Basic …` or `Bearer …`).
+   * Mirrors the value `OpenCodeServerClient` would inject on its requests,
+   * so the SSE stream and the JSON API stay authenticated consistently.
+   * `undefined`/empty sends no `Authorization` header.
+   */
+  authHeader?: string | null;
 }
 
 // ─── Turn Accumulator Types ───
