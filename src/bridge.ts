@@ -317,6 +317,14 @@ export class WeChatOpencodeBridge {
           this.setUserState(sessionId, this.userState.cwd);
         }
       },
+      // Forward server auth verbatim. The values are sensitive — neither
+      // the bridge nor the SessionManager logs them. The client only
+      // computes the final `Authorization` header value at construction.
+      auth: {
+        username: this.config.server.username,
+        password: this.config.server.password,
+        token: this.config.server.token,
+      },
     });
 
     // 4. Tool API server

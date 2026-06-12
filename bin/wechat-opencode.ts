@@ -33,14 +33,21 @@ Usage:
   wbo status                        Check daemon status
 
 Options:
-  --cwd <dir>         Working directory for agent (default: current dir)
-  --server-url <url>  Use external opencode serve at <url> (skip auto-start)
-  --login             Force re-login (new QR code)
-  --daemon            Run in background after login
-  --config <file>     Config file path (JSON)
-  --idle-timeout <m>  Session idle timeout in minutes (default: 1440)
-  -v, --verbose       Verbose logging
-  -h, --help          Show this help
+  --cwd <dir>             Working directory for agent (default: current dir)
+  --server-url <url>      Use external opencode serve at <url> (skip auto-start)
+  --server-username <u>   HTTP Basic auth username for the opencode server
+  --server-password <p>   HTTP Basic auth password for the opencode server
+  --server-token <t>      Bearer token for the opencode server (overrides Basic)
+  --login                 Force re-login (new QR code)
+  --daemon                Run in background after login
+  --config <file>         Config file path (JSON)
+  --idle-timeout <m>      Session idle timeout in minutes (default: 1440)
+  -v, --verbose           Verbose logging
+  -h, --help              Show this help
+
+Auth precedence: CLI flag > env (WECHAT_OPENCODE_SERVER_*) > config file.
+For Basic auth, --server-username and --server-password must be set together.
+Bearer token takes precedence over Basic auth when both are configured.
 `);
 }
 
@@ -48,6 +55,9 @@ function parseArgs(argv: string[]): {
   command?: string;
   cwd?: string;
   serverUrl?: string;
+  serverUsername?: string;
+  serverPassword?: string;
+  serverToken?: string;
   forceLogin: boolean;
   daemon: boolean;
   configFile?: string;
@@ -79,6 +89,15 @@ function parseArgs(argv: string[]): {
         break;
       case "--server-url":
         result.serverUrl = args[++i];
+        break;
+      case "--server-username":
+        result.serverUsername = args[++i];
+        break;
+      case "--server-password":
+        result.serverPassword = args[++i];
+        break;
+      case "--server-token":
+        result.serverToken = args[++i];
         break;
       case "--login":
         result.forceLogin = true;
@@ -371,13 +390,45 @@ async function main(): Promise<void> {
     Object.assign(config.storage, fileConfig.storage ?? {});
   }
 
-  // CLI overrides
+  // Env var layer (sits between config file and CLI).
+  // Lets users keep secrets out of shell history AND out of on-disk config
+  // files. The WECHAT_OPENCODE_SERVER_* namespace follows the same
+  // convention as the existing WECHAT_OPENCODE_DAEMON env var.
+  if (process.env.WECHAT_OPENCODE_SERVER_USERNAME !== undefined) {
+    config.server.username = process.env.WECHAT_OPENCODE_SERVER_USERNAME;
+  }
+  if (process.env.WECHAT_OPENCODE_SERVER_PASSWORD !== undefined) {
+    config.server.password = process.env.WECHAT_OPENCODE_SERVER_PASSWORD;
+  }
+  if (process.env.WECHAT_OPENCODE_SERVER_TOKEN !== undefined) {
+    config.server.token = process.env.WECHAT_OPENCODE_SERVER_TOKEN;
+  }
+
+  // CLI overrides (highest priority).
   if (args.cwd) config.agent.cwd = path.resolve(args.cwd);
   if (args.serverUrl) config.server.url = args.serverUrl;
+  if (args.serverUsername !== undefined) config.server.username = args.serverUsername;
+  if (args.serverPassword !== undefined) config.server.password = args.serverPassword;
+  if (args.serverToken !== undefined) config.server.token = args.serverToken;
   if (args.idleTimeout !== undefined) {
     config.session.idleTimeoutMs = args.idleTimeout * 60_000;
   }
   config.daemon.enabled = args.daemon;
+
+  // Validate auth configuration. Basic auth requires BOTH fields — a
+  // half-configured pair is almost certainly a mistake (typo, missing
+  // shell quoting, partial config file), and silently sending a Basic
+  // header with an empty username or password would be worse than a clear
+  // error.
+  const hasUser = !!config.server.username;
+  const hasPass = !!config.server.password;
+  if (hasUser !== hasPass) {
+    console.error(
+      "Error: --server-username and --server-password must be set together (Basic auth). " +
+        "If you only need an API key, use --server-token instead.",
+    );
+    process.exit(1);
+  }
 
   // Handle subcommands
   if (args.command === "stop") {

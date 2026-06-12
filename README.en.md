@@ -55,10 +55,30 @@ First run will:
 |------|-------------|
 | `--cwd <dir>` | Working directory |
 | `--server-url <url>` | Connect to external OpenCode Server; skip auto-start |
+| `--server-username <user>` | HTTP Basic username for the external server (pair with `--server-password`) |
+| `--server-password <pwd>` | HTTP Basic password for the external server |
+| `--server-token <token>` | Bearer token for the external server (overrides Basic auth) |
 | `--login` | Force re-login |
 | `--daemon` | Run in background |
 | `--config <file>` | JSON config file |
 | `--idle-timeout <min>` | Session idle timeout (default: 0 = unlimited) |
+
+**External server authentication**
+
+When `--server-url` points to an authenticated server, the bridge automatically injects an `Authorization` header. Two independent options are supported, with Bearer taking precedence:
+
+- **Basic auth**: pass `--server-username` and `--server-password` together. Common with reverse proxies (nginx/caddy) using built-in auth.
+- **Bearer token**: pass `--server-token <token>`. Common with API keys or custom auth middleware.
+
+To keep secrets out of shell history and on-disk config files, env vars are also supported (**precedence: CLI > env var > config file**):
+
+```bash
+export WECHAT_OPENCODE_SERVER_TOKEN=xxx
+export WECHAT_OPENCODE_SERVER_USERNAME=admin
+export WECHAT_OPENCODE_SERVER_PASSWORD=secret
+```
+
+> Basic auth requires BOTH `username` and `password` — supplying only one is a fatal startup error. When both Basic and Bearer are configured, the Bearer token wins. `password` and `token` are treated as secrets: never logged and never echoed back by `/status`.
 
 ## WeChat Commands
 

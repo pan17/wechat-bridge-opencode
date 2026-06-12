@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-12
+
+### Added
+- 外部 OpenCode Server 认证支持：通过 `--server-username` / `--server-password`（HTTP Basic）或 `--server-token`（Bearer）连接需要认证的 server。Bearer 优先于 Basic；Basic 要求 user/pass 同时设置否则启动报错。支持 `WECHAT_OPENCODE_SERVER_USERNAME` / `..._PASSWORD` / `..._TOKEN` 环境变量，优先级 CLI > env > 配置文件。适用于 OpenCode 桌面版 server（username=`opencode`，password=server token）
+
 ## [1.0.1] - 2026-06-10
 
 ### Fixed

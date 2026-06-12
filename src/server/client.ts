@@ -10,16 +10,54 @@ import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo
 export interface OpenCodeServerClientOpts {
   baseUrl: string;
   log?: (msg: string) => void;
+  /**
+   * Optional HTTP auth for the opencode server. Either Basic
+   * (`username` + `password`) or Bearer (`token`); when both are set the
+   * Bearer token wins. Sensitive values — never logged.
+   */
+  auth?: {
+    username?: string;
+    password?: string;
+    token?: string;
+  };
+}
+
+/**
+ * Compute the `Authorization` header value for the opencode server.
+ * Returns `null` when no credentials are configured.
+ *
+ * Precedence: Bearer token > Basic auth. Basic auth requires BOTH
+ * `username` and `password` — if only one is provided the server is
+ * treated as unauthenticated rather than sending a malformed header.
+ *
+ * The returned string is treated as a secret: it is captured in the
+ * client instance and never passed to the logger.
+ */
+function buildAuthHeader(
+  auth: { username?: string; password?: string; token?: string } | undefined,
+): string | null {
+  if (!auth) return null;
+  if (auth.token) return `Bearer ${auth.token}`;
+  if (auth.username && auth.password) {
+    // btoa() is globally available in Node 20+; we avoid Buffer here to
+    // keep the function pure (no Node imports in this module's top-level
+    // scope beyond what TypeScript needs).
+    return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
+  }
+  return null;
 }
 
 export class OpenCodeServerClient {
   private baseUrl: string;
   private log: (msg: string) => void;
+  /** Pre-computed `Authorization` header value, or null when unauthenticated. */
+  private authHeader: string | null;
 
   constructor(opts: OpenCodeServerClientOpts) {
     // Strip trailing slash
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.log = opts.log ?? (() => {});
+    this.authHeader = buildAuthHeader(opts.auth);
   }
 
   /** Base URL of the opencode server (used by the SSE event pipeline). */
@@ -426,6 +464,11 @@ export class OpenCodeServerClient {
    *   - By default NO timeout is applied. sendMessage() and the SSE event
    *     pipeline need unbounded time; short probes (health/list) should pass
    *     an explicit `timeoutMs`.
+   *
+   * Auth: when an `Authorization` header was pre-computed from constructor
+   * options, it is injected on every request. Caller-supplied `headers`
+   * win, so a per-request override (e.g. for a different auth scheme) is
+   * possible — the client default is the floor, not the ceiling.
    */
   private async fetch(
     path: string,
@@ -438,6 +481,15 @@ export class OpenCodeServerClient {
     const finalInit: RequestInit = { ...rest };
     if (timeoutMs !== undefined && timeoutMs > 0) {
       finalInit.signal = AbortSignal.timeout(timeoutMs);
+    }
+    if (this.authHeader) {
+      const existing = (finalInit.headers ?? {}) as Record<string, string>;
+      // Caller-provided Authorization always wins over the client's default.
+      if (!existing["Authorization"] && !existing["authorization"]) {
+        finalInit.headers = { ...existing, Authorization: this.authHeader };
+      } else {
+        finalInit.headers = existing;
+      }
     }
 
     return fetch(url, finalInit);

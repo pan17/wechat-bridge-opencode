@@ -55,10 +55,30 @@ wbo
 |------|------|
 | `--cwd <目录>` | 工作目录 |
 | `--server-url <url>` | 连接外部 OpenCode Server，跳过自动启动 |
+| `--server-username <user>` | 外部 Server 的 HTTP Basic 用户名（与 `--server-password` 配合） |
+| `--server-password <pwd>` | 外部 Server 的 HTTP Basic 密码 |
+| `--server-token <token>` | 外部 Server 的 Bearer Token（优先级高于 Basic） |
 | `--login` | 强制重新登录 |
 | `--daemon` | 后台运行 |
 | `--config <文件>` | JSON 配置文件 |
 | `--idle-timeout <分钟>` | 会话空闲超时（默认 0 = 无限） |
+
+**外部 Server 认证**
+
+当 `--server-url` 指向需要认证的 server 时，bridge 会自动注入 `Authorization` 头。支持两种方式（独立配置，Bearer 优先）：
+
+- **Basic 认证**：`--server-username` + `--server-password` 同时使用，常见于 nginx/caddy 反向代理内置认证
+- **Bearer Token**：`--server-token <token>`，常见于 API key / 自定义认证中间件
+
+为避免敏感信息落入 shell history 或 JSON 配置文件，也可通过环境变量设置（**优先级：CLI > 环境变量 > 配置文件**）：
+
+```bash
+export WECHAT_OPENCODE_SERVER_TOKEN=xxx
+export WECHAT_OPENCODE_SERVER_USERNAME=admin
+export WECHAT_OPENCODE_SERVER_PASSWORD=secret
+```
+
+> Basic 认证要求用户名和密码**同时**配置；只设一个会启动失败并报错。Bearer Token 与 Basic 同时配置时，Token 生效。`password` / `token` 视为敏感字段，永远不会写入日志或 `/status` 命令的输出。
 
 ## 微信命令
 

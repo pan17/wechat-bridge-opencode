@@ -37,6 +37,20 @@ export interface ServerConfig {
   /** Command to spawn opencode serve as a sidecar (empty = external). */
   command?: string;
   args?: string[];
+  /**
+   * HTTP Basic auth credentials for the opencode server. Both must be set
+   * to take effect; if only one is provided, the server is treated as
+   * unauthenticated. Typically used when the server sits behind a reverse
+   * proxy (nginx/caddy/traefik) with built-in auth.
+   */
+  username?: string;
+  password?: string;
+  /**
+   * Bearer token for the opencode server. Sent as `Authorization: Bearer <token>`.
+   * Takes precedence over `username`/`password` when both are set.
+   * Typically used for API tokens or custom auth middleware.
+   */
+  token?: string;
 }
 
 export interface WeChatOpencodeConfig {

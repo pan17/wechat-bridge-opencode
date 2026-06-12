@@ -84,6 +84,15 @@ export interface SessionManagerOpts {
    * will fall back to the legacy synchronous `sendMessage` flow. Default: true.
    */
   useEventStream?: boolean;
+  /**
+   * Optional HTTP auth for the opencode server. Forwarded verbatim to the
+   * underlying client. Sensitive values — never logged here.
+   */
+  auth?: {
+    username?: string;
+    password?: string;
+    token?: string;
+  };
 }
 
 interface QueueItem {
@@ -177,6 +186,7 @@ export class SessionManager {
     this.client = new OpenCodeServerClient({
       baseUrl: opts.serverUrl,
       log: opts.log,
+      auth: opts.auth,
     });
     this.cwd = opts.cwd;
     this.log = opts.log;
