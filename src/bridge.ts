@@ -27,7 +27,8 @@ import {
   parseModelCommand,
   parseReasoningCommand,
   parseStatusCommand,
-  parseThinkingCommand,
+  parseThoughtDisplayCommand,
+  parseToolDisplayCommand,
   parseStopCommand,
   parseRestartCommand,
   parseVersionCommand,
@@ -193,6 +194,8 @@ interface UserState {
   userId: string;
   sessionId: string;
   cwd: string;
+  showThoughts?: boolean;
+  showTools?: boolean;
 }
 
 export class WeChatOpencodeBridge {
@@ -327,6 +330,16 @@ export class WeChatOpencodeBridge {
       },
     });
 
+    // Restore persisted display flags (only if defined to avoid clobbering
+    // server-side defaults). setShowFlags is partial-update safe: passing
+    // `undefined` for a field leaves it untouched.
+    if (this.userState && (this.userState.showThoughts !== undefined || this.userState.showTools !== undefined)) {
+      this.sessionManager.setShowFlags({
+        showThoughts: this.userState.showThoughts,
+        showTools: this.userState.showTools,
+      });
+    }
+
     // 4. Tool API server
     this.startToolApiServer();
 
@@ -369,16 +382,33 @@ export class WeChatOpencodeBridge {
       const stateFile = path.join(this.config.storage.dir, ".wechat-bridge-state.json");
       const raw = fs.readFileSync(stateFile, "utf-8");
       const state = JSON.parse(raw) as
-        | { sessionId?: string; cwd: string }
-        | { users?: Array<{ userId: string; sessionId?: string; cwd: string }> };
+        | {
+            sessionId?: string;
+            cwd: string;
+            showThoughts?: boolean;
+            showTools?: boolean;
+          }
+        | {
+            users?: Array<{ userId: string; sessionId?: string; cwd: string }>;
+            showThoughts?: boolean;
+            showTools?: boolean;
+          };
       if ("users" in state && state.users && state.users.length > 0) {
         const u = state.users[0];
-        this.userState = { userId: u.userId ?? "", sessionId: u.sessionId ?? "", cwd: u.cwd };
+        this.userState = {
+          userId: u.userId ?? "",
+          sessionId: u.sessionId ?? "",
+          cwd: u.cwd,
+          showThoughts: state.showThoughts,
+          showTools: state.showTools,
+        };
       } else if ("sessionId" in state || "cwd" in state) {
         this.userState = {
           userId: "",
           sessionId: (state as { sessionId?: string }).sessionId ?? "",
           cwd: (state as { cwd: string }).cwd,
+          showThoughts: state.showThoughts,
+          showTools: state.showTools,
         };
       }
     } catch {
@@ -390,23 +420,19 @@ export class WeChatOpencodeBridge {
     if (!this.userState) return;
     try {
       const stateFile = path.join(this.config.storage.dir, ".wechat-bridge-state.json");
-      fs.writeFileSync(
-        stateFile,
-        JSON.stringify(
+      const payload: Record<string, unknown> = {
+        users: [
           {
-            users: [
-              {
-                userId: this.userState.userId,
-                sessionId: this.userState.sessionId,
-                cwd: this.userState.cwd,
-              },
-            ],
-            updatedAt: new Date().toISOString(),
+            userId: this.userState.userId,
+            sessionId: this.userState.sessionId,
+            cwd: this.userState.cwd,
           },
-          null,
-          2,
-        ),
-      );
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      if (this.userState.showThoughts !== undefined) payload.showThoughts = this.userState.showThoughts;
+      if (this.userState.showTools !== undefined) payload.showTools = this.userState.showTools;
+      fs.writeFileSync(stateFile, JSON.stringify(payload, null, 2));
     } catch {
       // Best effort
     }
@@ -414,7 +440,12 @@ export class WeChatOpencodeBridge {
 
   private setUserState(sessionId: string, cwd: string): void {
     const userId = this.userState?.userId ?? "";
-    this.userState = { userId, sessionId, cwd };
+    // Preserve display flags (`showThoughts` / `showTools`) across workspace
+    // and session switches — without this spread, /workspace switch or
+    // /session switch would silently reset the user's display settings.
+    this.userState = this.userState
+      ? { ...this.userState, sessionId, cwd }
+      : { userId, sessionId, cwd };
     this.saveUserState();
   }
 
@@ -642,10 +673,18 @@ export class WeChatOpencodeBridge {
         return;
       }
 
-      const thCmd = parseThinkingCommand(textContent);
-      if (thCmd) {
-        this.handleThinkingCommand(contextToken, thCmd).catch((err) => {
-          this.log(`Thinking command error: ${String(err)}`);
+      const tdCmd = parseThoughtDisplayCommand(textContent);
+      if (tdCmd) {
+        this.handleThoughtDisplayCommand(contextToken, tdCmd).catch((err) => {
+          this.log(`Thought-display command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const tldCmd = parseToolDisplayCommand(textContent);
+      if (tldCmd) {
+        this.handleToolDisplayCommand(contextToken, tldCmd).catch((err) => {
+          this.log(`Tool-display command error: ${String(err)}`);
         });
         return;
       }
@@ -1253,32 +1292,75 @@ export class WeChatOpencodeBridge {
     await this.sendReply(contextToken, statusText);
   }
 
-  // ─── Thinking command (/thinking) ───
+  // ─── Thought display command (/thought-display) ───
 
-  private async handleThinkingCommand(
+  private async handleThoughtDisplayCommand(
     contextToken: string,
-    cmd: ReturnType<typeof parseThinkingCommand>,
+    cmd: ReturnType<typeof parseThoughtDisplayCommand>,
   ): Promise<void> {
     if (!this.sessionManager) return;
 
     switch (cmd!.kind) {
       case "status": {
         const flags = this.sessionManager.getShowFlags();
-        const thoughtStatus = flags.showThoughts ? "✅ On" : "❌ Off";
-        const toolStatus = flags.showTools ? "✅ On" : "❌ Off";
-        await this.sendReply(contextToken, `🧠 Thinking & Tools:\n  💭 Thinking: ${thoughtStatus}\n  🔧 Tools: ${toolStatus}`);
+        await this.sendReply(
+          contextToken,
+          flags.showThoughts ? "🧠 Thought display: ✅ On" : "🧠 Thought display: ❌ Off",
+        );
         break;
       }
 
       case "on": {
-        this.sessionManager.setShowFlags({ showThoughts: true, showTools: true });
-        await this.sendReply(contextToken, "✅ Thinking & tool display on");
+        // Only mutate showThoughts; pass undefined for showTools so it isn't clobbered.
+        this.sessionManager.setShowFlags({ showThoughts: true, showTools: undefined });
+        if (this.userState) this.userState.showThoughts = true;
+        this.saveUserState();
+        await this.sendReply(contextToken, "✅ Thought display on");
         break;
       }
 
       case "off": {
-        this.sessionManager.setShowFlags({ showThoughts: false, showTools: false });
-        await this.sendReply(contextToken, "❌ Thinking & tool display off");
+        this.sessionManager.setShowFlags({ showThoughts: false, showTools: undefined });
+        if (this.userState) this.userState.showThoughts = false;
+        this.saveUserState();
+        await this.sendReply(contextToken, "❌ Thought display off");
+        break;
+      }
+    }
+  }
+
+  // ─── Tool display command (/tool-display) ───
+
+  private async handleToolDisplayCommand(
+    contextToken: string,
+    cmd: ReturnType<typeof parseToolDisplayCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    switch (cmd!.kind) {
+      case "status": {
+        const flags = this.sessionManager.getShowFlags();
+        await this.sendReply(
+          contextToken,
+          flags.showTools ? "🔧 Tool display: ✅ On" : "🔧 Tool display: ❌ Off",
+        );
+        break;
+      }
+
+      case "on": {
+        // Only mutate showTools; pass undefined for showThoughts so it isn't clobbered.
+        this.sessionManager.setShowFlags({ showThoughts: undefined, showTools: true });
+        if (this.userState) this.userState.showTools = true;
+        this.saveUserState();
+        await this.sendReply(contextToken, "✅ Tool display on");
+        break;
+      }
+
+      case "off": {
+        this.sessionManager.setShowFlags({ showThoughts: undefined, showTools: false });
+        if (this.userState) this.userState.showTools = false;
+        this.saveUserState();
+        await this.sendReply(contextToken, "❌ Tool display off");
         break;
       }
     }
@@ -1552,8 +1634,10 @@ export class WeChatOpencodeBridge {
     const cmdName = match[1].toLowerCase();
     const bridgeCommands = [
       "workspace", "ws", "session", "s", "agent", "a", "model",
-      "reasoning", "help", "h", "?", "status", "thinking", "stop",
-      "restart", "next", "version", "upgrade",
+      "reasoning", "help", "h", "?", "status",
+      "thought-display",
+      "tool-display",
+      "stop", "restart", "next", "version", "upgrade",
     ];
     if (bridgeCommands.includes(cmdName)) return null;
 

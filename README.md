@@ -139,13 +139,25 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 | `/stop` | 停止正在运行的 Agent |
 | `/restart` | 新会话（清除上下文） |
 
-### 思考（`/thought`）
+### 思考显示（`/thought-display`）
 
 | 命令 | 说明 |
 |------|------|
-| `/thought on` | 开启思考与工具显示 |
-| `/thought off` | 关闭思考与工具显示 |
-| `/thought status` | 查看当前显示设置 |
+| `/thought-display on` | 在微信中以单行 `🧠 Thought · {摘要} · {duration}` 显示模型推理（仅摘要，不含正文） |
+| `/thought-display off` | 隐藏推理内容（仅记录到 bridge 日志） |
+| `/thought-display status` | 查看当前思考显示状态 |
+
+设置独立且跨重启持久化(~/.wechat-bridge-opencode/.wechat-bridge-state.json)
+
+### 工具显示（`/tool-display`）
+
+| 命令 | 说明 |
+|------|------|
+| `/tool-display on` | 在每轮结束时显示工具摘要（emoji + 工具名 + opencode 生成的标题；如 `✅ webfetch https://httpbin.org/get`、`✅ bash exit 0`） |
+| `/tool-display off` | 隐藏工具摘要 |
+| `/tool-display status` | 查看当前工具显示状态 |
+
+设置独立且跨重启持久化(~/.wechat-bridge-opencode/.wechat-bridge-state.json)
 
 ### 系统（`/version`、`/upgrade`）
 

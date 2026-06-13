@@ -188,12 +188,23 @@ src/weixin/
 | `/stop` | Cancel the running agent |
 | `/restart` | New session (clear context) |
 
-### Thinking (/thought)
+### Thought Display (/thought-display)
 | Command | Description |
 |---------|-------------|
-| `/thought on` | Enable thinking & tool display |
-| `/thought off` | Disable thinking & tool display |
-| `/thought status` | Show current thinking & tool display settings |
+| `/thought-display on` | Show model reasoning in WeChat as a single `🧠 Thought · {summary} · {duration}` line per reasoning block (no body — only the summary) |
+| `/thought-display off` | Hide reasoning from WeChat (only logged to bridge log) |
+| `/thought-display status` | Show current thought display state |
+
+Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
+
+### Tool Display (/tool-display)
+| Command | Description |
+|---------|-------------|
+| `/tool-display on` | Show tool summary at end of turn (emoji + tool name + opencode-generated title; e.g. `✅ webfetch https://httpbin.org/get`, `✅ bash exit 0`) |
+| `/tool-display off` | Hide tool summary |
+| `/tool-display status` | Show current tool display state |
+
+Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
 
 ### System
 | Command | Description |
@@ -210,16 +221,3 @@ src/weixin/
 | Command | Description |
 |---------|-------------|
 | `/help` | Show all available commands |
-
-## References
-
-- **OpenCode** — https://github.com/anomalyco/opencode
-  The AI agent this project bridges to. Source for OpenCode Server HTTP API.
-- **OpenCode Server Docs** — https://opencode.ai/docs/server/
-  Official documentation for the OpenCode Server REST API and SSE event stream.
-- **OpenCode Server Docs (中文)** — https://opencode.ai/docs/zh-cn/server/
-  OpenCode Server REST API 与 SSE 事件流的中文文档。
-- **OpenCode SDK** — https://opencode.ai/docs/sdk/
-  TypeScript SDK for interacting with OpenCode Server (`@opencode-ai/sdk`).
-- **OpenClaw Weixin** — https://github.com/Tencent/openclaw-weixin
-  Official WeChat iLink API reference implementation. Authoritative source for image/file/video sending patterns, CDN upload flows, and AES-ECB encryption details.

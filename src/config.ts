@@ -71,7 +71,9 @@ export interface WeChatOpencodeConfig {
     cwd: string;
     /** @deprecated */
     env?: Record<string, string>;
+    /** @deprecated Use /thought-display instead (persisted in UserState). */
     showThoughts: boolean;
+    /** @deprecated Use /tool-display instead (persisted in UserState). */
     showTools: boolean;
   };
   /** @deprecated Agent presets are no longer used. */

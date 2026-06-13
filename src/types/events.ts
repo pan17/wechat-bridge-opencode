@@ -212,6 +212,15 @@ export interface TrackedTool {
   toolName: string;
   status: "pending" | "running" | "completed" | "error";
   title?: string;
+  /**
+   * Tool input from the LLM SDK (part.state.input). Captured so the
+   * WeChat tool summary can derive a human-readable fallback title
+   * (for example glob with a TypeScript glob pattern) when the LLM
+   * does not populate state.title. Not all model/tool combinations
+   * set the title field on every tool part, so we keep the raw input
+   * as a safety net.
+   */
+  input?: unknown;
   output?: string;
   /** True if this is a sub-agent dispatch (task tool). */
   isSubAgent: boolean;
@@ -252,4 +261,112 @@ export interface AccumulatedTurn {
    * flushed to WeChat; user-input parts (different messageID) are dropped.
    */
   pendingTextParts: Part[];
+  /**
+   * Reasoning parts that arrived BEFORE `assistantMessageId` was known.
+   * Mirrors the text-part buffer: a reasoning part whose `messageID` we
+   * can't yet verify against the assistant's ID gets buffered here, and
+   * is flushed in `flushPendingReasoningParts` once the ID is known. This
+   * prevents the FIRST reasoning part of a turn from being silently dropped
+   * when the OpenCode server streams `message.part.updated` for reasoning
+   * before emitting `message.updated` for the assistant message itself.
+   * Parts whose `messageID` doesn't match the assistant's are dropped at
+   * flush time, just like text parts.
+   */
+  pendingReasoningParts: Part[];
+  /**
+   * Display flag snapshot — captured at `beginTurn` from the SessionManager's
+   * current `showThoughts` / `showTools`. Mid-turn toggles via `setShowFlags`
+   * do NOT update this snapshot; the in-flight turn keeps whatever flags
+   * were active when it started. Task 6 reads these via `getShowFlagsForTurn`
+   * to decide whether to send reasoning/tool summaries to WeChat.
+   */
+  showThoughtsSnapshot: boolean;
+  showToolsSnapshot: boolean;
+  /**
+   * Total characters of reasoning text accumulated across all reasoning
+   * parts in this turn. Used for the "off-mode" log line emitted by
+   * `finalizeTurn` when `showThoughtsSnapshot` is false but reasoning was
+   * still produced (so the user can see how much thinking happened).
+   * Each `handleReasoningPart` invocation adds the new part's text length
+   * to `reasoningCharCount` (after the dedup check via `sentReasoningPartIds`).
+   */
+  reasoningCharCount: number;
+  /**
+   * Epoch-ms timestamp of the FIRST reasoning part observed in this turn.
+   * `null` if no reasoning part has been seen yet. Used together with
+   * `reasoningEndMs` to compute the reasoning duration for the off-mode
+   * log line and (when reasoning is shown) the `formatThoughtHeader` call.
+   * Set by `handleReasoningPart` once, on the first reasoning part that
+   * survives the `sentReasoningPartIds` dedup check.
+   */
+  reasoningStartMs: number | null;
+  /**
+   * Epoch-ms timestamp of the LAST reasoning part observed in this turn.
+   * `null` if no reasoning part has been seen yet. Updated on each new
+   * reasoning part so the duration reflects the full reasoning span.
+   * Together with `reasoningStartMs` it yields the reasoning duration for
+   * the off-mode log line and (when reasoning is shown) for the header.
+   */
+  reasoningEndMs: number | null;
+  /**
+   * Reasoning partIDs that have already been forwarded to WeChat
+   * during this turn. SSE event replay can re-deliver the same
+   * reasoning part (e.g. on reconnect or duplicate delivery); this
+   * set prevents the same reasoning from being sent twice within a
+   * single turn. Also gates `reasoningCharCount` and
+   * `reasoningStartMs`/`reasoningEndMs` updates: only first-seen
+   * reasoning parts contribute to those metrics.
+   */
+  sentReasoningPartIds: Set<string>;
+  /**
+   * Per-reasoning-part streaming timestamps. Keyed by `part.id`.
+   *
+   * - `startMs` is the wall-clock time when the FIRST `message.part.delta`
+   *   for that reasoning part arrived (set by
+   *   `accumulateReasoningDelta`).
+   * - `endMs` is updated to every subsequent delta's timestamp, so
+   *   it reflects the time the LAST delta for that part arrived
+   *   (i.e. just before `message.part.updated` with the full text).
+   *
+   * Used by `handleReasoningPart` to compute the per-part duration
+   * for the WeChat `🧠 Thought · {summary} · {duration}` line. The
+   * per-part span is what the user expects — the previous
+   * implementation used `turn.reasoningEndMs - reasoningStartMs`
+   * which is the CUMULATIVE time across all reasoning parts in the
+   * turn (including the tool calls interleaved between them), and
+   * was reported as a bug: a second reasoning that actually took
+   * 1.2s showed as 21.6s because that's the wall-clock from the
+   * first reasoning start to the second reasoning end (which
+   * includes the 20s bash call in between).
+   *
+   * The turn-level cumulative metrics (`reasoningStartMs` /
+   * `reasoningEndMs`) are still maintained for the off-mode log
+   * line in `finalizeTurn`, which reports the total thinking time
+   * for the operator.
+   */
+  reasoningPartTimestamps: Map<string, { startMs: number; endMs: number }>;
+  /**
+   * Set of tool `callID`s that have already been included in a
+   * `🔧 Tools: …` summary emitted to WeChat during this turn.
+   *
+   * Used to support the "consecutive tools get combined, separate
+   * tools get individual summaries" rule (user-stated): when
+   * `maybeFlushToolSummary` runs, it emits a summary line containing
+   * ONLY the tools whose `callID` is NOT in this set. The set is
+   * updated to include those `callID`s after the summary is sent.
+   *
+   * Trace for `R, T1, Text, R, T2, Text`:
+   *   - T1 tracked (set empty)
+   *   - Text1 → flush: new tools = {T1}, summary = "T1", set += {T1}
+   *   - T2 tracked (set = {T1})
+   *   - Text2 → flush: new tools = {T2}, summary = "T2", set += {T1,T2}
+   *   - Output: R1, "🔧 Tools: T1", Text1, R2, "🔧 Tools: T2", Text2
+   *
+   * Trace for `R, T1, T2, T3, R, Text` (consecutive):
+   *   - T1, T2, T3 tracked (set empty)
+   *   - R → flush: new tools = {T1,T2,T3}, summary combined, set += all
+   *   - Text → flush: new tools = {} (all in set), no-op
+   *   - Output: R1, "🔧 Tools: T1,T2,T3", R2, Text
+   */
+  toolCallIdsInLastSummary: Set<string>;
 }

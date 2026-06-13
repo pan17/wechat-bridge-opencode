@@ -18,6 +18,19 @@
 
 import { OpenCodeServerClient } from "./client.js";
 import { EventPipeline } from "./event-pipeline.js";
+import {
+  formatDuration,
+  formatThoughtHeader,
+  reasoningSummary,
+} from "../adapter/thinking-format.js";
+
+/**
+ * Hard cap on the full `🔧 Tools:` summary sent to WeChat. Each per-tool
+ * line is bounded separately (title truncated to 80 chars), but a turn
+ * with many tools could still produce a wall of text. This is a
+ * defense-in-depth cap to keep the WeChat 10-message budget healthy.
+ */
+const MAX_TOOL_SUMMARY_LEN = 1500;
 import type { MessagePart, MediaContent, ContextUsage, SessionMode, ModelRef, McpStatusMap } from "../types.js";
 import type {
   AccumulatedTurn,
@@ -26,6 +39,7 @@ import type {
   MessageUpdatedEvent,
   OpenCodeEvent,
   Part,
+  ReasoningPart,
   SessionErrorEvent,
   SessionStatusEvent,
   TrackedTool,
@@ -567,6 +581,34 @@ export class SessionManager {
       lastEventAt: Date.now(),
       sentTextPartIds: new Set(),
       pendingTextParts: [],
+      // Reasoning parts that arrived before assistantMessageId was known
+      // (see `flushPendingReasoningParts`). Mirrors the text-part buffer:
+      // both are flushed once the assistant's message ID is known, and
+      // parts whose `messageID` doesn't match the assistant are dropped.
+      pendingReasoningParts: [],
+      // Snapshot the display flags at turn-start. Mid-turn toggles via
+      // `setShowFlags` intentionally do NOT update `showThoughtsSnapshot` /
+      // `showToolsSnapshot` — see the JSDoc on `setShowFlags` below for the
+      // rationale. Consumers read these via `getShowFlagsForTurn`.
+      showThoughtsSnapshot: this.showThoughts,
+      showToolsSnapshot: this.showTools,
+      // Reasoning accumulation starts empty. Task 6's `handleReasoningPart`
+      // mutates `reasoningCharCount`, `reasoningStartMs`, `reasoningEndMs`,
+      // and `sentReasoningPartIds` as reasoning parts arrive. The dedup set
+      // is fresh per turn so a new turn never inherits stale partIDs.
+      reasoningCharCount: 0,
+      reasoningStartMs: null,
+      reasoningEndMs: null,
+      sentReasoningPartIds: new Set<string>(),
+      // Tool summary state. `toolCallIdsInLastSummary` is the set of
+      // tool `callID`s already included in a previously-emitted
+      // summary. Fresh per turn so a new turn never inherits
+      // stale callIDs. See `maybeFlushToolSummary` for the
+      // consecutive-vs-separate logic.
+      toolCallIdsInLastSummary: new Set<string>(),
+      // Per-reasoning-part streaming timestamps. Populated by
+      // `accumulateReasoningDelta`, read by `handleReasoningPart`.
+      reasoningPartTimestamps: new Map(),
     };
     this.log(`[turn] start contextToken=${item.contextToken.slice(0, 8)}…`);
     this.scheduleStuckTimeout();
@@ -579,14 +621,41 @@ export class SessionManager {
     turn.lastEventAt = Date.now();
 
     if (event.properties.field !== "text") {
-      // Non-text deltas (e.g. reasoning deltas) — ignored in MVP.
+      // Non-text deltas (e.g. step-start, step-finish, snapshot) — ignored.
+      // NOTE: reasoning deltas ALSO use `field: "text"` (verified against the
+      // opencode server's `processor.ts:411-417` — it emits `field: "text"`
+      // for both text and reasoning parts because reasoning parts carry
+      // their content in the `.text` field just like TextPart does). We
+      // therefore route by part type (looked up in `turn.parts`) below,
+      // NOT by the `field` string. If the part is unknown at this point
+      // we fall back to treating it as a text part to preserve backward
+      // compatibility — the first delta for a brand-new reasoning part
+      // will still arrive before any `part.updated` event, and the
+      // definitive re-delivery as a complete `part.updated` is handled
+      // in `handleReasoningPart`.
+      return;
+    }
+
+    // Route by part type. Both `text` and `reasoning` parts use
+    // `field: "text"` in their delta events; the discriminator is the
+    // `type` on the corresponding Part object.
+    const knownPart: Part | undefined = turn.parts.get(event.properties.partID);
+    if (knownPart && knownPart.type === "reasoning") {
+      this.accumulateReasoningDelta(turn, knownPart, event.properties.delta);
+      this.armFinalizeDebounce();
       return;
     }
 
     // Identify which part this delta belongs to. If we don't yet have the
     // part, create a stub TextPart.
-    let part = turn.parts.get(event.properties.partID);
-    if (!part || part.type !== "text") {
+    let part: Part = knownPart ?? ({
+      id: event.properties.partID,
+      sessionID: event.properties.sessionID,
+      messageID: event.properties.messageID,
+      type: "text",
+      text: "",
+    } as Part);
+    if (part.type !== "text") {
       part = {
         id: event.properties.partID,
         sessionID: event.properties.sessionID,
@@ -605,6 +674,52 @@ export class SessionManager {
 
     this.log(`[event] delta partID=${event.properties.partID.slice(0, 8)}… +${event.properties.delta.length}ch`);
     this.armFinalizeDebounce();
+  }
+
+  /**
+   * Accumulate a streaming reasoning delta into the turn's off-mode
+   * metrics. Called from `handlePartDelta` once the target part has been
+   * resolved as a `ReasoningPart` (either by a prior `part.updated` event
+   * or by direct lookup). The reasoning content is NEVER forwarded to
+   * WeChat from this path — only the per-turn metrics are updated.
+   * Display of reasoning content is driven by the `part.updated` event
+   * delivered to `handleReasoningPart`, which sees the full text in one
+   * go and decides whether to send it (showThoughts on) or only log a
+   * summary (off).
+   *
+   * Dedup note: `sentReasoningPartIds` is intentionally NOT consulted
+   * here. The dedup set exists to prevent duplicate `onReply` calls
+   * when the *same* reasoning part is re-delivered (e.g. on SSE
+   * reconnect). Streaming deltas for the same partID belong to the
+   * SAME part, so they should all contribute to the off-mode char
+   * count. The first delta also sets `reasoningStartMs` (only if null)
+   * and every delta updates `reasoningEndMs`.
+   */
+  private accumulateReasoningDelta(turn: AccumulatedTurn, part: Part, delta: string): void {
+    if (!delta) return;
+    const now = Date.now();
+    (part as { text: string }).text += delta;
+    turn.reasoningCharCount += delta.length;
+    // Turn-level cumulative timestamps (for the off-mode log line).
+    if (turn.reasoningStartMs === null) {
+      turn.reasoningStartMs = now;
+    }
+    turn.reasoningEndMs = now;
+    // Per-part streaming timestamps (for the on-mode WeChat header).
+    // `startMs` is set on the first delta for this part; `endMs` is
+    // updated to every subsequent delta so the final value is the
+    // timestamp of the last delta before the `message.part.updated`
+    // event delivers the full text. This gives a per-part duration
+    // that does NOT include the time spent on tool calls between
+    // reasoning parts — which is what the user expects to see in
+    // the WeChat `🧠 Thought · … · {duration}` line.
+    const partTimestamps = turn.reasoningPartTimestamps.get(part.id);
+    if (partTimestamps) {
+      partTimestamps.endMs = now;
+    } else {
+      turn.reasoningPartTimestamps.set(part.id, { startMs: now, endMs: now });
+    }
+    this.log(`[event] reasoning-delta partID=${part.id.slice(0, 8)}… +${delta.length}ch`);
   }
 
   private handlePartUpdated(event: MessagePartUpdatedEvent): void {
@@ -633,10 +748,18 @@ export class SessionManager {
       // known, buffered parts that match are flushed.
       this.maybeSendTextPart(turn, part);
     } else if (part.type === "tool") {
+      // Pass-through: tool parts are tracked silently. The tool
+      // summary is emitted by `maybeFlushToolSummary` at the FIRST
+      // non-tool event that arrives AFTER this tool (either a
+      // post-tool reasoning part or the first text part), so the
+      // summary appears in WeChat at the chronological boundary
+      // where the model switched from "tools" to "more output".
       this.trackTool(turn, part);
     } else if (part.type === "file") {
       // Could be sent via onMediaReply in Phase 2.
       this.log(`[event] file part: ${part.filename ?? part.url}`);
+    } else if (part.type === "reasoning") {
+      this.handleReasoningPart(turn, part);
     }
 
     this.log(`[event] part.updated type=${part.type} partID=${part.id.slice(0, 8)}…`);
@@ -659,8 +782,28 @@ export class SessionManager {
    * before `assistantMessageId` is known are buffered in
    * `turn.pendingTextParts` and flushed once the assistant's message ID
    * becomes available.
+   *
+   * Tool summary ordering: just before the FIRST assistant text part
+   * actually reaches WeChat, we flush the `🔧 Tools: …` summary (if
+   * `showToolsSnapshot` is on AND any tools were called AND it has not
+   * been sent yet). This puts the tool summary BEFORE the final text
+   * reply in WeChat, matching the chronological order of events — the
+   * model called tools first, then wrote the final text. The guard on
+   * `turn.toolSummarySent` ensures the summary is emitted exactly once
+   * even if the turn has many text parts; if the turn has tools but no
+   * text at all, `finalizeTurn` flushes the summary as a fallback.
+   *
+   * `skipToolFlush` is `true` when called from `flushPendingTextParts`
+   * — the text part was buffered because `assistantMessageId` was not
+   * yet known at arrival time, so tools that were tracked AFTER the
+   * buffer would be flushed here, putting the tool summary in front of
+   * a text part that, in the model's natural output order, came before
+   * those tools. Skipping the flush preserves the original chronology:
+   * the text part is sent, and any tools tracked after the buffer will
+   * be flushed at the next natural non-tool boundary (the next
+   * reasoning or text part that arrives live, not via buffer flush).
    */
-  private maybeSendTextPart(turn: AccumulatedTurn, part: Part): void {
+  private maybeSendTextPart(turn: AccumulatedTurn, part: Part, skipToolFlush = false): void {
     if (part.type !== "text") return;
     if (turn.sentTextPartIds.has(part.id)) return;
     if (!part.text.trim()) return;
@@ -685,6 +828,23 @@ export class SessionManager {
       return;
     }
 
+    // Pass-through: emit the tool summary right BEFORE the text part
+    // if any tools have been called and the summary hasn't been
+    // emitted yet. This puts the summary at the position where the
+    // model switched from "tools" to "final text reply" — the
+    // chronological boundary in the model's output stream.
+    //
+    // Skip the flush when replaying a buffered text part: the part
+    // was buffered because `assistantMessageId` wasn't known yet, and
+    // any tools tracked between the buffer and the flush would
+    // otherwise be inserted in front of a text that, in the model's
+    // natural output, came BEFORE them. Letting them stay tracked and
+    // flushing at the next live non-tool boundary preserves the
+    // original chronological order.
+    if (!skipToolFlush) {
+      this.maybeFlushToolSummary(turn);
+    }
+
     turn.sentTextPartIds.add(part.id);
     this.log(`[text-part] sending part ${part.id.slice(0, 8)}… (${part.text.length}ch)`);
     this.onReply(turn.contextToken, part.text).catch((err) => {
@@ -695,16 +855,185 @@ export class SessionManager {
   /**
    * Flush any text parts that were buffered before the assistant's
    * message ID was known. Called from `handleMessageUpdated` when
-   * `info.role === "assistant"` arrives, and from `finalizeTurn` as
-   * a last-chance flush.
+   * `info.role === "assistant"` arrives, and from `finalizeTurn` as a
+   * last-chance flush.
+   *
+   * Each buffered part is replayed with `skipToolFlush=true` so the
+   * tool-summary flush does NOT run here — see the JSDoc on
+   * `maybeSendTextPart` for the chronology-preservation rationale.
    */
   private flushPendingTextParts(turn: AccumulatedTurn): void {
     if (turn.pendingTextParts.length === 0) return;
     const pending = turn.pendingTextParts;
     turn.pendingTextParts = [];
     for (const part of pending) {
-      this.maybeSendTextPart(turn, part);
+      this.maybeSendTextPart(turn, part, true);
     }
+  }
+
+  /**
+   * Handle a finalized reasoning part delivered via `message.part.updated`.
+   *
+   * Mirrors the structure of `maybeSendTextPart` (dedup + assistantMessageId
+   * filter + contextToken guard) but routes by the `showThoughtsSnapshot`
+   * taken at turn-start:
+   *
+   *   - When `showThoughts === true`: send a single one-line
+   *     `🧠 Thought · <summary> · <duration>` header via the existing
+   *     `onReply` path. The reasoning body is NEVER forwarded to WeChat —
+   *     only the summary line. Sending the full body would flood the
+   *     WeChat 10-message-per-turn limit on long-thinking models, and
+   *     the user expects a label, not a transcript.
+   *   - When `showThoughts === false`: do NOT call `onReply`. The
+   *     off-mode metrics (`reasoningCharCount`, `reasoningStartMs`,
+   *     `reasoningEndMs`) are already being updated by
+   *     `accumulateReasoningDelta` for the streaming deltas — this
+   *     method just observes the part (and the final char count + end
+   *     timestamp are normalized here so that a reasoning part with
+   *     zero deltas still contributes its final `text.length` and a
+   *     proper end time).
+   *
+   * Empty / whitespace-only reasoning parts are skipped entirely to
+   * avoid emitting `🧠 Thought · …` headers with no body and to avoid
+   * polluting off-mode metrics with empty reasoning.
+   *
+   * Dedup is via `sentReasoningPartIds` — SSE replay / reconnection
+   * can re-deliver the same reasoning part; the set guarantees each
+   * reasoning part is sent at most once per turn.
+   *
+   * Race with `assistantMessageId`: if the first reasoning part arrives
+   * before `message.updated role=assistant`, we cannot verify its
+   * `messageID` against the assistant's. We buffer it in
+   * `pendingReasoningParts` and replay via `flushPendingReasoningParts`
+   * when the ID becomes known — parts whose `messageID` does not match
+   * the assistant's are dropped at flush time (user-input echoes).
+   * This mirrors the text-part buffering strategy.
+   */
+  private handleReasoningPart(turn: AccumulatedTurn, part: Part): void {
+    if (part.type !== "reasoning") return;
+    if (turn.sentReasoningPartIds.has(part.id)) {
+      this.log(`[reasoning-part] dropping duplicate part ${part.id.slice(0, 8)}… (already sent)`);
+      return;
+    }
+    if (!part.text.trim()) {
+      // Skip empty/whitespace-only reasoning entirely — no header, no
+      // off-mode metric increment. This guards against providers that
+      // emit a `reasoning` part with an empty `.text` (e.g. when reasoning
+      // was disabled mid-stream or the model returned no thoughts).
+      return;
+    }
+
+    // Buffer reasoning parts that arrived BEFORE the assistant message
+    // ID was known. The OpenCode server sometimes streams
+    // `message.part.updated` for the assistant's first reasoning part
+    // BEFORE emitting `message.updated` with role=assistant, so we
+    // can't filter on `part.messageID === turn.assistantMessageId` yet.
+    // Mirrors the text-part buffer — once the ID is known, buffered
+    // parts are flushed in arrival order; parts whose `messageID` does
+    // not match the assistant's are dropped (user-input echoes).
+    if (turn.assistantMessageId === null) {
+      turn.pendingReasoningParts.push(part);
+      this.log(`[reasoning-part] buffering part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}…) until assistantMessageId is known`);
+      return;
+    }
+
+    if (part.messageID !== turn.assistantMessageId) {
+      // Mirror the text-part filter: drop user-side reasoning parts
+      // (different messageID) so we never echo them.
+      this.log(`[reasoning-part] dropping part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}… ≠ assistant ${turn.assistantMessageId.slice(0, 8)}…)`);
+      return;
+    }
+    if (!turn.contextToken) {
+      this.log(`[reasoning-part] no contextToken for part ${part.id.slice(0, 8)}…; dropping`);
+      return;
+    }
+
+    this.dispatchReasoningPart(turn, part);
+  }
+
+  /**
+   * Flush reasoning parts that were buffered because they arrived before
+   * `assistantMessageId` was known. Called from `handleMessageUpdated`
+   * when the assistant message arrives, and from `finalizeTurn` as a
+   * last-chance flush.
+   *
+   * Mirrors `flushPendingTextParts`: buffered parts are replayed in
+   * arrival order; parts whose `messageID` does not match the
+   * assistant's are dropped (user-input echoes).
+   */
+  private flushPendingReasoningParts(turn: AccumulatedTurn): void {
+    if (turn.pendingReasoningParts.length === 0) return;
+    const pending = turn.pendingReasoningParts;
+    turn.pendingReasoningParts = [];
+    for (const part of pending) {
+      // Re-dispatch through the main handler. Re-entrancy is safe: the
+      // duplicate-id and empty-text guards will skip already-handled
+      // parts, and the assistantMessageId-null branch will not re-buffer
+      // because it's now set.
+      this.handleReasoningPart(turn, part);
+    }
+  }
+
+  /**
+   * Core reasoning-part dispatch (called once we know the part belongs
+   * to the assistant). Sends the summary line to WeChat immediately
+   * with the tool summary flushed just before it.
+   */
+  private dispatchReasoningPart(turn: AccumulatedTurn, part: ReasoningPart): void {
+    // Snapshot the display flag (Task 5 added the snapshot field so a
+    // mid-turn /thought-display toggle does not flip the visibility of
+    // in-flight reasoning).
+    const flags = this.getShowFlagsForTurn();
+
+    if (flags.showThoughts) {
+      // Compute PER-PART duration from the per-part streaming
+      // timestamps (populated by `accumulateReasoningDelta`). This
+      // gives the user the time spent THINKING for THIS reasoning
+      // part only — not the cumulative time across the turn (which
+      // would include tool calls interleaved between reasoning
+      // parts). For reasoning parts that arrived with no streaming
+      // deltas (rare; the `.text` non-empty guard above ensures we
+      // have SOME content), fall back to "now" so the duration
+      // renders as 0 instead of NaN.
+      const now = Date.now();
+      const partTimestamps = turn.reasoningPartTimestamps.get(part.id);
+      const startMs = partTimestamps?.startMs ?? now;
+      const endMs = partTimestamps?.endMs ?? now;
+      const durationMs = Math.max(0, endMs - startMs);
+
+      // `summary` is always populated: it's the `**Title**` header
+      // when the model emitted one, otherwise the first line of the
+      // body (truncated to MAX_SUMMARY_LEN).
+      const { summary } = reasoningSummary(part.text);
+      const line = formatThoughtHeader(durationMs, summary);
+
+      // Pass-through: send the reasoning summary immediately. If
+      // tools have been called in this turn (and the tool summary
+      // hasn't been sent yet), the summary is emitted just before
+      // this reasoning line so the WeChat display shows the tool
+      // summary at the chronological boundary where the model
+      // switched from "tools" to "more reasoning".
+      this.maybeFlushToolSummary(turn);
+
+      this.log(`[reasoning-part] sending summary for part ${part.id.slice(0, 8)}… (${part.text.length}ch, summary="${summary.length > 30 ? summary.slice(0, 30) + "…" : summary}", ${formatDuration(durationMs)})`);
+      // `turn.contextToken` is guaranteed non-null by the caller
+      // (`handleReasoningPart` returns early if it's missing). Re-checked
+      // here because TS doesn't narrow across the function boundary.
+      if (!turn.contextToken) return;
+      this.onReply(turn.contextToken, line).catch((err) => {
+        this.log(`onReply error for reasoning summary: ${String(err)}`);
+      });
+
+      // Mark the part as sent AFTER dispatching the single message
+      // so duplicate `part.updated` events skip cleanly. `onReply`
+      // is already fire-and-forget (catch is above), so synchronous
+      // add is safe.
+      turn.sentReasoningPartIds.add(part.id);
+    }
+    // off-mode: nothing to do here — `accumulateReasoningDelta`
+    // already updated `reasoningCharCount` / `reasoningStartMs` /
+    // `reasoningEndMs` during streaming. The `finalizeTurn` off-mode
+    // log line consumes those metrics.
   }
 
   private handleMessageUpdated(event: MessageUpdatedEvent): void {
@@ -738,10 +1067,12 @@ export class SessionManager {
       if (info.variant) {
         this.currentReasoning = info.variant;
       }
-      // Now that we know the assistant's message ID, flush any text parts
-      // that were buffered while waiting. User-input parts (different
-      // messageID) are dropped inside maybeSendTextPart.
+      // Now that we know the assistant's message ID, flush any text and
+      // reasoning parts that were buffered while waiting. User-input
+      // parts (different messageID) are dropped inside maybeSendTextPart
+      // / handleReasoningPart.
       this.flushPendingTextParts(turn);
+      this.flushPendingReasoningParts(turn);
     } else if (info.role === "user") {
       // A `message.updated role=user` event is normally the SERVER's
       // echo of a user message that was just created by our
@@ -832,6 +1163,7 @@ export class SessionManager {
       toolName: part.tool,
       status: part.state.status,
       title: part.state.title,
+      input: part.state.input,
       output: part.state.output,
       isSubAgent,
     };
@@ -906,14 +1238,20 @@ export class SessionManager {
     turn.status = reason;
     this.clearFinalizeTimers();
 
-    // Drop any text parts still buffered — if we got this far without the
-    // assistant's message ID being known, those buffered parts are very
-    // likely the user's own input parts that we correctly held back. Any
-    // real assistant parts should have been sent via flushPendingTextParts
-    // when the `message.updated role=assistant` event arrived.
+    // Drop any text and reasoning parts still buffered — if we got this
+    // far without the assistant's message ID being known, those buffered
+    // parts are very likely the user's own input parts (or stray
+    // reasoning echoes) that we correctly held back. Any real assistant
+    // parts should have been sent via flushPendingTextParts /
+    // flushPendingReasoningParts when the `message.updated role=assistant`
+    // event arrived.
     if (turn.pendingTextParts.length > 0) {
       this.log(`[turn] dropping ${turn.pendingTextParts.length} buffered text part(s) at finalize (likely user-input echoes)`);
       turn.pendingTextParts = [];
+    }
+    if (turn.pendingReasoningParts.length > 0) {
+      this.log(`[turn] dropping ${turn.pendingReasoningParts.length} buffered reasoning part(s) at finalize (likely user-input echoes)`);
+      turn.pendingReasoningParts = [];
     }
 
     const contextToken = turn.contextToken ?? "";
@@ -927,14 +1265,42 @@ export class SessionManager {
       this.cancelTyping?.(contextToken).catch(() => {});
     }
 
-    // Send tool summary as a SEPARATE message when /thinking on.
-    if (this.showTools && turn.toolCalls.size > 0 && contextToken) {
-      const summary = this.buildToolSummary(turn);
-      if (summary) {
-        this.onReply(contextToken, summary).catch((err) => {
-          this.log(`onReply error for tool summary: ${String(err)}`);
-        });
-      }
+    // Send tool summary as a SEPARATE message when /tool-display on.
+    // Two paths can emit it:
+    //   1. `handleReasoningPart` or `maybeSendTextPart` already
+    //      flushed it via `maybeFlushToolSummary` at the first
+    //      non-tool event that arrived after the tools. The
+    //      `!turn.toolSummarySent` guard skips us here so we don't
+    //      send it twice.
+    //   2. The turn had tools but NO non-tool event followed
+    //      (e.g. the model ended on a tool call, or an error
+    //      short-circuited before any text part arrived). In
+    //      that case the fallback path here is the only place the
+    //      user ever sees the summary, so we still emit it.
+    //
+    // We use `turn.showToolsSnapshot` (not the live `this.showTools`)
+    // for the same reason as the `maybeSendTextPart` flush above: a
+    // mid-turn toggle must not flip the in-flight turn's display.
+    this.maybeFlushToolSummary(turn);
+
+    // Off-mode reasoning log: when `/thought-display off` was active at
+    // turn-start, the user does NOT see reasoning in WeChat — but they
+    // should still get a single summary line in the bridge log so the
+    // operator / log reader knows thinking happened (and how much).
+    //
+    // `reasoningCharCount` is updated by `accumulateReasoningDelta` for
+    // every reasoning delta that arrives during streaming; the gate
+    // `> 0` ensures we never emit the `🧠 Thought · …` log line when
+    // the model produced zero reasoning for this turn.
+    //
+    // The duration uses `reasoningEndMs - reasoningStartMs` when both
+    // are available (the typical case), falling back to 0 when the
+    // turn interrupted before any reasoning ended cleanly.
+    if (!turn.showThoughtsSnapshot && turn.reasoningCharCount > 0) {
+      const duration = turn.reasoningEndMs && turn.reasoningStartMs
+        ? turn.reasoningEndMs - turn.reasoningStartMs
+        : 0;
+      this.log(`🧠 Thought · ${formatDuration(duration)} · ${turn.reasoningCharCount} chars`);
     }
 
     // If NO text parts were sent (e.g. agent did only tool calls, or the
@@ -971,14 +1337,214 @@ export class SessionManager {
    * Only called when showTools is enabled.
    */
   private buildToolSummary(turn: AccumulatedTurn): string {
+    return this.buildToolSummaryFromMap(turn.toolCalls);
+  }
+
+  /**
+   * Build a tool summary from a specific Map of `TrackedTool`. Used by
+   * `maybeFlushToolSummary` and `finalizeTurn` to render summaries
+   * containing only the "new since last flush" subset of tools, so
+   * consecutive tools get combined and separate tools get individual
+   * summaries (user-stated rule).
+  /**
+   * Per-tool line truncation cap for the `state.title` portion of a tool
+   * summary entry. opencode-generated titles are usually short ("exit 0",
+   * "3 matches", "https://x") but some tools emit very long ones (a
+   * sub-agent's full report header, for example) — 80 chars keeps a
+   * single tool from dominating the line in WeChat.
+   */
+  private static readonly MAX_TOOL_TITLE_LEN = 80;
+
+  /**
+   * Build a tool summary from a specific Map of `TrackedTool`. Used by
+   * `maybeFlushToolSummary` and `finalizeTurn` to render summaries
+   * containing only the "new since last flush" subset of tools, so
+   * consecutive tools get combined and separate tools get individual
+   * summaries (user-stated rule).
+   *
+   * Each line is `emoji name [title]` (optionally ` (sub-agent)` for
+   * `task`/`subtask` dispatches). The `title` is the opencode-generated
+   * one-line summary the tool itself set on its output — for example
+   * `webfetch` sets it to the URL it fetched, `bash` to the exit status.
+   * When the title is empty (the tool part arrived before the tool
+   * finished, or the tool didn't set a title) we synthesize a fallback
+   * title from the tool's known input parameters (for example glob
+   * with a TypeScript glob pattern, grep with the search term, or
+   * webfetch with the URL) so the user at least sees what the tool
+   * was invoked with. Titles longer than
+   * {@link MAX_TOOL_TITLE_LEN} chars are truncated with an ellipsis.
+   */
+  private buildToolSummaryFromMap(tools: Map<string, TrackedTool>): string {
     const lines: string[] = ["🔧 Tools:"];
-    for (const tc of turn.toolCalls.values()) {
-      const subAgentTag = tc.isSubAgent ? " (sub-agent)" : "";
-      const statusEmoji = tc.status === "completed" ? "✅" : tc.status === "error" ? "❌" : "⏳";
-      const title = tc.title ? ` ${tc.title}` : "";
-      lines.push(`  ${statusEmoji} ${tc.toolName}${title}${subAgentTag}`);
+    const MAX_TITLE = SessionManager.MAX_TOOL_TITLE_LEN;
+    const STATUS_EMOJI = {
+      completed: "✅",
+      error: "❌",
+      running: "⏳",
+      pending: "⏳",
+    } as const;
+    for (const tc of tools.values()) {
+      const emoji = STATUS_EMOJI[tc.status] ?? "⏳";
+      // LLM-supplied title takes priority; fall back to a derived title
+      // synthesized from the tool's known input parameters when the
+      // LLM SDK did not populate state.title (common for read-only
+      // tools like glob/grep/webfetch with some models).
+      const title = (tc.title?.trim() || this.deriveTitleFromInput(tc.toolName, tc.input) || "").trim();
+      let line = `${emoji} ${tc.toolName}`;
+      if (title) {
+        const trimmed = title.length > MAX_TITLE
+          ? title.slice(0, MAX_TITLE - 1) + "…"
+          : title;
+        line += ` ${trimmed}`;
+      }
+      if (tc.isSubAgent) {
+        line += " (sub-agent)";
+      }
+      lines.push(`  ${line}`);
     }
-    return lines.join("\n");
+    const summary = lines.join("\n");
+    // Hard cap the entire summary to keep the WeChat 10-message budget
+    // healthy when many tools are involved in one turn. Each tool line
+    // is already bounded; this trims the WHOLE block as a safety net.
+    if (summary.length > MAX_TOOL_SUMMARY_LEN) {
+      return summary.slice(0, MAX_TOOL_SUMMARY_LEN - 1) + "…";
+    }
+    return summary;
+  }
+
+  /**
+   * Derive a short, human-readable title from a tool's input parameters.
+   * Returns `undefined` if the input is missing or the tool is unknown
+   * (caller should treat the tool as title-less in that case).
+   *
+   * The derivation is per-tool, using whichever of the tool's known
+   * input parameters the SDK exposes:
+   *   - glob         → pattern (e.g. "**\/*.ts")
+   *   - grep         → pattern
+   *   - read         → filePath / path / file
+   *   - write        → filePath
+   *   - edit         → filePath
+   *   - webfetch     → url
+   *   - bash / shell → command (truncated)
+   *   - task         → description / prompt
+   *   - question     → question
+   *   - default      → JSON.stringify(input) (truncated)
+   */
+  private deriveTitleFromInput(toolName: string, input: unknown): string | undefined {
+    if (!input || typeof input !== "object") return undefined;
+    const params = input as Record<string, unknown>;
+    const pick = (...keys: string[]): string | undefined => {
+      for (const k of keys) {
+        const v = params[k];
+        if (typeof v === "string" && v.length > 0) return v;
+      }
+      return undefined;
+    };
+    const truncate = (s: string, max = 60): string =>
+      s.length <= max ? s : s.slice(0, max - 1) + "…";
+    let raw: string | undefined;
+    switch (toolName) {
+      case "glob":
+      case "grep":
+        raw = pick("pattern");
+        break;
+      case "read":
+      case "write":
+      case "edit":
+      case "patch":
+        raw = pick("filePath", "path", "file");
+        break;
+      case "webfetch":
+        raw = pick("url");
+        break;
+      case "bash":
+      case "shell":
+        raw = pick("command");
+        break;
+      case "task":
+      case "subtask":
+        raw = pick("description", "prompt");
+        break;
+      case "question":
+        raw = pick("question");
+        break;
+      case "todowrite":
+        raw = pick("content", "status");
+        break;
+      case "skill":
+        raw = pick("name");
+        break;
+      default:
+        raw = undefined;
+    }
+    if (raw) return truncate(raw);
+    // Fallback: stringify whatever the input is, then truncate.
+    try {
+      const json = JSON.stringify(input);
+      if (json && json !== "{}") return truncate(json, 60);
+    } catch {
+      // not serializable; give up
+    }
+    return undefined;
+  }
+
+  /**
+   * Emit the per-turn `🔧 Tools: …` summary to WeChat if (and only if)
+   * the snapshot flag is on, any tools have been called, the summary
+   * hasn't been emitted yet, and a contextToken is available.
+   *
+   * Called from the two non-tool event sites that are the natural
+   * "boundary" between the tools phase and the rest of the model
+   * output:
+   *
+   *   - `handleReasoningPart` (in showThoughts=on mode)  →
+   *     reasoning-after-tool appears in WeChat with the tool summary
+   *     IMMEDIATELY before it, so the WeChat display preserves the
+   *     chronological order:
+   *       reasoning1 → tools → reasoning2 → text
+   *     becomes
+   *       R1, tool-summary, R2, text
+   *
+   *   - `maybeSendTextPart`  → the first text part is preceded by
+   *     the tool summary, so the WeChat display reads:
+   *       R1, tool-summary, R2, text
+   *     in the common R → T → R → Text case, or:
+   *       R1, T-summary, R2, text  (with R2 actually being the text)
+   *     in the R → T → Text case where there's no post-tool reasoning.
+   *
+   * `finalizeTurn` also calls this as a fallback for turns that end
+   * on a tool call (no reasoning or text follows).
+   *
+   * Pass-through semantics: this is a NO-OP unless ALL of the
+   * following are true: tools have been called (`toolCalls.size > 0`),
+   * the summary flag is on (`showToolsSnapshot`), and at least one
+   * tool hasn't been included in a previous summary this turn
+   * (otherwise the non-tool boundary was a no-op). Tools are tracked
+   * silently; the summary is a single WeChat message emitted at the
+   * boundary, covering only the tools that arrived since the last
+   * flush.
+   */
+  private maybeFlushToolSummary(turn: AccumulatedTurn): void {
+    if (turn.toolCalls.size === 0) return;
+    if (!turn.showToolsSnapshot) return;
+    if (!turn.contextToken) return;
+    // Find tools that haven't been summarized yet.
+    const newTools = new Map<string, TrackedTool>();
+    for (const [callID, tracked] of turn.toolCalls) {
+      if (!turn.toolCallIdsInLastSummary.has(callID)) {
+        newTools.set(callID, tracked);
+      }
+    }
+    if (newTools.size === 0) return;
+    const toolSummary = this.buildToolSummaryFromMap(newTools);
+    if (!toolSummary) return;
+    for (const callID of newTools.keys()) {
+      turn.toolCallIdsInLastSummary.add(callID);
+    }
+    this.log(`[tool-summary] flushing ${newTools.size} new tool(s) at non-tool boundary (total tracked: ${turn.toolCalls.size})`);
+    this.onReply(turn.contextToken, toolSummary).catch((err) => {
+      this.log(`onReply error for tool summary: ${String(err)}`);
+    });
   }
 
   /** Helper: ensure a turn exists for the current session, creating a stub if needed. */
@@ -1395,12 +1961,57 @@ export class SessionManager {
 
   // ─── Display flags ───
 
+  /**
+   * Update the SessionManager's display flags.
+   *
+   * **Snapshot semantics (intentional):** this method deliberately does NOT
+   * propagate the new flag values into `currentTurn.showThoughtsSnapshot` /
+   * `currentTurn.showToolsSnapshot`. The snapshot is captured once, at the
+   * start of each turn (see `beginTurn`), and held stable for the lifetime
+   * of that turn. This means:
+   *
+   *   1. If the user runs `/thought-display on` mid-turn, the reasoning
+   *      for the in-flight turn is still hidden (the turn started with
+   *      `showThoughts=false`). The next turn picks up the new flag.
+   *   2. If the user runs `/thought-display off` mid-turn, reasoning
+   *      already being streamed for this turn is still shown. The next
+   *      turn hides it.
+   *
+   * This avoids confusing "flash" behavior where reasoning would appear
+   * halfway through a turn and disappear on the next delta. Reasoning
+   * visibility is a per-turn commitment, not a per-event one.
+   *
+   * Partial-update safe: only fields present in `flags` are mutated.
+   * Calling `setShowFlags({ showThoughts: true })` leaves `showTools`
+   * untouched.
+   */
   setShowFlags(flags: { showThoughts?: boolean; showTools?: boolean }): void {
     if (flags.showThoughts !== undefined) this.showThoughts = flags.showThoughts;
     if (flags.showTools !== undefined) this.showTools = flags.showTools;
   }
 
   getShowFlags(): { showThoughts: boolean; showTools: boolean } {
+    return { showThoughts: this.showThoughts, showTools: this.showTools };
+  }
+
+  /**
+   * Resolve the display flags that should govern event-handling for the
+   * **current** turn.
+   *
+   * Returns the snapshot captured at `beginTurn` if a turn is in flight
+   * (`currentTurn !== null`), else falls back to the SessionManager's
+   * live `showThoughts` / `showTools`. This is the accessor that Task 6's
+   * `handleReasoningPart` and tool-summary code should use, so that
+   * reasoning/tool visibility stays consistent within a turn regardless
+   * of any mid-turn toggle.
+   */
+  getShowFlagsForTurn(): { showThoughts: boolean; showTools: boolean } {
+    if (this.currentTurn !== null) {
+      return {
+        showThoughts: this.currentTurn.showThoughtsSnapshot,
+        showTools: this.currentTurn.showToolsSnapshot,
+      };
+    }
     return { showThoughts: this.showThoughts, showTools: this.showTools };
   }
 

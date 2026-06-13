@@ -139,13 +139,25 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 | `/stop` | Stop the running agent |
 | `/restart` | New session (clear context) |
 
-### Thinking (`/thought`)
+### Thought Display (`/thought-display`)
 
 | Command | Description |
 |---------|-------------|
-| `/thought on` | Enable thinking & tool display |
-| `/thought off` | Disable thinking & tool display |
-| `/thought status` | Show current thinking & tool display settings |
+| `/thought-display on` | Show model reasoning in WeChat as a single `🧠 Thought · {summary} · {duration}` line per reasoning block (no body — only the summary) |
+| `/thought-display off` | Hide reasoning from WeChat (only logged to bridge log) |
+| `/thought-display status` | Show current thought display state |
+
+Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
+
+### Tool Display (`/tool-display`)
+
+| Command | Description |
+|---------|-------------|
+| `/tool-display on` | Show tool summary at end of turn (emoji + tool name + opencode-generated title, e.g. `✅ webfetch https://httpbin.org/get`, `✅ bash exit 0`) |
+| `/tool-display off` | Hide tool summary |
+| `/tool-display status` | Show current tool display state |
+
+Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
 
 ### System (`/version`, `/upgrade`)
 

@@ -50,7 +50,11 @@ export interface StatusCommand {
   kind: "status";
 }
 
-export interface ThinkingCommand {
+export interface ThoughtDisplayCommand {
+  kind: "status" | "on" | "off";
+}
+
+export interface ToolDisplayCommand {
   kind: "status" | "on" | "off";
 }
 
@@ -267,13 +271,12 @@ export function parseStatusCommand(text: string): StatusCommand | null {
   return null;
 }
 
-export function parseThinkingCommand(text: string): ThinkingCommand | null {
+export function parseThoughtDisplayCommand(text: string): ThoughtDisplayCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(?:thinking|thought)\s+(.+)$/i);
+  const match = trimmed.match(/^\/thought-display\s+(on|off|status|enable|disable)\s*$/i);
   if (!match) return null;
 
-  const args = match[1].trim().split(/\s+/);
-  const subcommand = args[0]?.toLowerCase();
+  const subcommand = match[1].toLowerCase();
 
   switch (subcommand) {
     case "on":
@@ -283,7 +286,27 @@ export function parseThinkingCommand(text: string): ThinkingCommand | null {
     case "disable":
       return { kind: "off" };
     case "status":
-    case "current":
+      return { kind: "status" };
+    default:
+      return null;
+  }
+}
+
+export function parseToolDisplayCommand(text: string): ToolDisplayCommand | null {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^\/tool-display\s+(on|off|status|enable|disable)\s*$/i);
+  if (!match) return null;
+
+  const subcommand = match[1].toLowerCase();
+
+  switch (subcommand) {
+    case "on":
+    case "enable":
+      return { kind: "on" };
+    case "off":
+    case "disable":
+      return { kind: "off" };
+    case "status":
       return { kind: "status" };
     default:
       return null;
@@ -547,10 +570,15 @@ export function formatHelp(): string {
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
     "  /upgrade                 升级 OpenCode 并重启 server（外部 server 模式不可用）",
     "",
-    "── 思考 ──",
-    "  /thought on             开启思考与工具显示",
-    "  /thought off            关闭思考与工具显示",
-    "  /thought status         查看当前显示设置",
+    "── 思考显示 ──",
+    "  /thought-display on     开启思考内容显示",
+    "  /thought-display off    关闭思考内容显示",
+    "  /thought-display status 查看当前显示设置",
+    "",
+    "── 工具显示 ──",
+    "  /tool-display on        开启工具调用摘要",
+    "  /tool-display off       关闭工具调用摘要",
+    "  /tool-display status    查看当前显示设置",
     "",
     "── 消息计数 ──",
     "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
@@ -609,10 +637,15 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
     "  /upgrade                 升级 OpenCode 并重启 server（外部 server 模式不可用）",
     "",
-    "── 思考 ──",
-    "  /thought on             开启思考与工具显示",
-    "  /thought off            关闭思考与工具显示",
-    "  /thought status         查看当前显示设置",
+    "── 思考显示 ──",
+    "  /thought-display on     开启思考内容显示",
+    "  /thought-display off    关闭思考内容显示",
+    "  /thought-display status 查看当前显示设置",
+    "",
+    "── 工具显示 ──",
+    "  /tool-display on        开启工具调用摘要",
+    "  /tool-display off       关闭工具调用摘要",
+    "  /tool-display status    查看当前显示设置",
     "",
     "── 消息计数 ──",
     "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
