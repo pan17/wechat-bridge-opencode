@@ -369,4 +369,58 @@ export interface AccumulatedTurn {
    *   - Output: R1, "🔧 Tools: T1,T2,T3", R2, Text
    */
   toolCallIdsInLastSummary: Set<string>;
+  // ─── Type-change-based flushing state ────────────────────────────────
+  // The "current part" is the one being accumulated RIGHT NOW. When a
+  // new part of a DIFFERENT type arrives (R / TOOL / TEXT), the current
+  // part is flushed (built + sent to WeChat) and the new type becomes
+  // current. Same-type consecutive parts (e.g. R → R with no other type
+  // between) merge into the current state per user spec — they don't
+  // trigger an extra flush.
+  /**
+   * The type of part currently being accumulated. `null` when nothing is
+   * current (start of turn, or after a flush before the next part).
+   */
+  currentPartType: "reasoning" | "tool" | "text" | null;
+  /**
+   * The part.id of the current part. Used to verify that a delta event
+   * belongs to the current part before mutating the accumulated state
+   * (out-of-order deltas are silently dropped).
+   */
+  currentPartID: string | null;
+  /**
+   * For current reasoning: accumulated text from the initial `part.text`
+   * plus all subsequent deltas (until a different type arrives). Reset
+   * to "" on every flush. Multiple consecutive R parts in a row merge
+   * by APPENDING their text to this buffer (per "merge to current"
+   * user choice), so the `**Title**` regex picks the first R's title.
+   */
+  currentReasoningText: string;
+  /**
+   * For current reasoning: wall-clock time of the FIRST delta for the
+   * current R "phase". Used as `startMs` for `formatThoughtHeader` so
+   * the displayed duration reflects this R phase's thinking span.
+   * `null` if no delta has been seen yet.
+   */
+  currentReasoningStartMs: number | null;
+  /**
+   * For current reasoning: wall-clock time of the LATEST delta for the
+   * current R "phase". Used as `endMs` for `formatThoughtHeader`.
+   * Updated on every delta.
+   */
+  currentReasoningEndMs: number | null;
+  /**
+   * For current text: accumulated text from the initial `part.text`
+   * plus all subsequent deltas. Reset to "" on every flush.
+   */
+  currentText: string;
+  /**
+   * For current tool: the `callID` of the tool being accumulated. Tool
+   * parts don't accumulate text — subsequent tool part.updated events
+   * just update the entry in `toolCalls`. This field exists so
+   * `flushCurrentPart` knows which tool's current state to emit (the
+   * tool-summary itself is built from `toolCalls` minus the
+   * `toolCallIdsInLastSummary` set, so it naturally combines
+   * consecutive tools that share the same current-phase).
+   */
+  currentToolKey: string | null;
 }

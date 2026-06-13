@@ -219,6 +219,13 @@ export class WeChatOpencodeBridge {
   // Single-user state (no Map<string, ...>)
   private wechatMsgCount = 0;
   private pendingOutbound: PendingMessage[] = [];
+  // Per-contextToken outbound FIFO queue. SessionManager fires multiple
+  // `onReply` calls back-to-back (tool summary + thought line / text part)
+  // without awaiting each other; without serialization the shorter payload
+  // can race ahead of the longer one and reverse the chronological order
+  // on WeChat. This chain ensures the WeChat server receives messages in
+  // the same order the bridge dispatches them.
+  private outboundQueue = new Map<string, Promise<unknown>>();
   private static readonly MSG_LIMIT_WARN = 7;
   private static readonly MSG_LIMIT_MAX = 10;
   private log: (msg: string) => void;
@@ -1752,7 +1759,11 @@ export class WeChatOpencodeBridge {
     }
   }
 
-  private async sendReply(contextToken: string, text: string): Promise<void> {
+  private sendReply(contextToken: string, text: string): Promise<void> {
+    return this.enqueueOutbound(contextToken, () => this.sendReplyImpl(contextToken, text));
+  }
+
+  private async sendReplyImpl(contextToken: string, text: string): Promise<void> {
     const formatted = formatForWeChat(text);
     const segments = splitText(formatted, TEXT_CHUNK_LIMIT);
 
@@ -1782,7 +1793,11 @@ export class WeChatOpencodeBridge {
     this.cancelTypingIndicator(contextToken).catch(() => {});
   }
 
-  private async sendMediaReply(contextToken: string, blocks: MediaContent[]): Promise<void> {
+  private sendMediaReply(contextToken: string, blocks: MediaContent[]): Promise<void> {
+    return this.enqueueOutbound(contextToken, () => this.sendMediaReplyImpl(contextToken, blocks));
+  }
+
+  private async sendMediaReplyImpl(contextToken: string, blocks: MediaContent[]): Promise<void> {
     for (const block of blocks) {
       if (this.wechatMsgCount >= WeChatOpencodeBridge.MSG_LIMIT_MAX) {
         this.log(`WeChat 10-msg limit reached (sent=${this.wechatMsgCount}), caching media`);
@@ -1821,7 +1836,36 @@ export class WeChatOpencodeBridge {
         this.log(`Sent ${typeLabel} (sent=${this.wechatMsgCount})`);
       }
     }
+
     this.cancelTypingIndicator(contextToken).catch(() => {});
+  }
+
+  /**
+   * Run `fn` strictly after every previously enqueued operation for the same
+   * `contextToken`. Without this guard the SessionManager's back-to-back
+   * `onReply` calls (tool summary + thought line, or text part + tool
+   * summary) race each other: each `await sendTextMessage(...)` returns in
+   * arbitrary order depending on network timing, and the WeChat display
+   * ends up showing the SHORT payload before the LONG one — e.g. R2 (56ch)
+   * arriving before the bash-1 tool summary (30ch), or the 2ch "ok" text
+   * arriving before the 44ch webfetch tool summary.
+   *
+   * The chain swallows rejected predecessors so a failed send doesn't
+   * poison subsequent sends for the same contextToken. `next.finally`
+   * removes the entry from the map once this task settles AND no newer
+   * task has taken its slot — keeps the map bounded for contextTokens
+   * that have stopped sending.
+   */
+  private enqueueOutbound<T>(contextToken: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.outboundQueue.get(contextToken) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(() => fn());
+    this.outboundQueue.set(contextToken, next);
+    next.finally(() => {
+      if (this.outboundQueue.get(contextToken) === next) {
+        this.outboundQueue.delete(contextToken);
+      }
+    });
+    return next;
   }
 
   // ─── Typing indicator ───

@@ -42,6 +42,8 @@ import type {
   ReasoningPart,
   SessionErrorEvent,
   SessionStatusEvent,
+  TextPart,
+  ToolPart,
   TrackedTool,
 } from "../types/events.js";
 
@@ -600,6 +602,17 @@ export class SessionManager {
       reasoningStartMs: null,
       reasoningEndMs: null,
       sentReasoningPartIds: new Set<string>(),
+      // Type-change-based flushing state. See the JSDoc on
+      // `AccumulatedTurn.currentPartType` for the rule. All six fields
+      // reset to their "empty" defaults at turn-start; populated lazily
+      // as the first part of each type arrives during the turn.
+      currentPartType: null,
+      currentPartID: null,
+      currentReasoningText: "",
+      currentReasoningStartMs: null,
+      currentReasoningEndMs: null,
+      currentText: "",
+      currentToolKey: null,
       // Tool summary state. `toolCallIdsInLastSummary` is the set of
       // tool `callID`s already included in a previously-emitted
       // summary. Fresh per turn so a new turn never inherits
@@ -667,6 +680,16 @@ export class SessionManager {
     }
     (part as { text: string }).text += event.properties.delta;
     turn.textBuffer += event.properties.delta;
+    // Per-current-phase accumulation: append deltas to `currentText`
+    // only when this delta is for the CURRENT text part. Out-of-order
+    // deltas for a different text part (rare; only happens if the
+    // model emits two text parts in a row without a non-text part
+    // between) are silently skipped — the new part's text was already
+    // initialised to the FULL text by `handlePartUpdated`, so we don't
+    // need to re-append.
+    if (turn.currentPartType === "text" && turn.currentPartID === event.properties.partID) {
+      turn.currentText += event.properties.delta;
+    }
 
     if (turn.assistantMessageId === null) {
       turn.assistantMessageId = event.properties.messageID;
@@ -705,6 +728,21 @@ export class SessionManager {
       turn.reasoningStartMs = now;
     }
     turn.reasoningEndMs = now;
+    // Per-current-phase timestamps (for the on-mode WeChat header under
+    // the type-change-flushing design). Mirror the per-part timestamps
+    // below, but only mutate when this delta is for the CURRENT R phase
+    // (i.e. `currentPartID === part.id`). Out-of-order deltas for a
+    // different R part (which can happen if the model emits R1, R2, R3
+    // in a row and deltas arrive interleaved across partIDs) are
+    // silently skipped here — the `currentReasoningText` was already
+    // initialised to the FULL text of the new R by `handlePartUpdated`,
+    // so we don't need to append again.
+    if (turn.currentPartType === "reasoning" && turn.currentPartID === part.id) {
+      if (turn.currentReasoningStartMs === null) {
+        turn.currentReasoningStartMs = now;
+      }
+      turn.currentReasoningEndMs = now;
+    }
     // Per-part streaming timestamps (for the on-mode WeChat header).
     // `startMs` is set on the first delta for this part; `endMs` is
     // updated to every subsequent delta so the final value is the
@@ -730,40 +768,253 @@ export class SessionManager {
     const part = event.properties.part;
     turn.parts.set(part.id, part);
 
+    // ─── Type-change-based flushing ────────────────────────────────
+    // If a different part type just arrived, the previously-accumulated
+    // "current" part is done — build and send its WeChat message before
+    // letting the new type take over as `current`. Same-type consecutive
+    // parts (R1 → R2, text1 → text2) merge into the current state per
+    // the user-spec ("merge to current") and do NOT trigger a flush.
+    //
+    // When `currentPartType` is `null` (start of turn, or right after a
+    // flush), this is a no-op — the new type just becomes the new current.
+    if (turn.currentPartType !== null && part.type !== turn.currentPartType) {
+      this.flushCurrentPart(turn);
+    }
+
+    // The new part becomes the new current. Type-specific handlers
+    // below ONLY update state (currentReasoningText / currentText /
+    // toolCalls); they no longer send messages or flush tool summaries.
+    // Sending is the sole job of `flushCurrentPart` (called above or by
+    // `finalizeTurn` at the end of the turn).
+    //
+    // `currentPartType` only tracks the three WeChat-message-eligible
+    // types (R / tool / text). Other part types — `file`, `step-start`,
+    // `step-finish`, `snapshot` — don't produce WeChat messages on
+    // their own and don't interrupt an accumulating current part.
+    // If a non-message part arrives mid-R (e.g. step-start during
+    // streaming), the current R continues accumulating; only when a
+    // different MESSAGE type arrives do we flush. This keeps multi-step
+    // streams clean.
+    if (part.type === "reasoning" || part.type === "tool" || part.type === "text") {
+      turn.currentPartType = part.type;
+    } else {
+      // Non-message part arrived — leave currentPartType unchanged so
+      // the in-flight R/text keeps accumulating through it.
+      turn.currentPartType = turn.currentPartType;
+    }
+    turn.currentPartID = part.id;
+
+    // Safe-default initialization: the type-specific handler below may
+    // early-return (empty text, dedup, buffer, no messageID, no
+    // contextToken, etc.) without populating the type-specific state
+    // fields. If we don't pre-set them, a later type-change flush will
+    // crash (e.g. `turn.currentReasoningText.trim()` on undefined).
+    // The handler will overwrite with the real values when it proceeds.
+    if (part.type === "reasoning") {
+      turn.currentReasoningText = "";
+      turn.currentReasoningStartMs = null;
+      turn.currentReasoningEndMs = null;
+    } else if (part.type === "text") {
+      turn.currentText = "";
+    }
+
     if (part.type === "text") {
-      // Authoritative final text — replace any delta-derived buffer for this part.
-      turn.finalText = part.text;
+      // ─── Text part: buffer / dedup / state-update ─────────────────
       // NOTE: We must NOT set `turn.assistantMessageId` from `part.messageID`
-      // here. The OpenCode server replays the user's INPUT parts back through
-      // the event stream after `prompt_async`, and those user-input parts
-      // share the same `type: "text"`. Setting `assistantMessageId` from the
-      // first text part would point it at the user message, and then we'd
-      // either echo the user input to WeChat (if we send text parts
-      // unconditionally) or skip the assistant's actual text parts (if we
-      // filter by `part.messageID === assistantMessageId`).
-      //
-      // `assistantMessageId` is set exclusively in `handleMessageUpdated`
-      // when an `info.role === "assistant"` event arrives. Until that
-      // happens, the part is buffered; once the assistant message is
-      // known, buffered parts that match are flushed.
-      this.maybeSendTextPart(turn, part);
+      // here — the server replays user-input text parts (same `type: "text"`)
+      // on `prompt_async`, and we mustn't mistake them for the assistant's
+      // reply. `assistantMessageId` is set exclusively in
+      // `handleMessageUpdated` on `info.role === "assistant"`. Until then,
+      // text parts are buffered; once known, the buffer is replayed via
+      // `flushPendingTextParts`.
+
+      // Dedup: SSE replay can re-deliver the same text part; skip if
+      // already flushed by a previous event.
+      if (turn.sentTextPartIds.has(part.id)) return;
+      // Buffer until we know the assistant's message ID.
+      if (turn.assistantMessageId === null) {
+        turn.pendingTextParts.push(part);
+        this.log(`[text-part] buffering part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}…) until assistantMessageId is known`);
+        return;
+      }
+      // Drop user-input parts (different messageID).
+      if (part.messageID !== turn.assistantMessageId) {
+        this.log(`[text-part] dropping part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}… ≠ assistant ${turn.assistantMessageId.slice(0, 8)}…)`);
+        return;
+      }
+      if (!turn.contextToken) {
+        this.log(`[text-part] no contextToken for part ${part.id.slice(0, 8)}…; dropping`);
+        return;
+      }
+      // Update current state. Subsequent deltas for the same partID
+      // will be appended by `handlePartDelta`. The text is sent at
+      // the next type change (or at finalize) by `flushCurrentPart`.
+      turn.currentText = (part as TextPart).text ?? "";
+      // Mirror the legacy `finalText` field so the off-mode fallback
+      // path in `finalizeTurn` still works.
+      turn.finalText = (part as TextPart).text ?? "";
     } else if (part.type === "tool") {
-      // Pass-through: tool parts are tracked silently. The tool
-      // summary is emitted by `maybeFlushToolSummary` at the FIRST
-      // non-tool event that arrives AFTER this tool (either a
-      // post-tool reasoning part or the first text part), so the
-      // summary appears in WeChat at the chronological boundary
-      // where the model switched from "tools" to "more output".
+      // Update the tool's tracked state (callID → TrackedTool). The
+      // tool summary itself is emitted at the next type change (or at
+      // finalize) by `flushCurrentPart` → `maybeFlushToolSummary`,
+      // which naturally combines consecutive tools that share the
+      // same current-phase.
       this.trackTool(turn, part);
+      turn.currentToolKey = (part as ToolPart).callID;
     } else if (part.type === "file") {
       // Could be sent via onMediaReply in Phase 2.
       this.log(`[event] file part: ${part.filename ?? part.url}`);
     } else if (part.type === "reasoning") {
-      this.handleReasoningPart(turn, part);
+      // ─── Reasoning part: buffer / dedup / state-update ───────────
+      // Dedup: same R part may be re-delivered on SSE replay; skip if
+      // already sent.
+      if (turn.sentReasoningPartIds.has(part.id)) {
+        this.log(`[reasoning-part] dropping duplicate part ${part.id.slice(0, 8)}… (already sent)`);
+        return;
+      }
+      // Empty/whitespace-only reasoning → skip (no header, no metrics).
+      const partText = (part as ReasoningPart).text ?? "";
+      if (!partText.trim()) return;
+      // Buffer until we know the assistant's message ID.
+      if (turn.assistantMessageId === null) {
+        turn.pendingReasoningParts.push(part);
+        this.log(`[reasoning-part] buffering part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}…) until assistantMessageId is known`);
+        return;
+      }
+      // Drop user-input reasoning parts (different messageID).
+      if (part.messageID !== turn.assistantMessageId) {
+        this.log(`[reasoning-part] dropping part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}… ≠ assistant ${turn.assistantMessageId.slice(0, 8)}…)`);
+        return;
+      }
+      if (!turn.contextToken) {
+        this.log(`[reasoning-part] no contextToken for part ${part.id.slice(0, 8)}…; dropping`);
+        return;
+      }
+      // Update current state. Subsequent deltas (via
+      // `accumulateReasoningDelta`) will append to `currentReasoningText`
+      // and update timestamps. The thought line is emitted at the next
+      // type change (or at finalize) by `flushCurrentPart`.
+      turn.currentReasoningText = partText;
+      turn.currentReasoningStartMs = turn.reasoningPartTimestamps.get(part.id)?.startMs ?? null;
+      turn.currentReasoningEndMs = turn.reasoningPartTimestamps.get(part.id)?.endMs ?? null;
     }
 
     this.log(`[event] part.updated type=${part.type} partID=${part.id.slice(0, 8)}…`);
     this.armFinalizeDebounce();
+  }
+
+  /**
+   * Build and emit the WeChat message for the part currently being
+   * accumulated on `turn`, then reset the current-state fields so the
+   * next `handlePartUpdated` starts fresh for the new type.
+   *
+   * This is the SOLE place a WeChat message is dispatched under the
+   * type-change-flushing design. The old "boundary flush" pattern
+   * (where `dispatchReasoningPart` and `maybeSendTextPart` each called
+   * `maybeFlushToolSummary` BEFORE sending) is gone — flushing now
+   * happens at the START of a new type, not at the END of the old
+   * one. The two patterns produce the same WeChat order in the common
+   * case; the new one is robust to opencode's specific SSE ordering
+   * (text-end can arrive AFTER tool-input-start, which used to flip
+   * the order to "tool before text").
+   *
+   * Called from three places:
+   *   1. `handlePartUpdated` when `part.type !== turn.currentPartType`
+   *      (new part of a different type just arrived)
+   *   2. `finalizeTurn` at the very end of the turn (so the LAST
+   *      accumulated part of the turn still gets a WeChat line, even
+   *      if the stream just ended on a non-flushing event)
+   *   3. (Implicitly via `maybeFlushToolSummary` for the tool case —
+   *      we call THAT instead of building a tool summary here, because
+   *      tool summaries need to combine consecutive tools per
+   *      `toolCallIdsInLastSummary` semantics.)
+   */
+  private flushCurrentPart(turn: AccumulatedTurn): void {
+    if (!turn.currentPartType || !turn.currentPartID) {
+      // Nothing to flush (start of turn, or already flushed).
+      return;
+    }
+    if (!turn.contextToken) {
+      this.log(`[flush] no contextToken for current part; dropping`);
+      this.resetCurrentPart(turn);
+      return;
+    }
+
+    const partID = turn.currentPartID;
+    const partType = turn.currentPartType;
+
+    try {
+      switch (partType) {
+        case "reasoning": {
+          // Skip if this R has already been sent (e.g. via the legacy
+          // path during incremental migration, or via dedup on SSE
+          // replay). `sentReasoningPartIds` is the dedup set.
+          if (turn.sentReasoningPartIds.has(partID)) break;
+          if (!turn.currentReasoningText.trim()) break;
+
+          const now = Date.now();
+          const startMs = turn.currentReasoningStartMs ?? now;
+          const endMs = turn.currentReasoningEndMs ?? now;
+          const durationMs = Math.max(0, endMs - startMs);
+
+          const { summary } = reasoningSummary(turn.currentReasoningText);
+          const line = formatThoughtHeader(durationMs, summary);
+
+          turn.sentReasoningPartIds.add(partID);
+          this.log(
+            `[reasoning-part] sending summary (${turn.currentReasoningText.length}ch, summary="${summary.length > 30 ? summary.slice(0, 30) + "…" : summary}", ${formatDuration(durationMs)})`
+          );
+          this.onReply(turn.contextToken, line).catch((err) => {
+            this.log(`onReply error for reasoning summary: ${String(err)}`);
+          });
+          break;
+        }
+        case "tool": {
+          // The tool case defers to the existing `maybeFlushToolSummary`
+          // because tool summaries must combine consecutive tools that
+          // share the same current-phase (user-stated rule:
+          // consecutive = combined, separate = individual). The
+          // current tool's callID is in `turn.toolCalls` (tracked by
+          // `trackTool` in `handlePartUpdated`); the dedup set
+          // `toolCallIdsInLastSummary` tracks which ones have already
+          // been emitted. So we just call the existing flusher.
+          this.maybeFlushToolSummary(turn);
+          break;
+        }
+        case "text": {
+          // Skip if this text has already been sent (dedup on SSE replay
+          // or legacy path).
+          if (turn.sentTextPartIds.has(partID)) break;
+          if (!turn.currentText.trim()) break;
+
+          turn.sentTextPartIds.add(partID);
+          this.log(`[text-part] sending part ${partID.slice(0, 8)}… (${turn.currentText.length}ch)`);
+          this.onReply(turn.contextToken, turn.currentText).catch((err) => {
+            this.log(`onReply error for text part: ${String(err)}`);
+          });
+          break;
+        }
+      }
+    } finally {
+      // Always reset, even if the send threw — otherwise the next
+      // `handlePartUpdated` would see a stale `currentPartType` and
+      // think a flush is needed when there isn't.
+      this.resetCurrentPart(turn);
+    }
+  }
+
+  /**
+   * Clear the type-change-flushing state. Called after every flush and
+   * at the end of a turn. Idempotent — safe to call multiple times.
+   */
+  private resetCurrentPart(turn: AccumulatedTurn): void {
+    turn.currentPartType = null;
+    turn.currentPartID = null;
+    turn.currentReasoningText = "";
+    turn.currentReasoningStartMs = null;
+    turn.currentReasoningEndMs = null;
+    turn.currentText = "";
+    turn.currentToolKey = null;
   }
 
   /**
@@ -866,8 +1117,45 @@ export class SessionManager {
     if (turn.pendingTextParts.length === 0) return;
     const pending = turn.pendingTextParts;
     turn.pendingTextParts = [];
+    // Capture in a local so TS narrows the type to `string` (the caller
+    // — `handleMessageUpdated` — has already null-checked, but TS can't
+    // see that across the function boundary into this loop).
+    const assistantMsgId = turn.assistantMessageId;
+    if (!assistantMsgId) {
+      // Defensive: if assistantMessageId was cleared between buffering
+      // and flush (shouldn't happen, but guard anyway), drop everything.
+      this.log(`[text-part] assistantMessageId became null between buffering and flush; dropping ${pending.length} part(s)`);
+      return;
+    }
     for (const part of pending) {
-      this.maybeSendTextPart(turn, part, true);
+      // Drop user-input parts (different messageID).
+      if (part.messageID !== assistantMsgId) {
+        this.log(`[text-part] dropping part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}… ≠ assistant ${assistantMsgId.slice(0, 8)}…)`);
+        continue;
+      }
+      // We set state DIRECTLY here rather than re-dispatching through
+      // `handlePartUpdated`. The buffered part is OLDER in the model
+      // stream than the current (e.g. text "OK" arrived first but was
+      // buffered, then tool webfetch was tracked, then the messageID
+      // arrived). If we re-dispatched, the type-change check in
+      // `handlePartUpdated` would flush the current (the tool) before
+      // the buffered text — putting the tool BEFORE the text in
+      // WeChat output, which violates the natural-order rule (the
+      // text came first in the stream).
+      //
+      // Instead, the buffered part BECOMES the new current. The
+      // existing current (tool/reasoning/whatever is "later" in the
+      // stream) is left in place — it'll be flushed at the next
+      // non-{old-type} event. If the turn ends here with no next
+      // event, the existing current simply stays in toolCalls /
+      // tracking; the user will see it summarized in a later turn's
+      // boundary flush, or not at all (acceptable for the buffering
+      // race edge case — the next turn will re-emit it from the
+      // server's own SSE stream anyway).
+      turn.currentPartType = "text";
+      turn.currentPartID = part.id;
+      turn.currentText = (part as TextPart).text ?? "";
+      turn.finalText = (part as TextPart).text ?? "";
     }
   }
 
@@ -965,12 +1253,37 @@ export class SessionManager {
     if (turn.pendingReasoningParts.length === 0) return;
     const pending = turn.pendingReasoningParts;
     turn.pendingReasoningParts = [];
+    // Capture in a local so TS narrows the type to `string`.
+    const assistantMsgId = turn.assistantMessageId;
+    if (!assistantMsgId) {
+      this.log(`[reasoning-part] assistantMessageId became null between buffering and flush; dropping ${pending.length} part(s)`);
+      return;
+    }
     for (const part of pending) {
-      // Re-dispatch through the main handler. Re-entrancy is safe: the
-      // duplicate-id and empty-text guards will skip already-handled
-      // parts, and the assistantMessageId-null branch will not re-buffer
-      // because it's now set.
-      this.handleReasoningPart(turn, part);
+      // Drop user-input parts (different messageID).
+      if (part.messageID !== assistantMsgId) {
+        this.log(`[reasoning-part] dropping part ${part.id.slice(0, 8)}… (messageID=${part.messageID.slice(0, 8)}… ≠ assistant ${assistantMsgId.slice(0, 8)}…)`);
+        continue;
+      }
+      // Drop empty/whitespace-only reasoning (matches the live
+      // `handlePartUpdated` R-handler behavior).
+      const partText = (part as ReasoningPart).text ?? "";
+      if (!partText.trim()) continue;
+      // Dedup: skip parts that were somehow already sent.
+      if (turn.sentReasoningPartIds.has(part.id)) continue;
+      // Set state DIRECTLY here rather than re-dispatching through
+      // `handlePartUpdated`. Same rationale as `flushPendingTextParts`:
+      // the buffered part is OLDER in the model stream than the
+      // current, so flushing the current on replay would put the
+      // current BEFORE the buffered part in WeChat output (wrong
+      // order). The buffered part becomes the new current; the
+      // existing current stays in place for the next non-{old-type}
+      // event to flush it.
+      turn.currentPartType = "reasoning";
+      turn.currentPartID = part.id;
+      turn.currentReasoningText = partText;
+      turn.currentReasoningStartMs = turn.reasoningPartTimestamps.get(part.id)?.startMs ?? null;
+      turn.currentReasoningEndMs = turn.reasoningPartTimestamps.get(part.id)?.endMs ?? null;
     }
   }
 
@@ -1204,6 +1517,27 @@ export class SessionManager {
     }, TURN_STUCK_TIMEOUT_MS);
   }
 
+  /**
+   * Synchronously finalize the current turn, ignoring the debounce timer.
+   * Intended for tests that want to verify the end-of-turn output without
+   * waiting 500ms for the natural debounce. The test in
+   * `verify-display-commands.mjs` exercises the type-change-flushing
+   * design end-to-end and needs the LAST accumulated part (e.g. the
+   * final text when no further R/tool follows) to be emitted before the
+   * assertions run.
+   *
+   * Production code should NOT call this — the debounce exists so the
+   * server's `session.idle` event has a chance to fire and we can be
+   * sure no more R/tool parts are about to arrive. Force-finalizing would
+   * race against the opencode server's natural close of the message
+   * stream.
+   */
+  flushNowForTest(): void {
+    if (this.currentTurn && this.currentTurn.status === "accumulating") {
+      this.finalizeTurn("finalized");
+    }
+  }
+
   private clearFinalizeTimers(): void {
     if (this.finalizeTimer) {
       clearTimeout(this.finalizeTimer);
@@ -1265,13 +1599,29 @@ export class SessionManager {
       this.cancelTyping?.(contextToken).catch(() => {});
     }
 
+    // Flush the LAST accumulated current part before any fallback. If
+    // the turn ended on a non-flushing event (e.g. a tool call that
+    // never got followed by R/text, or a step-finish), the final
+    // current sits un-flushed otherwise.
+    //
+    // `flushCurrentPart` itself is a no-op if the current was already
+    // flushed (e.g. by a previous type change), so this is safe to call
+    // unconditionally. The reset clears the state so no further
+    // references to `turn.currentPartType` survive past the turn.
+    //
+    // IMPORTANT: capture `currentPartType` BEFORE the flush — the flush
+    // resets it to `null`, which would make the gate below misclassify
+    // the turn as "ended on tool" and wrongly flush the tool summary.
+    const preFlushCurrentType = turn.currentPartType;
+    this.flushCurrentPart(turn);
+
     // Send tool summary as a SEPARATE message when /tool-display on.
     // Two paths can emit it:
-    //   1. `handleReasoningPart` or `maybeSendTextPart` already
-    //      flushed it via `maybeFlushToolSummary` at the first
-    //      non-tool event that arrived after the tools. The
-    //      `!turn.toolSummarySent` guard skips us here so we don't
-    //      send it twice.
+    //   1. `flushCurrentPart` already flushed it when the type changed
+    //      AWAY from tool (handled in the case-"tool" branch of
+    //      `flushCurrentPart`, which delegates to `maybeFlushToolSummary`).
+    //      The `toolCallIdsInLastSummary` set marks those callIDs as
+    //      summarized so this re-flush is a no-op.
     //   2. The turn had tools but NO non-tool event followed
     //      (e.g. the model ended on a tool call, or an error
     //      short-circuited before any text part arrived). In
@@ -1281,7 +1631,22 @@ export class SessionManager {
     // We use `turn.showToolsSnapshot` (not the live `this.showTools`)
     // for the same reason as the `maybeSendTextPart` flush above: a
     // mid-turn toggle must not flip the in-flight turn's display.
-    this.maybeFlushToolSummary(turn);
+    //
+    // The gate on `preFlushCurrentType` (captured above, BEFORE
+    // `flushCurrentPart` reset the state) handles the buffering-race
+    // edge case: a buffered text/reasoning part may have been replayed
+    // AFTER a tool was tracked (text came first in the model stream,
+    // tool came second, replay shifted current from "tool" to
+    // "text"/"reasoning"). In that case the tool is "in flight" and
+    // should be flushed at the next non-tool event — but the turn is
+    // ending, so we leave the tool in `toolCalls` unsummarized. The
+    // user simply won't see a summary for that tool in this turn
+    // (acceptable — the next turn's stream will re-emit it from the
+    // server's own SSE anyway, and the assistantMessageId-race
+    // scenario is rare).
+    if (preFlushCurrentType !== "text" && preFlushCurrentType !== "reasoning") {
+      this.maybeFlushToolSummary(turn);
+    }
 
     // Off-mode reasoning log: when `/thought-display off` was active at
     // turn-start, the user does NOT see reasoning in WeChat — but they

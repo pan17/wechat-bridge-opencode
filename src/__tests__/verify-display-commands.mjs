@@ -1,30 +1,27 @@
 /**
- * scripts/verify-display-commands.mjs
+ * src/__tests__/verify-display-commands.mjs
  *
  * Comprehensive end-to-end verification harness for the
  * /thought-display + /tool-display feature (display-commands plan, Task 7).
  *
- * Runs all 7 acceptance categories from the plan (lines 889-912) against
- * the COMPILED dist/ artifacts. Zero npm deps — only `node:` built-ins.
+ * Runs all 10 acceptance categories from the plan against
+ * the COMPILED dist/ artifacts. Driven by vitest; run via `npm test`
+ * after `npm run build`.
  *
  * Categories:
- *   1. parsers            — 14 cases (7 per parser; mirrors test-parsers.mjs)
- *   2. pureFunctions      — 6 cases (reasoningSummary 3, formatThoughtHeader 2, formatDuration 5)
- *   3. persistence        — 4 cases (round-trip, undefined-field omission,
- *                                    legacy compat, old-shape single-user file)
- *   4. commandIndependence — 1 case (setShowFlags partial update is safe)
- *   5. thoughtRemoval     — 2 cases (parseThoughtDisplayCommand("/thought on") === null;
- *                                    bridgeCommands array does NOT contain "thinking")
- *   6. helpUpdates        — 3 cases (formatHelp contains new sections,
- *                                    formatHelp does NOT contain old "── 思考 ──",
- *                                    formatHelpWithNativeCommands contains new sections)
- *
- * Exit 0 on full pass, 1 on any failure. Prints `PASS: <n>/<n>` summary.
- *
- * Run: `node scripts/verify-display-commands.mjs` (after `npm run build`).
+ *   1. parsers               — 14 cases (7 per parser; mirrors test-parsers.mjs)
+ *   2. pureFunctions         — 6 cases (reasoningSummary, formatThoughtHeader, formatDuration)
+ *   3. persistence           — 4 cases (round-trip, undefined-field omission, legacy compat, old-shape)
+ *   4. commandIndependence   — 1 case (setShowFlags partial update is safe)
+ *   5. reasoningPartDisplay  — 4 cases
+ *   6. toolSummaryOrdering   — 4 cases
+ *   7. chronologicalOrder    — 2 cases
+ *   8. toolTitleDisplay      — 5 cases
+ *   9. thoughtRemoval        — 2 cases (legacy /thought rejected; bridgeCommands omits "thinking")
+ *   10. helpUpdates          — 3 cases
  */
 
-import assert from "node:assert/strict";
+import { test, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -34,57 +31,13 @@ import {
   parseToolDisplayCommand,
   formatHelp,
   formatHelpWithNativeCommands,
-} from "../dist/src/adapter/workspace-cmd.js";
+} from "../../dist/src/adapter/workspace-cmd.js";
 import {
   reasoningSummary,
   formatThoughtHeader,
   formatDuration,
-} from "../dist/src/adapter/thinking-format.js";
-import { SessionManager } from "../dist/src/server/session.js";
-
-let passed = 0;
-let failed = 0;
-const pendingPromises = [];
-
-function test(name, fn) {
-  // AWAIT async tests so their assertions actually run. Without this,
-  // `fn()` returns a Promise that the surrounding try/catch can't
-  // catch, and the test is marked PASS before any assertion executes.
-  // The Promise is tracked in `pendingPromises` so the bottom of the
-  // script can `await Promise.all(...)` before printing the summary
-  // and calling `process.exit`.
-  const result = fn();
-  if (result && typeof result.then === "function") {
-    const p = result.then(
-      () => {
-        passed++;
-        console.log(`  PASS  ${name}`);
-      },
-      (err) => {
-        failed++;
-        const message = err instanceof Error ? err.message : String(err);
-        const stack = err instanceof Error && err.stack ? err.stack.split("\n").slice(1, 3).join(" / ") : "";
-        console.log(`  FAIL  ${name}`);
-        console.log(`        ${message}`);
-        if (stack) console.log(`        ${stack}`);
-      },
-    );
-    pendingPromises.push(p);
-  } else {
-    try {
-      result;
-      passed++;
-      console.log(`  PASS  ${name}`);
-    } catch (err) {
-      failed++;
-      const message = err instanceof Error ? err.message : String(err);
-      const stack = err instanceof Error && err.stack ? err.stack.split("\n").slice(1, 3).join(" / ") : "";
-      console.log(`  FAIL  ${name}`);
-      console.log(`        ${message}`);
-      if (stack) console.log(`        ${stack}`);
-    }
-  }
-}
+} from "../../dist/src/adapter/thinking-format.js";
+import { SessionManager } from "../../dist/src/server/session.js";
 
 // ────────────────────────────────────────────────────────────────────────
 // Category 1: Parser unit checks (Task 2's 14 cases)
@@ -114,7 +67,7 @@ const toolCases = [
 function runParserCase(parserName, parser, c) {
   test(`${parserName}("${c.input}") → ${c.label}`, () => {
     const actual = parser(c.input);
-    assert.deepEqual(actual, c.expected);
+    expect(actual).toEqual(c.expected);
   });
 }
 
@@ -130,51 +83,44 @@ console.log("pureFunctions (6 cases)");
 
 test("reasoningSummary extracts title from **Title**\\n\\nbody pattern", () => {
   const r = reasoningSummary("**Inspecting PR workflow**\n\nLooking at the diff...");
-  assert.equal(r.title, "Inspecting PR workflow");
-  assert.equal(r.body, "Looking at the diff...");
-  assert.equal(r.summary, "Inspecting PR workflow", "summary mirrors the **Title** header");
+  expect(r.title).toBe("Inspecting PR workflow");
+  expect(r.body).toBe("Looking at the diff...");
+  expect(r.summary).toBe("Inspecting PR workflow");
 });
 
 test("reasoningSummary returns null title when no marker; summary falls back to first line", () => {
   const r = reasoningSummary("Just thinking out loud here.");
-  assert.equal(r.title, null);
-  assert.equal(r.body, "Just thinking out loud here.");
-  assert.equal(r.summary, "Just thinking out loud here.",
-    "no-title fallback: summary must use the first line of the body");
+  expect(r.title).toBe(null);
+  expect(r.body).toBe("Just thinking out loud here.");
+  expect(r.summary).toBe("Just thinking out loud here.");
 });
 
 test("reasoningSummary strips [REDACTED] placeholders", () => {
   const r = reasoningSummary("**My plan**\n\n[REDACTED] some secret [REDACTED] more text");
-  assert.equal(r.title, "My plan");
-  assert.equal(r.body, "some secret  more text");
-  assert.ok(!r.body.includes("[REDACTED]"), "body must not contain [REDACTED]");
-  assert.equal(r.summary, "My plan");
+  expect(r.title).toBe("My plan");
+  expect(r.body).toBe("some secret  more text");
+  expect(r.body.includes("[REDACTED]")).toBeFalsy();
+  expect(r.summary).toBe("My plan");
 });
 
 test("formatThoughtHeader includes summary and duration", () => {
-  assert.equal(
-    formatThoughtHeader(2300, "Inspecting PR workflow"),
-    "🧠 Thought · Inspecting PR workflow · 2.3s",
-  );
+  expect(formatThoughtHeader(2300, "Inspecting PR workflow")).toBe("🧠 Thought · Inspecting PR workflow · 2.3s");
 });
 
 test("formatThoughtHeader omits summary segment when summary is empty", () => {
-  assert.equal(formatThoughtHeader(450, ""), "🧠 Thought · 450ms");
+  expect(formatThoughtHeader(450, "")).toBe("🧠 Thought · 450ms");
 });
 
 test("formatThoughtHeader with first-line fallback summary (no **Title** marker)", () => {
-  assert.equal(
-    formatThoughtHeader(187, "Just thinking out loud here."),
-    "🧠 Thought · Just thinking out loud here. · 187ms",
-  );
+  expect(formatThoughtHeader(187, "Just thinking out loud here.")).toBe("🧠 Thought · Just thinking out loud here. · 187ms");
 });
 
 test("formatDuration handles sub-second and multi-second boundaries", () => {
-  assert.equal(formatDuration(450), "450ms");
-  assert.equal(formatDuration(999), "999ms");
-  assert.equal(formatDuration(1000), "1.0s");
-  assert.equal(formatDuration(2345), "2.3s");
-  assert.equal(formatDuration(12700), "12.7s");
+  expect(formatDuration(450)).toBe("450ms");
+  expect(formatDuration(999)).toBe("999ms");
+  expect(formatDuration(1000)).toBe("1.0s");
+  expect(formatDuration(2345)).toBe("2.3s");
+  expect(formatDuration(12700)).toBe("12.7s");
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -243,11 +189,11 @@ test("round-trip preserves both top-level display flags", () => {
     fs.writeFileSync(stateFile, JSON.stringify(initial, null, 2), "utf-8");
 
     const loaded = loadUserState(stateFile);
-    assert.equal(loaded.userId, "u1");
-    assert.equal(loaded.sessionId, "sess-1");
-    assert.equal(loaded.cwd, "C:/work/proj");
-    assert.equal(loaded.showThoughts, true,  "load: showThoughts must be true");
-    assert.equal(loaded.showTools, false,    "load: showTools must be false");
+    expect(loaded.userId).toBe("u1");
+    expect(loaded.sessionId).toBe("sess-1");
+    expect(loaded.cwd).toBe("C:/work/proj");
+    expect(loaded.showThoughts).toBe(true);
+    expect(loaded.showTools).toBe(false);
 
     // Mutate and save
     loaded.showThoughts = false;
@@ -255,8 +201,8 @@ test("round-trip preserves both top-level display flags", () => {
     saveUserState(stateFile, loaded);
 
     const reloaded = loadUserState(stateFile);
-    assert.equal(reloaded.showThoughts, false, "round-trip: showThoughts flipped to false");
-    assert.equal(reloaded.showTools, true,    "round-trip: showTools flipped to true");
+    expect(reloaded.showThoughts).toBe(false);
+    expect(reloaded.showTools).toBe(true);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -278,8 +224,8 @@ test("undefined fields are omitted on save (no clobbering)", () => {
     saveUserState(stateFile, loaded);
 
     const raw = fs.readFileSync(stateFile, "utf-8");
-    assert.ok(!raw.includes('"showThoughts"'), "undefined showThoughts must be omitted from JSON");
-    assert.ok(raw.includes('"showTools"'),     "defined showTools must be in JSON");
+    expect(raw.includes('"showThoughts"')).toBeFalsy();
+    expect(raw.includes('"showTools"')).toBeTruthy();
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -296,11 +242,11 @@ test("legacy v1.1.1 state (no showThoughts/showTools) loads with undefined flags
     }), "utf-8");
 
     const loaded = loadUserState(stateFile);
-    assert.ok(loaded, "legacy state must load");
-    assert.equal(loaded.sessionId, "sess-old");
-    assert.equal(loaded.cwd, "C:/old/proj");
-    assert.equal(loaded.showThoughts, undefined, "legacy: showThoughts must be undefined");
-    assert.equal(loaded.showTools, undefined,    "legacy: showTools must be undefined");
+    expect(loaded).toBeTruthy();
+    expect(loaded.sessionId).toBe("sess-old");
+    expect(loaded.cwd).toBe("C:/old/proj");
+    expect(loaded.showThoughts).toBe(undefined);
+    expect(loaded.showTools).toBe(undefined);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -315,12 +261,12 @@ test("legacy multi-user v1.1.1 state (no showThoughts/showTools) loads with unde
     }), "utf-8");
 
     const loaded = loadUserState(stateFile);
-    assert.ok(loaded, "legacy multi-user state must load");
-    assert.equal(loaded.userId, "u-old");
-    assert.equal(loaded.sessionId, "sess-old");
-    assert.equal(loaded.cwd, "C:/old/proj");
-    assert.equal(loaded.showThoughts, undefined);
-    assert.equal(loaded.showTools, undefined);
+    expect(loaded).toBeTruthy();
+    expect(loaded.userId).toBe("u-old");
+    expect(loaded.sessionId).toBe("sess-old");
+    expect(loaded.cwd).toBe("C:/old/proj");
+    expect(loaded.showThoughts).toBe(undefined);
+    expect(loaded.showTools).toBe(undefined);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -350,24 +296,24 @@ test("setShowFlags({ showThoughts: true }) does NOT clobber showTools", () => {
   const sm = makeSm();
   // Set both flags
   sm["setShowFlags"]({ showThoughts: true, showTools: true });
-  assert.deepEqual(sm["getShowFlags"](), { showThoughts: true, showTools: true });
+  expect(sm["getShowFlags"]()).toEqual({ showThoughts: true, showTools: true });
 
   // Partial update: only flip showThoughts. showTools must remain unchanged.
   sm["setShowFlags"]({ showThoughts: false });
   const after = sm["getShowFlags"]();
-  assert.equal(after.showThoughts, false, "showThoughts must flip to false");
-  assert.equal(after.showTools, true,    "showTools must remain unchanged after partial update");
+  expect(after.showThoughts).toBe(false);
+  expect(after.showTools).toBe(true);
 
   // And the snapshot accessor must agree (no turn active, so it returns live flags)
   const snapshotView = sm["getShowFlagsForTurn"]();
-  assert.deepEqual(snapshotView, { showThoughts: false, showTools: true });
+  expect(snapshotView).toEqual({ showThoughts: false, showTools: true });
 
   // Symmetric case: only flip showTools, showThoughts must remain.
   sm["setShowFlags"]({ showThoughts: true, showTools: false }); // reset
   sm["setShowFlags"]({ showTools: true });
   const after2 = sm["getShowFlags"]();
-  assert.equal(after2.showThoughts, true, "showThoughts must remain after partial showTools update");
-  assert.equal(after2.showTools, true,    "showTools must flip to true");
+  expect(after2.showThoughts).toBe(true);
+  expect(after2.showTools).toBe(true);
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -443,13 +389,11 @@ test("handleReasoningPart in showThoughts=on mode sends the summary line IMMEDIA
   // Pass-through: the summary is sent IMMEDIATELY. The body never
   // appears in WeChat. The summary uses · separators (no colon) and
   // includes the duration.
-  assert.equal(replyCalls.length, 1,
-    `expected 1 onReply call (the summary line); got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.equal(replyCalls[0], "🧠 Thought · Inspecting PR workflow · 1.9s",
-    "the onReply call must be the summary line with · separators (no colon)");
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0]).toBe("🧠 Thought · Inspecting PR workflow · 1.9s");
 
   // And the part must be marked as sent (dedup works).
-  assert.ok(turn.sentReasoningPartIds.has("rp-1"), "part must be added to sentReasoningPartIds after sending");
+  expect(turn.sentReasoningPartIds.has("rp-1")).toBeTruthy();
 });
 
 test("handleReasoningPart uses first-line summary when no **Title** marker (showThoughts=on)", async () => {
@@ -482,9 +426,8 @@ test("handleReasoningPart uses first-line summary when no **Title** marker (show
   await Promise.resolve();
   await Promise.resolve();
 
-  assert.equal(replyCalls.length, 1, `expected 1 onReply call; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.equal(replyCalls[0], "🧠 Thought · Just thinking out loud here. · 1.9s",
-    "without **Title**, the first line of the body becomes the summary");
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0]).toBe("🧠 Thought · Just thinking out loud here. · 1.9s");
 });
 
 test("handleReasoningPart in showThoughts=off mode does NOT call onReply", async () => {
@@ -512,10 +455,8 @@ test("handleReasoningPart in showThoughts=off mode does NOT call onReply", async
   await Promise.resolve();
   await Promise.resolve();
 
-  assert.equal(replyCalls.length, 0,
-    `off-mode: expected 0 onReply calls; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(!turn.sentReasoningPartIds.has("rp-3"),
-    "off-mode: part must NOT be marked as sent (it was never sent)");
+  expect(replyCalls.length).toBe(0);
+  expect(turn.sentReasoningPartIds.has("rp-3")).toBeFalsy();
 });
 
 test("handleReasoningPart drops parts with empty text (no header emitted in either mode)", async () => {
@@ -543,7 +484,7 @@ test("handleReasoningPart drops parts with empty text (no header emitted in eith
   await Promise.resolve();
   await Promise.resolve();
 
-  assert.equal(replyCalls.length, 0, "empty reasoning text must NOT produce a header");
+  expect(replyCalls.length).toBe(0);
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -595,20 +536,16 @@ test("maybeSendTextPart flushes tool summary BEFORE the first text part (showToo
   await Promise.resolve();
 
   // Expect EXACTLY 2 calls in this order: tool summary first, then text.
-  assert.equal(replyCalls.length, 2, `expected 2 onReply calls; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(replyCalls[0].startsWith("🔧 Tools:"),
-    `call #0 must be the tool summary, got: ${replyCalls[0]}`);
-  assert.ok(replyCalls[0].includes("bash") && replyCalls[0].includes("lsp_status"),
-    `tool summary must list both tools; got: ${replyCalls[0]}`);
-  assert.equal(replyCalls[1], textPart.text,
-    `call #1 must be the text reply (in full); got: ${replyCalls[1].slice(0, 60)}…`);
+  expect(replyCalls.length).toBe(2);
+  expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[0].includes("bash") && replyCalls[0].includes("lsp_status")).toBeTruthy();
+  expect(replyCalls[1]).toBe(textPart.text);
 
   // After flushing, all tracked callIDs must be in the "summarized" set
   // so a subsequent flush for the same tools is a no-op.
-  assert.equal(turn.toolCallIdsInLastSummary.size, 2,
-    "both tracked callIDs must be in toolCallIdsInLastSummary after the flush");
-  assert.ok(turn.toolCallIdsInLastSummary.has("call-1"));
-  assert.ok(turn.toolCallIdsInLastSummary.has("call-2"));
+  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
+  expect(turn.toolCallIdsInLastSummary.has("call-1")).toBeTruthy();
+  expect(turn.toolCallIdsInLastSummary.has("call-2")).toBeTruthy();
 });
 
 test("maybeSendTextPart does NOT re-emit tool summary on subsequent text parts", async () => {
@@ -635,11 +572,11 @@ test("maybeSendTextPart does NOT re-emit tool summary on subsequent text parts",
   await Promise.resolve();
 
   // Expect 4 calls total: 1 tool summary + 3 text parts (in order).
-  assert.equal(replyCalls.length, 4, `expected 4 onReply calls; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(replyCalls[0].startsWith("🔧 Tools:"), "first call must be the tool summary");
-  assert.equal(replyCalls[1], "First text chunk.");
-  assert.equal(replyCalls[2], "Second text chunk.");
-  assert.equal(replyCalls[3], "Third text chunk.");
+  expect(replyCalls.length).toBe(4);
+  expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1]).toBe("First text chunk.");
+  expect(replyCalls[2]).toBe("Second text chunk.");
+  expect(replyCalls[3]).toBe("Third text chunk.");
 });
 
 test("maybeSendTextPart does NOT emit tool summary when showTools=off (snapshot)", async () => {
@@ -663,10 +600,9 @@ test("maybeSendTextPart does NOT emit tool summary when showTools=off (snapshot)
   await Promise.resolve();
 
   // Only the text should be sent — the snapshot was off at turn start.
-  assert.equal(replyCalls.length, 1, `expected 1 onReply call; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.equal(replyCalls[0], "Just the text.");
-  assert.equal(turn.toolCallIdsInLastSummary.size, 0,
-    "toolCallIdsInLastSummary must stay empty when snapshot is off (no flush attempt)");
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0]).toBe("Just the text.");
+  expect(turn.toolCallIdsInLastSummary.size).toBe(0);
 });
 
 test("maybeFlushToolSummary is a no-op when there are no tools to summarize", async () => {
@@ -687,9 +623,8 @@ test("maybeFlushToolSummary is a no-op when there are no tools to summarize", as
   await Promise.resolve();
   await Promise.resolve();
 
-  assert.equal(replyCalls.length, 0, "no tools → no tool summary message");
-  assert.equal(turn.toolCallIdsInLastSummary.size, 0,
-    "no tools → toolCallIdsInLastSummary must stay empty");
+  expect(replyCalls.length).toBe(0);
+  expect(turn.toolCallIdsInLastSummary.size).toBe(0);
 });
 
 test("handleReasoningPart flushes tool summary BEFORE the reasoning line (post-tool reasoning)", async () => {
@@ -720,13 +655,10 @@ test("handleReasoningPart flushes tool summary BEFORE the reasoning line (post-t
   await Promise.resolve();
 
   // Expect 2 calls: tool summary first, then reasoning line.
-  assert.equal(replyCalls.length, 2, `expected 2 onReply calls; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(replyCalls[0].startsWith("🔧 Tools:"),
-    `call #0 must be the tool summary, got: ${replyCalls[0]}`);
-  assert.ok(replyCalls[1].startsWith("🧠 Thought ·"),
-    `call #1 must be the reasoning summary, got: ${replyCalls[1]}`);
-  assert.equal(turn.toolCallIdsInLastSummary.size, 2,
-    "both tracked callIDs must be in toolCallIdsInLastSummary after the flush");
+  expect(replyCalls.length).toBe(2);
+  expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
 });
 
 test("finalizeTurn flushes tool summary as fallback when there are tools but NO non-tool event followed", async () => {
@@ -752,11 +684,9 @@ test("finalizeTurn flushes tool summary as fallback when there are tools but NO 
   await Promise.resolve();
   await Promise.resolve();
 
-  assert.equal(replyCalls.length, 1, `expected 1 onReply call; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(replyCalls[0].startsWith("🔧 Tools:"),
-    `finalizeTurn fallback must emit the tool summary; got: ${replyCalls[0]}`);
-  assert.equal(turn.toolCallIdsInLastSummary.size, 2,
-    "all tracked callIDs must be in toolCallIdsInLastSummary after fallback flush");
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -812,29 +742,22 @@ test("user scenario A: R → T*4 → R → Text produces [R, tools, R, text] in 
   ]);
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Expected WeChat order: [R1, T-summary, R2, text]
-  assert.equal(replyCalls.length, 4,
-    `expected 4 onReply calls in order [R1, tools, R2, text]; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
+  expect(replyCalls.length).toBe(4);
 
-  assert.ok(replyCalls[0].startsWith("🧠 Thought ·"),
-    `replyCalls[0] must be the first reasoning summary; got: ${replyCalls[0]}`);
-  assert.ok(replyCalls[0].includes("The user is just testing"),
-    `first reasoning must summarize the first part; got: ${replyCalls[0]}`);
+  expect(replyCalls[0].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[0].includes("The user is just testing")).toBeTruthy();
 
-  assert.ok(replyCalls[1].startsWith("🔧 Tools:"),
-    `replyCalls[1] must be the tool summary; got: ${replyCalls[1]}`);
-  assert.ok(replyCalls[1].includes("bash") && replyCalls[1].includes("lsp_status") &&
-            replyCalls[1].includes("cron_list") && replyCalls[1].includes("glob"),
-    `tool summary must list all 4 tools; got: ${replyCalls[1]}`);
+  expect(replyCalls[1].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1].includes("bash") && replyCalls[1].includes("lsp_status") &&
+            replyCalls[1].includes("cron_list") && replyCalls[1].includes("glob")).toBeTruthy();
 
-  assert.ok(replyCalls[2].startsWith("🧠 Thought ·"),
-    `replyCalls[2] must be the second reasoning summary; got: ${replyCalls[2]}`);
-  assert.ok(replyCalls[2].includes("The user just wants to test"),
-    `second reasoning must summarize the second part; got: ${replyCalls[2]}`);
+  expect(replyCalls[2].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[2].includes("The user just wants to test")).toBeTruthy();
 
-  assert.equal(replyCalls[3], "几个工具测试通过 ✅\n\n| 工具 | 结果 |\n| ... | ... |",
-    `replyCalls[3] must be the final text reply; got: ${replyCalls[3]}`);
+  expect(replyCalls[3]).toBe("几个工具测试通过 ✅\n\n| 工具 | 结果 |\n| ... | ... |");
 });
 
 test("user scenario B: R → T → R → Text 'OK' produces [R, tools, R, 'OK'] in WeChat", async () => {
@@ -864,28 +787,21 @@ test("user scenario B: R → T → R → Text 'OK' produces [R, tools, R, 'OK'] 
   ]);
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Expected WeChat order: [R1, T-summary, R2, "OK"]
-  assert.equal(replyCalls.length, 4,
-    `expected 4 onReply calls in order [R1, tools, R2, "OK"]; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
+  expect(replyCalls.length).toBe(4);
 
-  assert.ok(replyCalls[0].startsWith("🧠 Thought ·"),
-    `replyCalls[0] must be the first reasoning summary; got: ${replyCalls[0]}`);
-  assert.ok(replyCalls[0].includes("The user wants me to reply"),
-    `first reasoning must summarize the first part; got: ${replyCalls[0]}`);
+  expect(replyCalls[0].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[0].includes("The user wants me to reply")).toBeTruthy();
 
-  assert.ok(replyCalls[1].startsWith("🔧 Tools:"),
-    `replyCalls[1] must be the tool summary; got: ${replyCalls[1]}`);
-  assert.ok(replyCalls[1].includes("bash"),
-    `tool summary must list bash; got: ${replyCalls[1]}`);
+  expect(replyCalls[1].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1].includes("bash")).toBeTruthy();
 
-  assert.ok(replyCalls[2].startsWith("🧠 Thought ·"),
-    `replyCalls[2] must be the second reasoning summary; got: ${replyCalls[2]}`);
-  assert.ok(replyCalls[2].includes("First bash command executed"),
-    `second reasoning must summarize the second part; got: ${replyCalls[2]}`);
+  expect(replyCalls[2].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[2].includes("First bash command executed")).toBeTruthy();
 
-  assert.equal(replyCalls[3], "OK",
-    `replyCalls[3] must be the final text reply; got: ${replyCalls[3]}`);
+  expect(replyCalls[3]).toBe("OK");
 });
 
 test("user scenario C: R → T → Text → R → T → Text produces [R, T, Text, R, T, Text] — separate tools get individual summaries", async () => {
@@ -921,28 +837,27 @@ test("user scenario C: R → T → Text → R → T → Text produces [R, T, Tex
   ]);
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Expected WeChat order: [R1, 🔧(T1), TEXT-1, R2, 🔧(T2), TEXT-2]
   // Each separate tool gets its own summary line.
-  assert.equal(replyCalls.length, 6,
-    `expected 6 onReply calls; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
+  expect(replyCalls.length).toBe(6);
 
-  assert.ok(replyCalls[0].startsWith("🧠 Thought ·"), `call #0 must be R1; got: ${replyCalls[0]}`);
-  assert.ok(replyCalls[1].startsWith("🔧 Tools:"), `call #1 must be T1 summary; got: ${replyCalls[1]}`);
-  assert.ok(replyCalls[1].includes("bash"), "T1 summary must list bash");
-  assert.ok(!replyCalls[1].includes("glob"), "T1 summary must NOT list glob (T2 not yet tracked in batch)");
-  assert.equal(replyCalls[2], "TEXT-1", `call #2 must be TEXT-1; got: ${replyCalls[2]}`);
+  expect(replyCalls[0].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[1].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1].includes("bash")).toBeTruthy();
+  expect(replyCalls[1].includes("glob")).toBeFalsy();
+  expect(replyCalls[2]).toBe("TEXT-1");
 
-  assert.ok(replyCalls[3].startsWith("🧠 Thought ·"), `call #3 must be R2; got: ${replyCalls[3]}`);
-  assert.ok(replyCalls[4].startsWith("🔧 Tools:"), `call #4 must be T2 summary; got: ${replyCalls[4]}`);
-  assert.ok(replyCalls[4].includes("glob"), "T2 summary must list glob");
-  assert.ok(!replyCalls[4].includes("bash"), "T2 summary must NOT list bash (already in earlier summary)");
-  assert.equal(replyCalls[5], "TEXT-2", `call #5 must be TEXT-2; got: ${replyCalls[5]}`);
+  expect(replyCalls[3].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[4].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[4].includes("glob")).toBeTruthy();
+  expect(replyCalls[4].includes("bash")).toBeFalsy();
+  expect(replyCalls[5]).toBe("TEXT-2");
 
   // Both tool callIDs must be in the "summarized" set so a re-flush
   // is a no-op.
-  assert.equal(turn.toolCallIdsInLastSummary.size, 2,
-    "both T1 and T2 must be marked as already summarized");
+  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
 });
 
 test("reasoning duration is per-part (NOT cumulative across tools between parts)", async () => {
@@ -1006,26 +921,21 @@ test("reasoning duration is per-part (NOT cumulative across tools between parts)
   });
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Expect: [R1=900ms, 🔧(bash), R2=1.2s] — 3 messages.
-  assert.equal(replyCalls.length, 3,
-    `expected 3 onReply calls; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
+  expect(replyCalls.length).toBe(3);
 
   // R1: ~900ms (per-part duration, not cumulative)
-  assert.ok(replyCalls[0].includes("· 900ms") || replyCalls[0].includes("· 901ms") || replyCalls[0].includes("· 899ms"),
-    `R1 must show ~900ms; got: ${replyCalls[0]}`);
-  assert.ok(!replyCalls[0].includes("21.6s"),
-    `R1 must NOT show the cumulative 21.6s; got: ${replyCalls[0]}`);
+  expect(replyCalls[0].includes("· 900ms") || replyCalls[0].includes("· 901ms") || replyCalls[0].includes("· 899ms")).toBeTruthy();
+  expect(replyCalls[0].includes("21.6s")).toBeFalsy();
 
   // Tool summary
-  assert.ok(replyCalls[1].includes("bash"),
-    `tool summary must list bash; got: ${replyCalls[1]}`);
+  expect(replyCalls[1].includes("bash")).toBeTruthy();
 
   // R2: ~1.2s (per-part duration, NOT 21.6s)
-  assert.ok(replyCalls[2].includes("· 1.2s") || replyCalls[2].includes("· 1.1s") || replyCalls[2].includes("· 1.3s"),
-    `R2 must show ~1.2s per-part; got: ${replyCalls[2]}`);
-  assert.ok(!replyCalls[2].includes("21.6s"),
-    `R2 must NOT show the cumulative 21.6s; got: ${replyCalls[2]}`);
+  expect(replyCalls[2].includes("· 1.2s") || replyCalls[2].includes("· 1.1s") || replyCalls[2].includes("· 1.3s")).toBeTruthy();
+  expect(replyCalls[2].includes("21.6s")).toBeFalsy();
 });
 
 test("consecutive tools get combined: R → T1, T2, T3 → R → Text produces [R, 🔧(T1,T2,T3), R, Text]", async () => {
@@ -1061,17 +971,16 @@ test("consecutive tools get combined: R → T1, T2, T3 → R → Text produces [
   ]);
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Expected: [R1, 🔧(T1,T2,T3), R2, TEXT] — 4 messages.
-  assert.equal(replyCalls.length, 4,
-    `expected 4 onReply calls; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
+  expect(replyCalls.length).toBe(4);
 
-  assert.ok(replyCalls[0].startsWith("🧠 Thought ·"), `call #0 must be R1; got: ${replyCalls[0]}`);
-  assert.ok(replyCalls[1].startsWith("🔧 Tools:"), `call #1 must be the combined tool summary; got: ${replyCalls[1]}`);
-  assert.ok(replyCalls[1].includes("bash") && replyCalls[1].includes("glob") && replyCalls[1].includes("cron"),
-    "combined summary must list all 3 consecutive tools");
-  assert.ok(replyCalls[2].startsWith("🧠 Thought ·"), `call #2 must be R2; got: ${replyCalls[2]}`);
-  assert.equal(replyCalls[3], "TEXT", `call #3 must be TEXT; got: ${replyCalls[3]}`);
+  expect(replyCalls[0].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[1].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1].includes("bash") && replyCalls[1].includes("glob") && replyCalls[1].includes("cron")).toBeTruthy();
+  expect(replyCalls[2].startsWith("🧠 Thought ·")).toBeTruthy();
+  expect(replyCalls[3]).toBe("TEXT");
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1120,10 +1029,8 @@ test("tool summary shows title when state.title is set (webfetch → URL)", asyn
   await Promise.resolve();
 
   const toolLine = replyCalls[0].split("\n").find((l) => l.includes("webfetch"));
-  assert.ok(toolLine && toolLine.includes("https://httpbin.org/get"),
-    `tool line must show the opencode-generated title; got: ${toolLine}`);
-  assert.equal(toolLine, "  ✅ webfetch https://httpbin.org/get",
-    `expected exact format '✅ webfetch <title>'; got: ${JSON.stringify(toolLine)}`);
+  expect(toolLine && toolLine.includes("https://httpbin.org/get")).toBeTruthy();
+  expect(toolLine).toBe("  ✅ webfetch https://httpbin.org/get");
 });
 
 test("tool summary shows just emoji + name when state.title is EMPTY (option B)", async () => {
@@ -1159,8 +1066,7 @@ test("tool summary shows just emoji + name when state.title is EMPTY (option B)"
   await Promise.resolve();
 
   const toolLine = replyCalls[0].split("\n").find((l) => l.includes("webfetch"));
-  assert.equal(toolLine, "  ⏳ webfetch",
-    `no-title tools must show just '⏳ webfetch' (option B); got: ${JSON.stringify(toolLine)}`);
+  expect(toolLine).toBe("  ⏳ webfetch");
 });
 
 test("tool summary shows distinct title for bash (e.g. 'exit 0')", async () => {
@@ -1194,8 +1100,7 @@ test("tool summary shows distinct title for bash (e.g. 'exit 0')", async () => {
   await Promise.resolve();
 
   const toolLine = replyCalls[0].split("\n").find((l) => l.includes("bash"));
-  assert.equal(toolLine, "  ✅ bash exit 0",
-    `bash must show the title; got: ${JSON.stringify(toolLine)}`);
+  expect(toolLine).toBe("  ✅ bash exit 0");
 });
 
 test("tool summary truncates long titles to 80 chars with ellipsis", async () => {
@@ -1232,10 +1137,8 @@ test("tool summary truncates long titles to 80 chars with ellipsis", async () =>
 
   const toolLine = replyCalls[0].split("\n").find((l) => l.includes("bash"));
   // '  ✅ bash ' is 9 chars, then 79 'T's, then '…' = 89 chars total.
-  assert.equal(toolLine.length, 89,
-    `truncated line must be 89 chars (9 prefix + 79 T + 1 ellipsis); got ${toolLine.length}: ${JSON.stringify(toolLine)}`);
-  assert.ok(toolLine.endsWith("…"),
-    `truncated line must end with ellipsis; got: ${JSON.stringify(toolLine)}`);
+  expect(toolLine.length).toBe(89);
+  expect(toolLine.endsWith("…")).toBeTruthy();
 });
 
 test("tool summary: sub-agent (task tool) gets ' (sub-agent)' suffix", async () => {
@@ -1269,8 +1172,7 @@ test("tool summary: sub-agent (task tool) gets ' (sub-agent)' suffix", async () 
   await Promise.resolve();
 
   const toolLine = replyCalls[0].split("\n").find((l) => l.includes("task"));
-  assert.equal(toolLine, "  ✅ task Explore PR #1234 (sub-agent)",
-    `sub-agent line must append ' (sub-agent)' after the title; got: ${JSON.stringify(toolLine)}`);
+  expect(toolLine).toBe("  ✅ task Explore PR #1234 (sub-agent)");
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1282,7 +1184,7 @@ console.log("");
 console.log("thoughtRemoval (2 cases)");
 
 test("parseThoughtDisplayCommand('/thought on') returns null", () => {
-  assert.equal(parseThoughtDisplayCommand("/thought on"), null);
+  expect(parseThoughtDisplayCommand("/thought on")).toBe(null);
 });
 
 test("bridgeCommands array in src/bridge.ts does NOT contain 'thinking'", () => {
@@ -1296,14 +1198,12 @@ test("bridgeCommands array in src/bridge.ts does NOT contain 'thinking'", () => 
   );
   // Locate the bridgeCommands array literal.
   const arrMatch = bridgeSrc.match(/bridgeCommands\s*=\s*\[([\s\S]*?)\];/);
-  assert.ok(arrMatch, "bridgeCommands array literal must be present in src/bridge.ts");
+  expect(arrMatch).toBeTruthy();
   const arrBody = arrMatch[1];
   // Parse the quoted string entries.
   const entries = Array.from(arrBody.matchAll(/"([^"]+)"/g)).map((m) => m[1]);
-  assert.ok(entries.includes("thought-display"),
-    `bridgeCommands must include 'thought-display'; got: ${JSON.stringify(entries)}`);
-  assert.ok(!entries.includes("thinking"),
-    `bridgeCommands must NOT include 'thinking'; got: ${JSON.stringify(entries)}`);
+  expect(entries.includes("thought-display")).toBeTruthy();
+  expect(entries.includes("thinking")).toBeFalsy();
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1316,21 +1216,18 @@ console.log("helpUpdates (3 cases)");
 
 test("formatHelp contains '── 思考显示 ──' section header", () => {
   const help = formatHelp();
-  assert.ok(help.includes("── 思考显示 ──"),
-    `formatHelp must contain '── 思考显示 ──'; got first 200 chars: ${help.slice(0, 200)}`);
+  expect(help.includes("── 思考显示 ──")).toBeTruthy();
 });
 
 test("formatHelp contains '── 工具显示 ──' section header", () => {
   const help = formatHelp();
-  assert.ok(help.includes("── 工具显示 ──"),
-    `formatHelp must contain '── 工具显示 ──'`);
+  expect(help.includes("── 工具显示 ──")).toBeTruthy();
 });
 
 test("formatHelp does NOT contain legacy '── 思考 ──' (exact match, no suffix)", () => {
   const help = formatHelp();
   // The legacy section header was exactly "── 思考 ──" with no "显示" suffix.
-  assert.ok(!help.includes("── 思考 ──"),
-    `formatHelp must NOT contain legacy '── 思考 ──'`);
+  expect(help.includes("── 思考 ──")).toBeFalsy();
 });
 
 // Bonus: formatHelpWithNativeCommands must also reflect the update so the
@@ -1338,12 +1235,9 @@ test("formatHelp does NOT contain legacy '── 思考 ──' (exact match, no
 // formatHelp) also shows the new sections.
 test("formatHelpWithNativeCommands contains both new sections", () => {
   const help = formatHelpWithNativeCommands([]);
-  assert.ok(help.includes("── 思考显示 ──"),
-    `formatHelpWithNativeCommands must contain '── 思考显示 ──'`);
-  assert.ok(help.includes("── 工具显示 ──"),
-    `formatHelpWithNativeCommands must contain '── 工具显示 ──'`);
-  assert.ok(!help.includes("── 思考 ──"),
-    `formatHelpWithNativeCommands must NOT contain legacy '── 思考 ──'`);
+  expect(help.includes("── 思考显示 ──")).toBeTruthy();
+  expect(help.includes("── 工具显示 ──")).toBeTruthy();
+  expect(help.includes("── 思考 ──")).toBeFalsy();
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1379,13 +1273,12 @@ test("tool title derived from glob input when state.title is missing", async () 
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   const summaryCall = replyCalls.find((m) => m.startsWith("🔧 Tools:"));
-  assert.ok(summaryCall, `expected a 🔧 Tools summary; got: ${JSON.stringify(replyCalls)}`);
-  assert.ok(summaryCall.includes("**/*.ts"),
-    `summary should include derived pattern; got: ${summaryCall}`);
-  assert.ok(summaryCall.includes("glob"),
-    `summary should include tool name; got: ${summaryCall}`);
+  expect(summaryCall).toBeTruthy();
+  expect(summaryCall.includes("**/*.ts")).toBeTruthy();
+  expect(summaryCall.includes("glob")).toBeTruthy();
 });
 
 test("tool title derived from bash input (command truncated to 60 chars)", async () => {
@@ -1412,17 +1305,15 @@ test("tool title derived from bash input (command truncated to 60 chars)", async
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   const summaryCall = replyCalls.find((m) => m.startsWith("🔧 Tools:"));
-  assert.ok(summaryCall, `expected a 🔧 Tools summary; got: ${JSON.stringify(replyCalls)}`);
+  expect(summaryCall).toBeTruthy();
   // The derived title should contain the start of the command and the ellipsis marker.
-  assert.ok(summaryCall.includes("echo xxx"),
-    `summary should include the start of the long command; got: ${summaryCall}`);
-  assert.ok(summaryCall.includes("…"),
-    `summary should truncate long commands with ellipsis; got: ${summaryCall}`);
+  expect(summaryCall.includes("echo xxx")).toBeTruthy();
+  expect(summaryCall.includes("…")).toBeTruthy();
   // And it must NOT include the full 80-char x run (that would mean we forgot to truncate).
-  assert.ok(!summaryCall.includes("x".repeat(80)),
-    `summary must truncate the 80-char run; got: ${summaryCall}`);
+  expect(summaryCall.includes("x".repeat(80))).toBeFalsy();
 });
 
 test("tool title derived from webfetch url", async () => {
@@ -1448,13 +1339,12 @@ test("tool title derived from webfetch url", async () => {
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   const summaryCall = replyCalls.find((m) => m.startsWith("🔧 Tools:"));
-  assert.ok(summaryCall, `expected a 🔧 Tools summary; got: ${JSON.stringify(replyCalls)}`);
-  assert.ok(summaryCall.includes("https://example.com/docs"),
-    `summary should include the url; got: ${summaryCall}`);
-  assert.ok(summaryCall.includes("⏳"),
-    `running tool should still be ⏳ in summary; got: ${summaryCall}`);
+  expect(summaryCall).toBeTruthy();
+  expect(summaryCall.includes("https://example.com/docs")).toBeTruthy();
+  expect(summaryCall.includes("⏳")).toBeTruthy();
 });
 
 test("state.title (when present) takes priority over derived input title", async () => {
@@ -1481,14 +1371,13 @@ test("state.title (when present) takes priority over derived input title", async
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   const summaryCall = replyCalls.find((m) => m.startsWith("🔧 Tools:"));
-  assert.ok(summaryCall, `expected a 🔧 Tools summary; got: ${JSON.stringify(replyCalls)}`);
-  assert.ok(summaryCall.includes("Finding TypeScript files"),
-    `summary should use the LLM-supplied title; got: ${summaryCall}`);
+  expect(summaryCall).toBeTruthy();
+  expect(summaryCall.includes("Finding TypeScript files")).toBeTruthy();
   // The raw pattern should NOT appear in the summary if the title was used.
-  assert.ok(!summaryCall.includes("**/*.ts"),
-    `summary must NOT fall back to input when title is present; got: ${summaryCall}`);
+  expect(summaryCall.includes("**/*.ts")).toBeFalsy();
 });
 
 test("tool summary still works when tool has neither title nor input (just tool name)", async () => {
@@ -1514,14 +1403,13 @@ test("tool summary still works when tool has neither title nor input (just tool 
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   const summaryCall = replyCalls.find((m) => m.startsWith("🔧 Tools:"));
-  assert.ok(summaryCall, `expected a 🔧 Tools summary; got: ${JSON.stringify(replyCalls)}`);
+  expect(summaryCall).toBeTruthy();
   // Should still render the line — just the tool name + status emoji, no title slot.
-  assert.ok(summaryCall.includes("mystery"),
-    `summary should at least show the tool name; got: ${summaryCall}`);
-  assert.ok(summaryCall.includes("✅"),
-    `summary should show completion status; got: ${summaryCall}`);
+  expect(summaryCall.includes("mystery")).toBeTruthy();
+  expect(summaryCall.includes("✅")).toBeTruthy();
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1565,12 +1453,12 @@ test("reasoning part arriving before assistantMessageId is buffered and flushed 
       text: "**Planning the first step**\n\nThis is the body the user never sees in WeChat." },
   ]);
 
-  for (let i = 0; i < 5; i++) await Promise.resolve();
   // Nothing should have been sent yet — the part is buffered.
-  assert.equal(replyCalls.length, 0,
-    `reasoning part must be buffered, not sent; got: ${JSON.stringify(replyCalls)}`);
-  assert.equal(turn.pendingReasoningParts.length, 1,
-    "the reasoning part must be sitting in pendingReasoningParts");
+  // (We do NOT call flushNowForTest here: that would run finalizeTurn
+  // which drops the buffered part as a "user-input echo" before the
+  // assistant message ID is even known.)
+  expect(replyCalls.length).toBe(0);
+  expect(turn.pendingReasoningParts.length).toBe(1);
 
   // Patch the buffered part's messageID so it matches the now-known
   // ID. (In a real scenario the server would have re-delivered the
@@ -1589,14 +1477,12 @@ test("reasoning part arriving before assistantMessageId is buffered and flushed 
   });
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Now the reasoning summary should have been sent.
-  assert.equal(replyCalls.length, 1,
-    `expected 1 onReply call after flush; got: ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(replyCalls[0].startsWith("🧠 Thought · "),
-    `expected thought header; got: ${replyCalls[0]}`);
-  assert.equal(turn.pendingReasoningParts.length, 0,
-    "the buffered reasoning part must be drained after flush");
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0].startsWith("🧠 Thought · ")).toBeTruthy();
+  expect(turn.pendingReasoningParts.length).toBe(0);
 });
 
 test("buffered reasoning part with non-matching messageID is dropped (user-input echo)", async () => {
@@ -1621,9 +1507,10 @@ test("buffered reasoning part with non-matching messageID is dropped (user-input
       text: "**User echo reasoning**\n\nShould never be sent to WeChat." },
   ]);
 
-  for (let i = 0; i < 5; i++) await Promise.resolve();
-  assert.equal(turn.pendingReasoningParts.length, 1,
-    "the reasoning part must be buffered");
+  // (We do NOT call flushNowForTest here — that would run
+  // finalizeTurn which drops the buffered part before the assistant
+  // message ID is even known.)
+  expect(turn.pendingReasoningParts.length).toBe(1);
 
   // Assistant message arrives with a DIFFERENT messageID.
   sm["handleMessageUpdated"]({
@@ -1635,13 +1522,12 @@ test("buffered reasoning part with non-matching messageID is dropped (user-input
   });
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // The buffered part's messageID ("user-echo") does NOT match the
   // assistant's ("am-1"), so it must be dropped, not sent.
-  assert.equal(replyCalls.length, 0,
-    `non-matching reasoning part must be dropped at flush; got: ${JSON.stringify(replyCalls)}`);
-  assert.equal(turn.pendingReasoningParts.length, 0,
-    "the buffered part must be drained even when dropped");
+  expect(replyCalls.length).toBe(0);
+  expect(turn.pendingReasoningParts.length).toBe(0);
 });
 
 test("buffered text part does NOT flush tools tracked after the buffer (preserves natural order)", async () => {
@@ -1675,7 +1561,7 @@ test("buffered text part does NOT flush tools tracked after the buffer (preserve
     { id: "tp-1", sessionID: turn.sessionId, messageID: "am-not-yet-known", type: "text", text: "OK" },
   ]);
   for (let i = 0; i < 3; i++) await Promise.resolve();
-  assert.equal(turn.pendingTextParts.length, 1, "text part must be buffered");
+  expect(turn.pendingTextParts.length).toBe(1);
 
   // 2. Tool webfetch is tracked AFTER the text part was buffered.
   driveStream(sm, turn, [
@@ -1702,18 +1588,16 @@ test("buffered text part does NOT flush tools tracked after the buffer (preserve
   });
 
   for (let i = 0; i < 5; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // The text "OK" was sent. The webfetch tool summary was NOT sent
   // (it stays in toolCalls, waiting for the next non-tool boundary).
-  assert.equal(replyCalls.length, 1,
-    `expected 1 onReply (the text "OK"); got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.equal(replyCalls[0], "OK",
-    `text part must be sent; got: ${replyCalls[0]}`);
-  assert.equal(turn.toolCallIdsInLastSummary.size, 0,
-    "no tool summary may be flushed ahead of the buffered text part");
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0]).toBe("OK");
+  expect(turn.toolCallIdsInLastSummary.size).toBe(0);
   // The tool is still tracked, awaiting flush at the next non-tool boundary.
-  assert.equal(turn.toolCalls.size, 1, "the webfetch tool is still tracked");
-  assert.ok(turn.toolCalls.has("w1"), "webfetch is still in toolCalls");
+  expect(turn.toolCalls.size).toBe(1);
+  expect(turn.toolCalls.has("w1")).toBeTruthy();
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1756,22 +1640,18 @@ test("showThoughts=on with NO reasoning parts in the turn: zero 🧠 lines, only
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Exactly 2 lines: the tool summary, then the text. NO thought line.
-  assert.equal(replyCalls.length, 2,
-    `expected 2 lines (tool summary + text); got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(replyCalls[0].startsWith("🔧 Tools:"),
-    `first line must be tool summary; got: ${replyCalls[0]}`);
-  assert.equal(replyCalls[1], "Done.",
-    `second line must be the text; got: ${replyCalls[1]}`);
+  expect(replyCalls.length).toBe(2);
+  expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1]).toBe("Done.");
   // Belt-and-suspenders: no `🧠 Thought` anywhere in the output.
   for (const line of replyCalls) {
-    assert.ok(!line.includes("🧠 Thought"),
-      `output must not contain any thought line; got: ${line}`);
+    expect(line.includes("🧠 Thought")).toBeFalsy();
   }
   // Off-mode metric sanity: no reasoning char count since no parts arrived.
-  assert.equal(turn.reasoningCharCount, 0,
-    "no reasoning parts = no chars accumulated");
+  expect(turn.reasoningCharCount).toBe(0);
 });
 
 test("reasoning part with empty text is dropped (no header emitted in showThoughts=on)", async () => {
@@ -1797,21 +1677,18 @@ test("reasoning part with empty text is dropped (no header emitted in showThough
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Only the text part is sent. Empty reasoning is silently dropped.
-  assert.equal(replyCalls.length, 1,
-    `expected 1 line (the text); got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.equal(replyCalls[0], "hello",
-    `text must be sent; got: ${replyCalls[0]}`);
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0]).toBe("hello");
   // No `🧠 Thought` line at all (empty reasoning must not produce a header).
   for (const line of replyCalls) {
-    assert.ok(!line.includes("🧠 Thought"),
-      `empty reasoning must not produce a thought header; got: ${line}`);
+    expect(line.includes("🧠 Thought")).toBeFalsy();
   }
   // The empty part must NOT be added to sentReasoningPartIds (so a
   // later non-empty part with the same id would still be sent).
-  assert.ok(!turn.sentReasoningPartIds.has("rp-empty"),
-    "empty reasoning must not be added to sentReasoningPartIds");
+  expect(turn.sentReasoningPartIds.has("rp-empty")).toBeFalsy();
 });
 
 test("reasoning part with whitespace-only text is dropped", async () => {
@@ -1837,10 +1714,10 @@ test("reasoning part with whitespace-only text is dropped", async () => {
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
-  assert.equal(replyCalls.length, 1,
-    `whitespace reasoning must be dropped; got: ${JSON.stringify(replyCalls)}`);
-  assert.equal(replyCalls[0], "ok");
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0]).toBe("ok");
 });
 
 test("duplicate reasoning part (same id, SSE replay) is sent only ONCE", async () => {
@@ -1866,13 +1743,12 @@ test("duplicate reasoning part (same id, SSE replay) is sent only ONCE", async (
   driveStream(sm, turn, [reasoningPart, reasoningPart, reasoningPart]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Exactly one thought line despite 3 deliveries.
   const thoughtLines = replyCalls.filter((m) => m.startsWith("🧠 Thought · "));
-  assert.equal(thoughtLines.length, 1,
-    `reasoning must be sent exactly once; got ${thoughtLines.length}: ${JSON.stringify(thoughtLines)}`);
-  assert.ok(thoughtLines[0].includes("Same part delivered twice"),
-    `summary should come from the part's body; got: ${thoughtLines[0]}`);
+  expect(thoughtLines.length).toBe(1);
+  expect(thoughtLines[0].includes("Same part delivered twice")).toBeTruthy();
 });
 
 test("showThoughts=off with no reasoning: tool summary still flushes at text boundary", async () => {
@@ -1900,25 +1776,15 @@ test("showThoughts=off with no reasoning: tool summary still flushes at text bou
   ]);
 
   for (let i = 0; i < 10; i++) await Promise.resolve();
+    sm["flushNowForTest"]();
 
   // Tool summary + text, no thought line.
-  assert.equal(replyCalls.length, 2,
-    `expected tool summary + text; got ${replyCalls.length}: ${JSON.stringify(replyCalls)}`);
-  assert.ok(replyCalls[0].startsWith("🔧 Tools:"),
-    `tool summary must be flushed at text boundary even in showThoughts=off; got: ${replyCalls[0]}`);
-  assert.equal(replyCalls[1], "All done.");
+  expect(replyCalls.length).toBe(2);
+  expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1]).toBe("All done.");
 });
 
 // ────────────────────────────────────────────────────────────────────────
-// Summary — wait for all async tests to settle before printing/exiting
+// vitest handles test discovery, async awaiting, pass/fail reporting,
+// and process exit. Nothing to do at the bottom of this file.
 // ────────────────────────────────────────────────────────────────────────
-await Promise.all(pendingPromises);
-const total = passed + failed;
-console.log("");
-if (failed === 0) {
-  console.log(`PASS: ${passed}/${total}`);
-  process.exit(0);
-} else {
-  console.log(`FAIL: ${passed}/${total} passed, ${failed} failed`);
-  process.exit(1);
-}

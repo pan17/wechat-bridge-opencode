@@ -18,9 +18,11 @@ npm run build        # Compile TypeScript → dist/
 npm run dev          # Watch mode: tsc --watch
 npm start            # Run compiled CLI: node dist/bin/wechat-opencode.js
 npm run prepack      # Runs build before npm publish
+npm test             # Run vitest unit tests (97 tests across 5 files)
+npm run test:watch   # Vitest in watch mode
 ```
 
-**No test framework or linter is configured.** This is a lean project with only `tsc` for builds.
+**Tests:** Vitest 4.1.8 unit tests live in `src/__tests__/` (97 tests across 5 files). No linter is configured.
 
 ### Running the CLI locally
 
@@ -43,6 +45,7 @@ src/vendor.d.ts                 — Type declarations for untyped npm packages
 src/server/
   client.ts                     — OpenCode Server HTTP client (fetch wrapper)
   session.ts                    — Simplified SessionManager (no subprocess, just HTTP)
+src/__tests__/                  — Vitest unit tests (5 files, 97 tests)
 src/adapter/
   inbound.ts                    — WeChat message → MessagePart[] (text, image, file)
   outbound.ts                   — Server reply → WeChat text (formatting, splitting)
