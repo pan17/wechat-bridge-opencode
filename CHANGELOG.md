@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-06-14
+
+### Added
+- `--cat-girl` CLI flag: one-time install of the bundled cat-girl agent (`猫娘咪咪`) to `~/.config/opencode/agents/` on first run; omit on subsequent runs
+- `presets/cat-girl.md` — bundled cat-girl agent shipped with the package
+
+### Removed
+- `--idle-timeout` CLI flag and all related dead code (was deprecated and non-functional — session idle is managed by OpenCode Server)
+
 ### Changed
+- README restructured: merged install/usage sections, reorganized feature list, added cat-girl documentation (zh + en)
 - **Default for `/thought-display` and `/tool-display` flipped from OFF to ON.** First-time installs now see 🧠 Thought summaries and 🔧 Tool summaries in WeChat without having to discover and toggle the commands. Users who already toggled either flag keep their saved choice (`~/.wechat-bridge-state.json`); users who never toggled inherit the new defaults on next bridge start. AGENTS.md / README.md / README.en.md / `/help` output all reflect the new default.
 - Deprecated `config.agent.showThoughts` / `config.agent.showTools` defaults flipped to `true` for consistency (these fields are no longer consulted at runtime — only the `/thought-display` / `/tool-display` state path drives display).
 

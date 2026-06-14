@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-bridge-opencode` v1.3.0 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-bridge-opencode` v1.3.1 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
