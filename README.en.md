@@ -6,27 +6,27 @@
 ![npm downloads](https://img.shields.io/npm/dm/wechat-bridge-opencode?style=flat-square&logo=npm)
 ![License](https://img.shields.io/github/license/pan17/wechat-opencode?style=flat-square)
 
-Bridge WeChat direct messages to OpenCode Server (HTTP API), with full bidirectional support for text, images, files, audio, and video.
+Bridge WeChat direct messages to OpenCode, with full bidirectional support for text, images, files, audio, and video. The goal is to recreate the OpenCode TUI and Desktop experience inside WeChat.
 
 <img src="./resources/发送.jpg" alt="Send" width="49%" /> <img src="./resources/接收.jpg" alt="Receive" width="49%" />
 
 ## Features
 
-- **Text** — Send/receive messages between WeChat and OpenCode
-- **Images** — Send/receive images with WeChat CDN support
-- **Files** — Send/receive files of any type
-- **Audio/Video** — Full audio and video message support
+- **Send** — Text, images, files, audio/video sent from WeChat to the OpenCode agent; media is auto-downloaded to `~/.wechat-bridge-opencode/tempfile/` and forwarded as a file-path attachment
+- **Receive** — Agent replies are forwarded to WeChat; the `send-wechat` tool lets the agent proactively push text, files, and images to WeChat
+- **WeChat slash commands** — `/help`, `/workspace`, `/session`, `/agent`, `/model`, `/stop` and 10+ more commands are consumed by the bridge, never forwarded to the agent
+- **OpenCode slash commands** — Any `/xxx` the bridge doesn't recognize (e.g. `/init`, `/compact`) is forwarded to the agent as plain text, triggering OpenCode's built-in slash commands
 - **Permission cards** — Surface OpenCode's `permission.asked` events to WeChat as `once` / `always` / `reject` cards; `/auto-permission` toggles auto-accept mode; 30-min soft timeout
 - **QR Login** — Terminal QR code rendering for WeChat login
 - **OpenCode Server** — HTTP API based, no ACP subprocess required
-- **Daemon Mode** — Run in background with `--daemon`
-- **send-wechat Tool** — Agents can send text, files, and images back to WeChat
+- **Cat-girl agent** — Built-in cat-girl agent; add `--cat-girl` on first run to install it globally (one-time only, omit on subsequent runs), then use `/agent switch cat-girl` in WeChat to start chatting
 
-## Install
+## Installation & Usage
 
-### Method 1: One-click run (Recommended)
-No installation required, `npx` will download and run automatically:
+### Method 1: npx (no install, recommended)
+Run directly in your project directory:
 ```bash
+cd /path/to/your/project
 npx wechat-bridge-opencode
 ```
 
@@ -34,17 +34,10 @@ npx wechat-bridge-opencode
 ```bash
 npm install -g wechat-bridge-opencode
 ```
-After installation, use the shorthand command:
-```bash
-wbo
-```
-
-## Usage
+After installation, use the shorthand command from any project directory:
 ```bash
 cd /path/to/your/project
 wbo
-# or use npx directly:
-# npx wechat-bridge-opencode
 ```
 
 First run will:
@@ -66,7 +59,7 @@ First run will:
 | `--login` | Force re-login |
 | `--daemon` | Run in background |
 | `--config <file>` | JSON config file |
-| `--idle-timeout <min>` | Session idle timeout (default: 0 = unlimited) |
+| `--cat-girl` | Install cat-girl agent to `~/.config/opencode/agents/` on first run (one-time, omit afterwards) |
 
 **External server authentication**
 

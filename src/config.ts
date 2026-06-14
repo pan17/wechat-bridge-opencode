@@ -78,10 +78,6 @@ export interface WeChatOpencodeConfig {
   };
   /** @deprecated Agent presets are no longer used. */
   agents: Record<string, AgentPreset>;
-  /** @deprecated Session idle timeout is managed by the server. */
-  session: {
-    idleTimeoutMs: number;
-  };
   daemon: {
     enabled: boolean;
     logFile: string;
@@ -122,9 +118,6 @@ export function defaultConfig(): WeChatOpencodeConfig {
       showTools: true,
     },
     agents: { ...BUILT_IN_AGENTS },
-    session: {
-      idleTimeoutMs: 0, // disabled by default
-    },
     daemon: {
       enabled: false,
       logFile: path.join(storageDir, "wechat-opencode.log"),

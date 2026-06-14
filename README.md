@@ -6,28 +6,28 @@
 ![npm downloads](https://img.shields.io/npm/dm/wechat-bridge-opencode?style=flat-square&logo=npm)
 ![License](https://img.shields.io/github/license/pan17/wechat-opencode?style=flat-square)
 
-将微信私聊消息桥接到 OpenCode Server（HTTP API），支持文本、图片、文件、音视频的双向传输。
+将微信私聊消息桥接到 OpenCode，支持文本、图片、文件、音视频的双向传输。目标是在微信端还原 OpenCode TUI 和 Desktop 的体验。
 
 <img src="./resources/发送.jpg" alt="发送" width="49%" /> <img src="./resources/接收.jpg" alt="接收" width="49%" />
 
 ## 功能
 
-- **文本消息** — 微信与 OpenCode 之间的双向文本传输
-- **图片传输** — 支持发送/接收图片，支持微信 CDN 下载
-- **文件传输** — 支持任意类型文件收发
-- **音视频传输** — 完整的音频和视频消息支持
+- **发送** — 文本、图片、文件、音视频从微信发送给 OpenCode agent；媒体自动下载到 `~/.wechat-bridge-opencode/tempfile/`，本地路径作为附件发给 agent
+- **接收** — OpenCode agent 回复文本到微信，或通过 `send-wechat` 工具主动推送文字、文件、图片到微信
+- **微信 slash 命令** — `/help`、`/workspace`、`/session`、`/agent`、`/model`、`/stop` 等 16+ 条命令由 bridge 直接处理，不进入 agent
+- **OpenCode slash 命令** — bridge 不识别的 `/xxx`（如 `/init`、`/compact`）自动作为文本转发给 agent，触发 OpenCode 内置 slash 命令
 - **LLM 问答支持** — 转发 OpenCode `question` 工具的提问到微信，支持选项 / 多选 / 自定义答案；30 分钟软超时自动 reject
 - **工具权限审批** — WeChat 弹权限卡片，支持 `once` / `always` / `reject` 三选一；`/auto-permission` 可切换自动接收模式；30 分钟软超时自动 reject
 - **二维码登录** — 终端渲染二维码，扫码登录微信
 - **OpenCode Server** — 基于 HTTP API，不再需要 ACP 子进程
-- **后台模式** — 使用 `--daemon` 参数后台运行
-- **send-wechat 工具** — Agent 可直接发送文字、文件、图片到微信
+- **猫娘咪咪** — 开箱即送，首次运行加 `--cat-girl` 自动安装到全局 agents 目录（一次安装永久生效，后续无需再加），微信端 `/agent switch cat-girl` 即可对话
 
-## 安装
+## 安装与使用
 
-### 方式一：一键运行（推荐）
-无需安装，`npx` 会自动下载并运行：
+### 方式一：npx（无需安装，推荐）
+在项目目录直接运行即可：
 ```bash
+cd /path/to/your/project
 npx wechat-bridge-opencode
 ```
 
@@ -35,17 +35,10 @@ npx wechat-bridge-opencode
 ```bash
 npm install -g wechat-bridge-opencode
 ```
-安装完成后，可使用简写命令：
-```bash
-wbo
-```
-
-## 使用
+安装完成后可在任意项目目录使用简写命令：
 ```bash
 cd /path/to/your/project
 wbo
-# 或直接使用 npx：
-# npx wechat-bridge-opencode
 ```
 
 首次运行会：
@@ -67,7 +60,7 @@ wbo
 | `--login` | 强制重新登录 |
 | `--daemon` | 后台运行 |
 | `--config <文件>` | JSON 配置文件 |
-| `--idle-timeout <分钟>` | 会话空闲超时（默认 0 = 无限） |
+| `--cat-girl` | 首次运行安装猫娘咪咪到 `~/.config/opencode/agents/`（一次安装，后续无需再加） |
 
 **外部 Server 认证**
 

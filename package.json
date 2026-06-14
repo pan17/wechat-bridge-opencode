@@ -5,6 +5,7 @@
   "type": "module",
   "files": [
     "dist/",
+    "presets/",
     ".opencode/tools/send-wechat.ts",
     "scripts/install-tool.mjs",
     "README.md",

@@ -18,6 +18,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import os from "node:os";
 import qrcodeTerminal from "qrcode-terminal";
 import { WeChatOpencodeBridge } from "../src/bridge.js";
 import { defaultConfig } from "../src/config.js";
@@ -41,7 +43,7 @@ Options:
   --login                 Force re-login (new QR code)
   --daemon                Run in background after login
   --config <file>         Config file path (JSON)
-  --idle-timeout <m>      Session idle timeout in minutes (default: 1440)
+  --cat-girl              Install cat-girl agent to ~/.config/opencode/agents/
   -v, --verbose           Verbose logging
   -h, --help              Show this help
 
@@ -61,13 +63,14 @@ function parseArgs(argv: string[]): {
   forceLogin: boolean;
   daemon: boolean;
   configFile?: string;
-  idleTimeout?: number;
+  catGirl: boolean;
   verbose: boolean;
   help: boolean;
 } {
   const result = {
     forceLogin: false,
     daemon: false,
+    catGirl: false,
     verbose: false,
     help: false,
   } as ReturnType<typeof parseArgs>;
@@ -105,11 +108,11 @@ function parseArgs(argv: string[]): {
       case "--daemon":
         result.daemon = true;
         break;
+      case "--cat-girl":
+        result.catGirl = true;
+        break;
       case "--config":
         result.configFile = args[++i];
-        break;
-      case "--idle-timeout":
-        result.idleTimeout = parseInt(args[++i], 10);
         break;
       case "-v":
       case "--verbose":
@@ -368,6 +371,24 @@ function renderQrInTerminal(url: string): void {
   });
 }
 
+// ─── Cat-girl agent install ───
+
+function installCatGirlAgent(): void {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const sourceFile = path.resolve(__dirname, "../../presets/cat-girl.md");
+  const targetDir = path.join(os.homedir(), ".config", "opencode", "agents");
+  const targetFile = path.join(targetDir, "cat-girl.md");
+
+  if (!fs.existsSync(sourceFile)) {
+    console.error(`Error: cat-girl preset not found at ${sourceFile}`);
+    process.exit(1);
+  }
+
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.copyFileSync(sourceFile, targetFile);
+  console.log(`Installed cat-girl agent to ${targetFile}`);
+}
+
 // ─── Main ───
 
 async function main(): Promise<void> {
@@ -410,9 +431,6 @@ async function main(): Promise<void> {
   if (args.serverUsername !== undefined) config.server.username = args.serverUsername;
   if (args.serverPassword !== undefined) config.server.password = args.serverPassword;
   if (args.serverToken !== undefined) config.server.token = args.serverToken;
-  if (args.idleTimeout !== undefined) {
-    config.session.idleTimeoutMs = args.idleTimeout * 60_000;
-  }
   config.daemon.enabled = args.daemon;
 
   // Validate auth configuration. Basic auth requires BOTH fields — a
@@ -444,6 +462,11 @@ async function main(): Promise<void> {
   if (args.daemon && !process.env.WECHAT_OPENCODE_DAEMON) {
     daemonize(config);
     return;
+  }
+
+  // Install cat-girl agent before starting opencode serve (must be picked up at startup).
+  if (args.catGirl) {
+    installCatGirlAgent();
   }
 
   // Start opencode serve sidecar unless an external server URL was given.
