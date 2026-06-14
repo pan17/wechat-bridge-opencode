@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-bridge-opencode` v1.3.1 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-bridge-opencode` v1.3.2 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -165,7 +165,7 @@ src/weixin/
 |---------|-------------|
 | `/workspace list` | List all workspaces sorted by recent activity, numbered |
 | `/workspace status` | Show current workspace directory |
-| `/workspace switch <path>` | Switch to directory by path |
+| `/workspace switch <path>` | Switch to directory by path; resumes the most recent session in that workspace (creates a new one if none exists) |
 | `/workspace add /path` | Add directory (creates if not exists) |
 
 ### Session (/session or /s)

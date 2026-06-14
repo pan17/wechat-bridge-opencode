@@ -99,7 +99,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 |------|------|
 | `/workspace list` | 列出所有工作区，按最近活跃度排序，带序号 |
 | `/workspace status` | 显示当前工作区 |
-| `/workspace switch <路径\|编号>` | 切换到指定目录（`/workspace list` 中的编号也可） |
+| `/workspace switch <路径\|编号>` | 切换到指定目录（`/workspace list` 中的编号也可）；恢复该目录下最近的会话（无则新建） |
 | `/workspace add <路径>` | 添加并切换到目录 |
 
 ### 会话（`/session` 或 `/s`）

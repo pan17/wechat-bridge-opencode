@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-06-15
+
+### Fixed
+- **`/workspace switch` reported a generic session error after switching.** Two related bugs: `handleSessionError` was calling `String()` on object-shaped server errors, hiding the real message behind `"[object Object]"`; and `switchWorkspace` left `currentMode` / `currentModelId` / `currentReasoning` populated from the previous workspace, causing the next prompt to fail with `session.error: Agent not found: "<old-agent>"` when the new workspace didn't define the same agent/model. The real error is now surfaced to the bridge log and WeChat, and stale state is cleared on workspace switch.
+- **`/workspace switch` always created a brand-new session**, even when the target workspace already had a previous conversation. The new session had no context, model, or agent from that workspace. Now resumes the most recent root session in the target workspace, falling back to creating a new one if none exists. Users who want a fresh session in the target workspace can still use `/session new` afterwards.
+
 ## [1.3.1] - 2026-06-14
 
 ### Added

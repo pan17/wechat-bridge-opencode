@@ -98,7 +98,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 |---------|-------------|
 | `/workspace list` | List all workspaces sorted by recent activity, numbered |
 | `/workspace status` | Show current workspace |
-| `/workspace switch <path\|n>` | Switch to directory by path (or by index from `/workspace list`) |
+| `/workspace switch <path\|n>` | Switch to directory by path (or by index from `/workspace list`); resumes the most recent session in that workspace (creates a new one if none exists) |
 | `/workspace add <path>` | Add and switch to directory |
 
 ### Session (`/session` or `/s`)
