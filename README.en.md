@@ -15,7 +15,7 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 - **Send** — Text, images, files, audio/video sent from WeChat to the OpenCode agent; media is auto-downloaded to `~/.wechat-bridge-opencode/tempfile/` and forwarded as a file-path attachment
 - **Receive** — Agent replies are forwarded to WeChat; the `send-wechat` tool lets the agent proactively push text, files, and images to WeChat
 - **WeChat slash commands** — `/help`, `/workspace`, `/session`, `/agent`, `/model`, `/stop` and 10+ more commands are consumed by the bridge, never forwarded to the agent
-- **OpenCode slash commands** — Any `/xxx` the bridge doesn't recognize (e.g. `/init`, `/compact`) is forwarded to the agent as plain text, triggering OpenCode's built-in slash commands
+- **OpenCode slash commands** — Any `/xxx` the bridge doesn't recognize is forwarded to the agent as plain text, triggering OpenCode's built-in slash commands (e.g. `/init`, `/review`). Send `/help` to see all available commands
 - **Permission cards** — Surface OpenCode's `permission.asked` events to WeChat as `once` / `always` / `reject` cards; `/auto-permission` toggles auto-accept mode; 30-min soft timeout
 - **QR Login** — Terminal QR code rendering for WeChat login
 - **OpenCode Server** — HTTP API based, no ACP subprocess required
