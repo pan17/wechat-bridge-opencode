@@ -400,26 +400,80 @@ export class SessionManager {
 
   /**
    * Switch to a different session (workspace switch).
-   * Creates a new session if no existingSessionId provided.
+   *
+   * Resolution order:
+   *   1. If `existingSessionId` is provided and the server knows it, use it.
+   *   2. Otherwise, look up the most recent root session in `cwd` and resume
+   *      it. This is the common case for `/workspace switch <path>` — the
+   *      user wants to continue where they left off in that workspace, not
+   *      start a blank session.
+   *   3. If no prior session exists in `cwd`, create a new one.
+   *
+   * State handling:
+   *   - Resumed session: agent/model/reasoning are synced from the session's
+   *     last assistant message via `syncStateFromServer` (overwriting any
+   *     stale values from the previous workspace).
+   *   - New session: stale currentMode/currentModelId/currentReasoning from
+   *     the previous workspace are cleared so the server doesn't reject the
+   *     next prompt with `Agent not found` / `Model not found`. The cleared
+   *     fields are then repopulated from the new workspace by the
+   *     `refreshAgents` / `refreshProviders` calls below.
    */
   async switchWorkspace(cwd: string, existingSessionId?: string): Promise<void> {
+    let targetSessionId: string | null = null;
+    let isResumed = false;
+
     if (existingSessionId) {
-      this.log(`Loading session ${existingSessionId} for workspace switch (cwd: ${cwd})`);
-      // Verify the session exists and is usable
+      // Caller-specified session: verify it exists on the server.
       try {
         await this.client.getSession(existingSessionId);
-        this.sessionId = existingSessionId;
+        targetSessionId = existingSessionId;
+        this.log(`Loading session ${existingSessionId} for workspace switch (cwd: ${cwd})`);
       } catch {
-        this.log(`Session ${existingSessionId} not found, creating new one`);
-        const info = await this.client.createSession(undefined, undefined, cwd);
-        this.sessionId = info.id;
+        this.log(`Session ${existingSessionId} not found, will create a new one`);
       }
     } else {
+      // No session specified — try to resume the most recent root session
+      // in the target workspace.
+      targetSessionId = await this.findRecentSessionInCwd(cwd);
+      if (targetSessionId) {
+        // Verify it still exists (could have been deleted between list and use).
+        try {
+          await this.client.getSession(targetSessionId);
+          isResumed = true;
+          this.log(`Resuming most recent session ${targetSessionId} in ${cwd}`);
+        } catch {
+          this.log(`Resumed session ${targetSessionId} not found, will create a new one`);
+          targetSessionId = null;
+        }
+      }
+    }
+
+    if (!targetSessionId) {
+      // No existing session available — create a new one for this workspace.
       this.log(`Creating new session for workspace switch (cwd: ${cwd})`);
       const info = await this.client.createSession(undefined, undefined, cwd);
-      this.sessionId = info.id;
+      targetSessionId = info.id;
     }
+
+    this.sessionId = targetSessionId;
     this.cwd = cwd;
+
+    if (isResumed) {
+      // Pull agent/model/reasoning from the resumed session's last message.
+      // This correctly overwrites any stale values from the previous workspace.
+      await this.syncStateFromServer(targetSessionId).catch(() => {});
+    } else {
+      // Brand-new session: clear stale state from the previous workspace.
+      // Leaving them stale caused the next prompt to fail with
+      // `session.error: Agent not found: "<old-agent>"` because
+      // sendPromptAsync carries them in the request body (see sendPromptAsync).
+      // refreshProviders / refreshAgents below repopulate defaults from the
+      // new workspace's opencode.json.
+      this.currentMode = undefined;
+      this.currentModelId = undefined;
+      this.currentReasoning = undefined;
+    }
     this.onSessionReady?.(this.sessionId);
     // The new workspace may define its own agents / providers in
     // opencode.json; refresh so /agent list and /model list reflect them
@@ -428,6 +482,24 @@ export class SessionManager {
     // appeared to be global-only after `/workspace switch`.
     this.refreshAgents().catch(() => {});
     this.refreshProviders().catch(() => {});
+  }
+
+  /**
+   * Find the most recent root session in the given directory.
+   * Returns the session id, or null if none / on error.
+   *
+   * Used by `switchWorkspace` to resume the user's last conversation in a
+   * workspace when no explicit session id is given.
+   */
+  private async findRecentSessionInCwd(cwd: string): Promise<string | null> {
+    try {
+      const sessions = await this.listServerSessions();
+      const match = sessions.find((s) => s.cwd === cwd);
+      return match?.sessionId ?? null;
+    } catch (err) {
+      this.log(`Failed to list sessions for resume lookup: ${String(err)}`);
+      return null;
+    }
   }
 
   /**
@@ -2115,7 +2187,14 @@ export class SessionManager {
   }
 
   private handleSessionError(event: SessionErrorEvent): void {
-    const msg = event.properties.error ? String(event.properties.error) : "unknown";
+    const raw = event.properties.error;
+    const msg = !raw
+      ? "unknown"
+      : typeof raw === "string"
+        ? raw
+        : typeof raw === "object"
+          ? (raw as { message?: string }).message ?? JSON.stringify(raw)
+          : String(raw);
     this.log(`[event] session.error: ${msg}`);
     if (this.currentTurn) {
       this.finalizeTurn("error", `⚠️ Session error: ${msg}`);
