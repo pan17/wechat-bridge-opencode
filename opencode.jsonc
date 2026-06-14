@@ -5,10 +5,6 @@
       "repository": "anomalyco/opencode",
       "description": "OpenCode 源码仓库。Server REST API 与 SSE 事件流的中文文档位于 packages/web/src/content/docs/zh-cn/server.mdx（即 https://opencode.ai/docs/zh-cn/server/ 对应的源文件）"
     },
-    "opencode-server-docs": {
-      "path": "references",
-      "description": "OpenCode Server HTTP API 的离线精简参考（zh-cn）。主文件 references/opencode-server.zh-cn.md，含全部 REST 端点、SSE 事件流、认证、启动参数。原文：https://opencode.ai/docs/zh-cn/server/"
-    },
     "openclaw-weixin": {
       "repository": "Tencent/openclaw-weixin",
       "description": "OpenClaw Weixin：官方 WeChat iLink API 参考实现。权威来源：图片/文件/视频发送模式、CDN 上传流程、AES-ECB 加密细节。"

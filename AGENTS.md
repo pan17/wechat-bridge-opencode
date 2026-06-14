@@ -224,8 +224,7 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 ### System
 | Command | Description |
 |---------|-------------|
-| `/version` | Show Bridge, OpenCode Server, and the latest version published to npm; hints `/upgrade` if a newer version is available |
-| `/upgrade` | Run `opencode upgrade` and auto-restart the server (unavailable in external-server mode; in npx mode a restart is itself an upgrade) |
+| `/version` | Show Bridge, OpenCode Server, and the latest version published to npm; hints `/restart` (sidecar mode) when a newer server version is available. External-server mode cannot update via the bridge |
 
 ### Message Limit (/next)
 | Command | Description |

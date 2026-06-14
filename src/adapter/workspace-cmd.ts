@@ -66,10 +66,6 @@ export interface VersionCommand {
   kind: "version";
 }
 
-export interface UpgradeCommand {
-  kind: "upgrade";
-}
-
 export interface RestartCommand {
   kind: "restart";
 }
@@ -335,14 +331,6 @@ export function parseVersionCommand(text: string): VersionCommand | null {
   const trimmed = text.trim().toLowerCase();
   if (trimmed === "/version") {
     return { kind: "version" };
-  }
-  return null;
-}
-
-export function parseUpgradeCommand(text: string): UpgradeCommand | null {
-  const trimmed = text.trim().toLowerCase();
-  if (trimmed === "/upgrade") {
-    return { kind: "upgrade" };
   }
   return null;
 }
@@ -613,7 +601,6 @@ export function formatHelp(): string {
     "",
     "── 系统 ──",
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
-    "  /upgrade                 升级 OpenCode 并重启 server（外部 server 模式不可用）",
     "",
     "── 思考显示 ──",
     "  /thought-display on     开启思考内容显示",
@@ -687,7 +674,6 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "",
     "── 系统 ──",
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
-    "  /upgrade                 升级 OpenCode 并重启 server（外部 server 模式不可用）",
     "",
     "── 思考显示 ──",
     "  /thought-display on     开启思考内容显示",

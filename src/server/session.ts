@@ -2759,7 +2759,7 @@ export class SessionManager {
   /**
    * Return the running server's version string (from /global/health), or null
    * if the server is unreachable or does not report a version. Used by the
-   * `/version` and `/upgrade` commands.
+   * `/version` command.
    */
   async getServerVersion(): Promise<string | null> {
     try {

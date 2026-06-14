@@ -170,12 +170,11 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 设置独立且跨重启持久化(~/.wechat-bridge-opencode/.wechat-bridge-state.json)
 
-### 系统（`/version`、`/upgrade`）
+### 系统（`/version`）
 
 | 命令 | 说明 |
 |------|------|
-| `/version` | 查询 Bridge、OpenCode Server 与 npm 上最新版本；如有新版会提示 `/upgrade` |
-| `/upgrade` | 运行 `opencode upgrade` 升级 OpenCode 并自动重启 server（外部 server 模式不可用，npx 模式下重启即升级） |
+| `/version` | 查询 Bridge、OpenCode Server 与 npm 上最新版本；sidecar 模式下如有新版会提示用 `/restart` 更新 server，外部 server 模式无法通过 bridge 更新 |
 
 ### 消息计数（`/next`）
 
