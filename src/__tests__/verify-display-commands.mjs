@@ -19,9 +19,12 @@
  *   8. toolTitleDisplay      — 5 cases
  *   9. thoughtRemoval        — 2 cases (legacy /thought rejected; bridgeCommands omits "thinking")
  *   10. helpUpdates          — 3 cases
+ *   11. helpOrdering         — 4 cases (状态 section first in /help)
+ *   12. workspaceListTruncation — 5 cases (maxCount cap + hint)
+ *   13. slowWarn             — 5 cases (runWithSlowWarn timing contract via fake timers)
  */
 
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -31,6 +34,7 @@ import {
   parseToolDisplayCommand,
   formatHelp,
   formatHelpWithNativeCommands,
+  formatWorkspaceList,
 } from "../../dist/src/adapter/workspace-cmd.js";
 import {
   reasoningSummary,
@@ -38,6 +42,8 @@ import {
   formatDuration,
 } from "../../dist/src/adapter/thinking-format.js";
 import { SessionManager } from "../../dist/src/server/session.js";
+import { WeChatOpencodeBridge } from "../../dist/src/bridge.js";
+import { defaultConfig } from "../../dist/src/config.js";
 
 // ────────────────────────────────────────────────────────────────────────
 // Category 1: Parser unit checks (Task 2's 14 cases)
@@ -1238,6 +1244,306 @@ test("formatHelpWithNativeCommands contains both new sections", () => {
   expect(help.includes("── 思考显示 ──")).toBeTruthy();
   expect(help.includes("── 工具显示 ──")).toBeTruthy();
   expect(help.includes("── 思考 ──")).toBeFalsy();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Category 11: /help ordering — `── 状态 ──` must appear before
+// `── 工作区 ──` so `/status` is the most visible command for a user
+// who just reconnected. Same ordering requirement applies to the
+// native-commands variant because that's what runtime `/help` uses.
+// ────────────────────────────────────────────────────────────────────────
+console.log("");
+console.log("helpOrdering (4 cases)");
+
+test("formatHelp: 状态 section appears before 工作区 section", () => {
+  const help = formatHelp();
+  const statusIdx = help.indexOf("── 状态 ──");
+  const workspaceIdx = help.indexOf("── 工作区 ──");
+  // Both sections must exist, and 状态 must come first.
+  expect(statusIdx).toBeGreaterThan(-1);
+  expect(workspaceIdx).toBeGreaterThan(-1);
+  expect(statusIdx).toBeLessThan(workspaceIdx);
+});
+
+test("formatHelp: 状态 is the first section after the title", () => {
+  const help = formatHelp();
+  // After "📖 可用命令：" the next section header should be 状态.
+  const titleIdx = help.indexOf("📖 可用命令：");
+  const afterTitle = help.slice(titleIdx);
+  const firstSection = afterTitle.match(/\n── [^\n]+ ──/);
+  expect(firstSection).toBeTruthy();
+  // `!` non-null assertion isn't valid in .mjs; guard with a runtime
+  // truthy check so this still throws a clear error if it ever fails.
+  if (firstSection) {
+    expect(firstSection[0]).toBe("\n── 状态 ──");
+  }
+});
+
+test("formatHelpWithNativeCommands: 状态 section appears before 工作区 section", () => {
+  const help = formatHelpWithNativeCommands([]);
+  const statusIdx = help.indexOf("── 状态 ──");
+  const workspaceIdx = help.indexOf("── 工作区 ──");
+  expect(statusIdx).toBeGreaterThan(-1);
+  expect(workspaceIdx).toBeGreaterThan(-1);
+  expect(statusIdx).toBeLessThan(workspaceIdx);
+});
+
+test("formatHelpWithNativeCommands: 状态 is the first section after the title", () => {
+  const help = formatHelpWithNativeCommands([]);
+  const titleIdx = help.indexOf("📖 可用命令：");
+  const afterTitle = help.slice(titleIdx);
+  const firstSection = afterTitle.match(/\n── [^\n]+ ──/);
+  expect(firstSection).toBeTruthy();
+  if (firstSection) {
+    expect(firstSection[0]).toBe("\n── 状态 ──");
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Category 12: workspace list truncation — when the input exceeds the
+// `maxCount` cap, the formatter must (a) drop the tail entries, (b) add
+// a "(showing first N of M)" hint, and (c) still include the /workspace
+// switch reminder so the user knows how to reach the truncated entries.
+// When the input fits, neither the truncation hint nor a "of N total"
+// phrase should appear — the output should match the original behavior.
+// ────────────────────────────────────────────────────────────────────────
+console.log("");
+console.log("workspaceListTruncation (5 cases)");
+
+test("formatWorkspaceList: with empty input returns the legacy empty message", () => {
+  expect(formatWorkspaceList([], null)).toBe("No workspaces configured.");
+});
+
+test("formatWorkspaceList: under cap shows every entry and no truncation hint", () => {
+  const ws = Array.from({ length: 5 }, (_, i) => ({ cwd: `/path/${i}` }));
+  const out = formatWorkspaceList(ws, null, 20);
+  // All 5 entries present, numbered 1..5
+  expect(out).toContain("  1. /path/0");
+  expect(out).toContain("  5. /path/4");
+  // No truncation hint
+  expect(out).not.toMatch(/仅显示.*共/);
+  // Reminder still present
+  expect(out).toContain("/workspace switch");
+});
+
+test("formatWorkspaceList: at the cap shows every entry and no truncation hint", () => {
+  const ws = Array.from({ length: 20 }, (_, i) => ({ cwd: `/path/${i}` }));
+  const out = formatWorkspaceList(ws, null, 20);
+  expect(out).toContain("  1. /path/0");
+  expect(out).toContain("  20. /path/19");
+  // Exactly at the cap → no truncation, no hint
+  expect(out).not.toMatch(/仅显示.*共/);
+});
+
+test("formatWorkspaceList: over the cap drops tail entries and shows truncation hint", () => {
+  const ws = Array.from({ length: 25 }, (_, i) => ({ cwd: `/path/${i.toString().padStart(2, "0")}` }));
+  const out = formatWorkspaceList(ws, null, 20);
+  // First 20 entries present
+  expect(out).toContain("  1. /path/00");
+  expect(out).toContain("  20. /path/19");
+  // Entries 21..25 dropped
+  expect(out).not.toContain("/path/20");
+  expect(out).not.toContain("/path/24");
+  // Truncation hint with both numbers visible
+  expect(out).toMatch(/仅显示.*20/);
+  expect(out).toMatch(/共.*25/);
+  // /workspace switch reminder still present so the user knows how to
+  // reach the dropped entries.
+  expect(out).toContain("/workspace switch");
+});
+
+test("formatWorkspaceList: active marker survives truncation", () => {
+  // 25 entries, the active cwd is entry #5. After truncation to 20 the
+  // active marker must still show on the right line.
+  const ws = Array.from({ length: 25 }, (_, i) => ({ cwd: `/path/${i}` }));
+  const active = "/path/4";
+  const out = formatWorkspaceList(ws, active, 20);
+  expect(out).toContain("  5. /path/4 ◀");
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Category 13: slow-warn helper on the bridge.
+//
+// `runWithSlowWarn` is the private helper that backs /status and /help:
+// it sets a 2-second timer that fires a `⏳ 正在获取 ${label}，请稍候...`
+// hint to the user if the wrapped operation hasn't resolved yet. These
+// tests pin down the timing contract using vitest's fake timers so they
+// run instantly instead of waiting the full 2-second threshold.
+//
+// Construction: we build a bridge with `defaultConfig()` (so we exercise
+// the real `runWithSlowWarn` code path) but never call `start()`, so no
+// filesystem or WeChat login happens. The instance method `sendReply`
+// is replaced on the instance — that shadows the prototype method, and
+// since `runWithSlowWarn` reads `this.sendReply` at call time, the
+// override is what gets invoked.
+// ────────────────────────────────────────────────────────────────────────
+console.log("");
+console.log("slowWarn (5 cases)");
+
+/**
+ * Construct a minimal bridge with mocked sendReply so we can inspect
+ * what was sent without touching WeChat. The `tokenData` stays null —
+ * that's fine because we override `sendReply` so the impl that reads
+ * tokenData is never reached.
+ */
+function makeBridgeWithMockedSend() {
+  const sent = [];
+  const config = defaultConfig();
+  // Storage dir doesn't matter because we never call start(), but point
+  // it at a tmpdir so a hypothetical future constructor can't reach the
+  // user's home by accident.
+  config.storage.dir = fs.mkdtempSync(path.join(os.tmpdir(), "wbo-test-"));
+  const bridge = new WeChatOpencodeBridge(config, () => {});
+  bridge["sendReply"] = async (ctx, text) => {
+    sent.push({ ctx, text });
+  };
+  return { bridge, sent };
+}
+
+test("slowWarn: fast operation sends final reply, no warn", async () => {
+  vi.useFakeTimers();
+  try {
+    const { bridge, sent } = makeBridgeWithMockedSend();
+
+    const op = bridge["runWithSlowWarn"]("ctx-A", "test", async () => {
+      // Simulate the real flow: fn does work, then sends the final reply.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await bridge["sendReply"]("ctx-A", "fast-result");
+    });
+
+    // Fast-forward 100ms — op completes well before the 2000ms threshold.
+    await vi.advanceTimersByTimeAsync(100);
+    await op;
+
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toEqual({ ctx: "ctx-A", text: "fast-result" });
+
+    // Advance PAST the threshold — the timer must already have been
+    // cleared in runWithSlowWarn's `finally`, so no warn should fire.
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(sent.length).toBe(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("slowWarn: slow operation sends warn THEN final reply, in that order", async () => {
+  vi.useFakeTimers();
+  try {
+    const { bridge, sent } = makeBridgeWithMockedSend();
+
+    const op = bridge["runWithSlowWarn"]("ctx-B", "状态", async () => {
+      // 2500ms exceeds the 2000ms threshold
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      await bridge["sendReply"]("ctx-B", "final");
+    });
+
+    // Advance 2000ms exactly — warn timer fires here
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // Warn must already be sent (no final yet — fn is still sleeping)
+    expect(sent.length).toBe(1);
+    expect(sent[0].ctx).toBe("ctx-B");
+    expect(sent[0].text).toBe("⏳ 正在获取 状态，请稍候...");
+
+    // Advance the remaining 500ms so fn completes
+    await vi.advanceTimersByTimeAsync(500);
+    await op;
+
+    // Order: warn first, final second. This is the key invariant the
+    // user asked us to verify — the warn can never arrive after the
+    // final reply because both go through the same sendReply path.
+    expect(sent.length).toBe(2);
+    expect(sent[0].text).toContain("⏳");
+    expect(sent[1].text).toBe("final");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("slowWarn: fast-throw propagates error and sends no warn", async () => {
+  vi.useFakeTimers();
+  try {
+    const { bridge, sent } = makeBridgeWithMockedSend();
+
+    // Attach a no-op catch handler immediately so the rejection that
+    // will fire when the timer advances isn't reported as unhandled.
+    // The test body still verifies the rejection explicitly below.
+    const op = bridge["runWithSlowWarn"]("ctx-C", "test", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      throw new Error("boom");
+    });
+    op.catch(() => undefined);
+
+    // Advance 100ms so fn's setTimeout fires and fn throws.
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(op).rejects.toThrow("boom");
+
+    // Nothing was sent — fast path = no warn, and the error didn't
+    // trigger an outbound message.
+    expect(sent.length).toBe(0);
+
+    // Advance past threshold — timer must have been cleared by the
+    // finally block even though fn threw.
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(sent.length).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("slowWarn: slow-throw sends warn THEN propagates error", async () => {
+  vi.useFakeTimers();
+  try {
+    const { bridge, sent } = makeBridgeWithMockedSend();
+
+    // Attach a no-op catch handler immediately so the rejection that
+    // will fire when the timer advances isn't reported as an unhandled
+    // rejection. The test body still verifies the rejection explicitly.
+    const op = bridge["runWithSlowWarn"]("ctx-D", "帮助", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      throw new Error("boom");
+    });
+    op.catch(() => undefined);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(sent.length).toBe(1);
+    expect(sent[0].text).toBe("⏳ 正在获取 帮助，请稍候...");
+
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(op).rejects.toThrow("boom");
+
+    // Warn was sent; the error didn't add another outbound message.
+    expect(sent.length).toBe(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("slowWarn: returns the wrapped function's return value (fast and slow)", async () => {
+  vi.useFakeTimers();
+  try {
+    const { bridge } = makeBridgeWithMockedSend();
+
+    // Fast path (no warn fired)
+    const fastVal = await bridge["runWithSlowWarn"]("ctx", "x", async () => {
+      await bridge["sendReply"]("ctx", "fast");
+      return 42;
+    });
+    expect(fastVal).toBe(42);
+
+    // Slow path (warn fires but value still returned)
+    const slowOp = bridge["runWithSlowWarn"]("ctx", "x", async () => {
+      await new Promise((r) => setTimeout(r, 2500));
+      await bridge["sendReply"]("ctx", "slow");
+      return { ok: true };
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+    const slowVal = await slowOp;
+    expect(slowVal).toEqual({ ok: true });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 // ────────────────────────────────────────────────────────────────────────

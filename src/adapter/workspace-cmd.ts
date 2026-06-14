@@ -373,17 +373,33 @@ export function parseRejectQuestionCommand(text: string): RejectQuestionCommand 
 export function formatWorkspaceList(
   workspaces: Array<{ cwd: string }>,
   activeCwd: string | null,
+  /**
+   * Maximum number of entries to render. When the input has more entries,
+   * the extras are dropped and an explicit truncation hint is appended so
+   * the user knows they can still reach the rest with `/workspace switch
+   * <path>`. Default is `Infinity` (no cap) so existing callers that don't
+   * care about WeChat's display budget keep their behavior.
+   */
+  maxCount: number = Infinity,
 ): string {
   if (workspaces.length === 0) return "No workspaces configured.";
 
+  const truncated = workspaces.length > maxCount;
+  const shown = truncated ? workspaces.slice(0, maxCount) : workspaces;
+
   const lines = ["📂 Workspaces:"];
-  for (let i = 0; i < workspaces.length; i++) {
-    const ws = workspaces[i];
+  for (let i = 0; i < shown.length; i++) {
+    const ws = shown[i];
     const marker = ws.cwd === activeCwd ? " ◀" : "";
     lines.push(`  ${i + 1}. ${ws.cwd}${marker}`);
   }
   lines.push("");
+  if (truncated) {
+    lines.push(`（仅显示最近 ${maxCount} 个，共 ${workspaces.length} 个）`);
+    lines.push("");
+  }
   lines.push("💡 使用 /workspace switch <路径> 或编号 切换工作区");
+  lines.push("   路径未列出？直接 /workspace switch <完整路径> 也能切换");
   return lines.join("\n");
 }
 
@@ -547,10 +563,17 @@ export function parseHelpCommand(text: string): boolean {
 
 /**
  * Format the help message listing all available commands.
+ *
+ * Section ordering: 状态 is intentionally placed first (right after the
+ * title) so it's the most prominent entry — `/status` is the single
+ * command users reach for most often when reconnecting mid-session.
  */
 export function formatHelp(): string {
   return [
     "📖 可用命令：",
+    "",
+    "── 状态 ──",
+    "  /status                  显示会话标题、工作区、Agent、模型、推理、上下文用量",
     "",
     "── 工作区 ──",
     "  /workspace list          列出所有工作区（按活跃度排序）",
@@ -584,9 +607,6 @@ export function formatHelp(): string {
     "  /reasoning switch <level|default>  切换推理级别（`default` 清除，让 server 选默认）",
     "  /reasoning status        显示当前推理级别",
     "",
-    "── 状态 ──",
-    "  /status                  显示会话标题、工作区、Agent、模型、推理、上下文用量",
-    "",
     "── 停止 ──",
     "  /stop                    停止正在运行的 Agent",
     "  /restart                 重启 OpenCode Server（外部 server 时仅新建会话）",
@@ -618,10 +638,16 @@ export function formatHelp(): string {
 
 /**
  * Format help message including OpenCode native slash commands from available_commands_update.
+ *
+ * Section ordering mirrors `formatHelp`: 状态 first so `/status` is the
+ * most visible command for users reconnecting mid-session.
  */
 export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: string; description: string }>): string {
   const lines = [
     "📖 可用命令：",
+    "",
+    "── 状态 ──",
+    "  /status                  显示会话标题、工作区、Agent、模型、推理、上下文用量",
     "",
     "── 工作区 ──",
     "  /workspace list          列出所有工作区（按活跃度排序）",
@@ -654,9 +680,6 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "  /reasoning list          列出当前模型的实际推理等级",
     "  /reasoning switch <level|default>  切换推理级别（`default` 清除，让 server 选默认）",
     "  /reasoning status        显示当前推理级别",
-    "",
-    "── 状态 ──",
-    "  /status                  显示会话标题、工作区、Agent、模型、推理、上下文用量",
     "",
     "── 停止 ──",
     "  /stop                    停止正在运行的 Agent",

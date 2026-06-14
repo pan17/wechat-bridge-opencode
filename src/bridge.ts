@@ -46,6 +46,26 @@ import type { WeChatOpencodeConfig } from "./config.js";
 const TEXT_CHUNK_LIMIT = 4000;
 const TOOL_API_PORT = 18792;
 const TOOL_API_HOST = "127.0.0.1";
+/**
+ * Threshold for the "still working, please wait" reminder sent by
+ * `runWithSlowWarn`. Commands that finish faster than this send only the
+ * final reply; commands that take longer (e.g. `/status` while MCP status
+ * or `/help` while fetching native commands from a slow server) emit a
+ * short hint to the user so they don't think the bridge is hung.
+ *
+ * Two seconds was chosen because typing indicator alone doesn't read as
+ * "actively working" in WeChat private messages — the user often waits
+ * longer for typing indicators during real conversations and doesn't know
+ * when the bot has stalled.
+ */
+const SLOW_WARN_THRESHOLD_MS = 2000;
+/**
+ * Max number of workspaces to render in `/workspace list`. Mirrors the
+ * `/session list` cap so the WeChat reply stays a manageable size even
+ * when the user has many projects. Anything past the cap is reachable via
+ * `/workspace switch <path>`.
+ */
+const WORKSPACE_LIST_MAX = 20;
 
 /**
  * Read the bridge's own version from the nearest package.json. The compiled
@@ -963,7 +983,14 @@ export class WeChatOpencodeBridge {
       case "list": {
         const currentCwd = this.userState?.cwd ?? this.config.agent.cwd;
         const workspaces = await this.getSortedWorkspaces(currentCwd);
-        await this.sendReply(contextToken, formatWorkspaceList(workspaces, currentCwd));
+        // Cap at WORKSPACE_LIST_MAX so the WeChat reply stays a manageable
+        // size and renders in a single bubble. `formatWorkspaceList` adds a
+        // truncation hint + /workspace switch reminder when the input
+        // exceeds the cap, so the user can still reach anything beyond it.
+        await this.sendReply(
+          contextToken,
+          formatWorkspaceList(workspaces, currentCwd, WORKSPACE_LIST_MAX),
+        );
         break;
       }
 
@@ -1421,69 +1448,76 @@ export class WeChatOpencodeBridge {
     contextToken: string,
     _cmd: ReturnType<typeof parseStatusCommand>,
   ): Promise<void> {
-    if (!this.sessionManager) return;
+    // Capture to a local so the narrowing from the early-return survives
+    // into the async closure passed to runWithSlowWarn. Without this TS
+    // can't prove `this.sessionManager` is non-null inside the callback
+    // (class-field narrowing doesn't propagate through async boundaries).
+    const sessionManager = this.sessionManager;
+    if (!sessionManager) return;
 
-    const cwd = this.userState?.cwd ?? this.config.agent.cwd;
+    await this.runWithSlowWarn(contextToken, "状态", async () => {
+      const cwd = this.userState?.cwd ?? this.config.agent.cwd;
 
-    // Lazy-refresh agents/models if caches are empty
-    if (this.sessionManager.getAvailableModes().length === 0) {
-      try { await this.sessionManager.refreshAgents(); } catch { /* ignore */ }
-    }
-    if (this.sessionManager.getAvailableModels().length === 0) {
-      try { await this.sessionManager.refreshProviders(); } catch { /* ignore */ }
-    }
-
-    const currentMode = this.sessionManager.getActiveMode();
-    const currentModel = this.sessionManager.getCurrentModel() ?? "(not set)";
-    let currentReasoning = this.sessionManager.getCurrentReasoningDisplay();
-    if (currentReasoning === "(not set)") {
-      // Default to the first reasoning level of the current model
-      const levels = this.sessionManager.getReasoningLevels();
-      if (levels.length > 0) {
-        currentReasoning = levels[0].name;
+      // Lazy-refresh agents/models if caches are empty
+      if (sessionManager.getAvailableModes().length === 0) {
+        try { await sessionManager.refreshAgents(); } catch { /* ignore */ }
       }
-    }
-    const contextUsage = this.sessionManager.getContextUsage();
-    const sessionId = this.sessionManager.getSessionId();
+      if (sessionManager.getAvailableModels().length === 0) {
+        try { await sessionManager.refreshProviders(); } catch { /* ignore */ }
+      }
 
-    const sessionTitle = sessionId ? await this.sessionManager.getSessionTitle(sessionId).catch(() => undefined) : undefined;
-    const sessionInfo = sessionId ? { id: sessionId, cwd, title: sessionTitle } : null;
+      const currentMode = sessionManager.getActiveMode();
+      const currentModel = sessionManager.getCurrentModel() ?? "(not set)";
+      let currentReasoning = sessionManager.getCurrentReasoningDisplay();
+      if (currentReasoning === "(not set)") {
+        // Default to the first reasoning level of the current model
+        const levels = sessionManager.getReasoningLevels();
+        if (levels.length > 0) {
+          currentReasoning = levels[0].name;
+        }
+      }
+      const contextUsage = sessionManager.getContextUsage();
+      const sid = sessionManager.getSessionId();
 
-    // Fetch MCP status. Failures are swallowed (the network call goes to
-    // the local opencode server) and the section is omitted in that case.
-    let mcpStatus: Record<string, import("./types.js").McpServerStatus> | null = null;
-    try {
-      mcpStatus = await this.sessionManager.getMcpStatus();
-    } catch {
-      // Server doesn't expose /mcp, or call failed — just skip the section.
-    }
+      const sessionTitle = sid ? await sessionManager.getSessionTitle(sid).catch(() => undefined) : undefined;
+      const sessionInfo = sid ? { id: sid, cwd, title: sessionTitle } : null;
 
-    let statusText = formatStatus({
-      session: sessionInfo,
-      workspace: cwd,
-      agent: currentMode ?? "(not set)",
-      model: currentModel,
-      reasoning: currentReasoning,
-      contextUsage: contextUsage ? { used: contextUsage.totalTokens, size: contextUsage.contextSize } : null,
-      mcpStatus,
+      // Fetch MCP status. Failures are swallowed (the network call goes to
+      // the local opencode server) and the section is omitted in that case.
+      let mcpStatus: Record<string, import("./types.js").McpServerStatus> | null = null;
+      try {
+        mcpStatus = await sessionManager.getMcpStatus();
+      } catch {
+        // Server doesn't expose /mcp, or call failed — just skip the section.
+      }
+
+      let statusText = formatStatus({
+        session: sessionInfo,
+        workspace: cwd,
+        agent: currentMode ?? "(not set)",
+        model: currentModel,
+        reasoning: currentReasoning,
+        contextUsage: contextUsage ? { used: contextUsage.totalTokens, size: contextUsage.contextSize } : null,
+        mcpStatus,
+      });
+
+      // Append a "⏳ Question pending" line if a question is waiting. We
+      // mutate the returned string here (rather than inside formatStatus)
+      // to keep the formatter a pure function. Showing elapsed seconds
+      // helps the user decide whether to /reject-question and let the
+      // agent proceed.
+      if (sessionManager.hasPendingQuestion()) {
+        const pending = sessionManager.getPendingQuestion();
+        if (pending) {
+          const elapsedSec = Math.max(0, Math.floor((Date.now() - pending.askedAt) / 1000));
+          const qLabel = `Q${pending.questions.length} question${pending.questions.length > 1 ? "s" : ""}`;
+          const idShort = pending.requestID.slice(0, 12);
+          statusText += `\n⏳ Question pending (${qLabel}, ${elapsedSec}s elapsed, id=${idShort}…)`;
+        }
+      }
+
+      await this.sendReply(contextToken, statusText);
     });
-
-    // Append a "⏳ Question pending" line if a question is waiting. We
-    // mutate the returned string here (rather than inside formatStatus)
-    // to keep the formatter a pure function. Showing elapsed seconds
-    // helps the user decide whether to /reject-question and let the
-    // agent proceed.
-    if (this.sessionManager?.hasPendingQuestion()) {
-      const pending = this.sessionManager.getPendingQuestion();
-      if (pending) {
-        const elapsedSec = Math.max(0, Math.floor((Date.now() - pending.askedAt) / 1000));
-        const qLabel = `Q${pending.questions.length} question${pending.questions.length > 1 ? "s" : ""}`;
-        const idShort = pending.requestID.slice(0, 12);
-        statusText += `\n⏳ Question pending (${qLabel}, ${elapsedSec}s elapsed, id=${idShort}…)`;
-      }
-    }
-
-    await this.sendReply(contextToken, statusText);
   }
 
   // ─── Thought display command (/thought-display) ───
@@ -1818,6 +1852,43 @@ export class WeChatOpencodeBridge {
 
   // ─── Helpers ───
 
+  /**
+   * Run `fn` and, if it hasn't resolved within `SLOW_WARN_THRESHOLD_MS`,
+   * send a short "still working, please wait" hint to the user before
+   * `fn`'s real reply lands. The hint is sent *only* when the operation
+   * actually takes longer than the threshold — fast operations stay
+   * silent and the user sees a single, clean reply.
+   *
+   * Implementation notes:
+   * - The hint goes through `sendReply` (i.e. the same outbound queue as
+   *   every other WeChat message) so it can never arrive after the real
+   *   reply even under back-pressure.
+   * - The timer is always cleared in `finally` so a fast fn that races
+   *   the timer doesn't leave a dangling setTimeout firing a stale hint
+   *   later (which would be confusing — the user already saw the answer).
+   * - Hint-send failures are swallowed: if WeChat itself is degraded,
+   *   surfacing that to the user via the hint channel would be worse
+   *   than just dropping the hint and letting the real reply try.
+   * - Returns whatever `fn` returns (or re-throws), so callers can use
+   *   the wrapper transparently.
+   */
+  private async runWithSlowWarn<T>(
+    contextToken: string,
+    label: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const timer = setTimeout(() => {
+      this.sendReply(contextToken, `⏳ 正在获取 ${label}，请稍候...`).catch((err: unknown) => {
+        this.log(`slow-warn send error: ${String(err)}`);
+      });
+    }, SLOW_WARN_THRESHOLD_MS);
+    try {
+      return await fn();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private detectUnknownSlashCommand(text: string): string | null {
     const trimmed = text.trim();
     if (!trimmed.startsWith("/")) return null;
@@ -1839,9 +1910,21 @@ export class WeChatOpencodeBridge {
   }
 
   private async sendHelpReply(contextToken: string): Promise<void> {
-    const nativeCommands = (await this.sessionManager?.getAvailableCommands()) ?? [];
-    const helpText = formatHelpWithNativeCommands(nativeCommands);
-    await this.sendReply(contextToken, helpText);
+    // Capture to a local for the same TS-narrowing reason as
+    // handleStatusCommand — `this.sessionManager` is `SessionManager | null`
+    // and the narrowing from the optional chain doesn't survive the await.
+    // Preserve the null-tolerant behavior of the original code (when no
+    // session manager exists, still send a help reply with no native
+    // commands appended) by handling null inside the closure.
+    const sessionManager = this.sessionManager;
+
+    await this.runWithSlowWarn(contextToken, "帮助", async () => {
+      const nativeCommands = sessionManager
+        ? (await sessionManager.getAvailableCommands()) ?? []
+        : [];
+      const helpText = formatHelpWithNativeCommands(nativeCommands);
+      await this.sendReply(contextToken, helpText);
+    });
   }
 
   private extractTextFromMessage(msg: WeixinMessage): string | null {
