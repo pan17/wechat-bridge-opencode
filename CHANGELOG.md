@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.1] - 2026-06-12
+## [1.2.0] - 2026-06-14
+
+### Added
+- **Question 工具端到端支持**：OpenCode Agent 调用 `question` 工具时，Bridge 将问题原文转发到微信私聊，用户回复 `Q1=1`、`Q1-自定义文字` 或 `1 --- 2 --- 3` 格式回传答案。支持多题路由（顺序无关）、多选/单选/自定义混合、手机自动空格容忍、`/reject-question`（`/rq`）显式拒绝、30 分钟无应答软超时自动 reject（`.omo/plans/question-tool-design.md` 设计稿）
+- **/thought-display** / **/tool-display** 微信命令：分别控制模型推理内容和工具调用摘要在微信侧的显示（`on` / `off` / `status`），设置跨重启持久化
+- **推理摘要显示**：WeChat 端实时显示 `🧠 Thought · {摘要} · {duration}`（单行），支持流式推理分片计时、摘要提取
+- **工具调用摘要显示**：每轮末尾显示 `✅ · {工具名} {标题}` 摘要，同类工具合并一行
+- `src/adapter/thinking-format.ts`：推理摘要提取 + 工具摘要格式化
+- `src/adapter/question-format.ts`：Question 展示/解析（Qn=/Qn- 双 marker 语法）
+- `src/types/question.ts`：Question 工具类型定义（QuestionPrompt / PendingQuestion 等）
+- `vitest.config.mjs` + `opencode.jsonc`：项目配置补充
+
+### Changed
+- **测试框架迁移**：从 `scripts/` 中的手动测试脚本迁移到 **Vitest 4.1.8**，`src/__tests__/` 现有 7 个测试文件共 141 个单元测试（`npm test`）
+- **SessionManager 消息分发重构**：从旧有的"边界缓冲"模式改为 type-change-flushing 设计——Reasonging / Tool / Text 三种类型在切换时实时冲刷到 WeChat，同类型连续多段合并为一条消息；缓冲消息在处理时保持原始 stream 顺序
+- `bridge.ts`：outbound 发送队列串联（`outboundQueue: Map<contextToken, Promise>`），防止并发发送乱序
+
+### Fixed
+- Question 工具事件未被处理：`session.ts.handleEvent` switch 缺 `question.asked/replied/rejected` 三个 case，导致 Agent 在 `Deferred.await()` 上永久挂起。添加 pendingQuestion 状态机 + 3 个 SSE handler + race-safe 清理
+
+### Removed
+- `test.md`：已废弃的手动测试文档（Vitest 替代）
+- `scripts/` 中多个手动测试脚本（迁移至 Vitest）
 
 ### Fixed
 - 外部 server 认证失效：SSE event pipeline 的 `/global/event` 长连接在 `event-pipeline.ts` 自己用裸 `fetch()`，绕过了 `OpenCodeServerClient.fetch()` 的 `Authorization` 头注入路径，导致 v1.1.0 在任何需要认证的 server（包括 OpenCode 桌面版）上持续 401 重连。EventPipeline 现在通过新加的 `getAuthHeader()` getter 复用 client 预计算的 `Authorization` 头
