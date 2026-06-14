@@ -2229,6 +2229,15 @@ export class WeChatOpencodeBridge {
    * removes the entry from the map once this task settles AND no newer
    * task has taken its slot — keeps the map bounded for contextTokens
    * that have stopped sending.
+   *
+   * Bug fix: `next.finally(...)` returns a NEW promise that inherits
+   * `next`'s rejection. That new promise was unhandled when `fn()`
+   * rejected (e.g. WeChat API timeout → `TypeError: fetch failed`),
+   * which crashed the process under Node ≥15's default unhandled-
+   * rejection policy. The `.catch(() => { })` below is the small
+   * suppression: the original `next` is still returned to the caller
+   * (and the caller attaches its own `.catch`), and we only need the
+   * `finally` callback to run for the map cleanup.
    */
   private enqueueOutbound<T>(contextToken: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.outboundQueue.get(contextToken) ?? Promise.resolve();
@@ -2238,6 +2247,9 @@ export class WeChatOpencodeBridge {
       if (this.outboundQueue.get(contextToken) === next) {
         this.outboundQueue.delete(contextToken);
       }
+    }).catch(() => {
+      // Suppress the unhandled-rejection that `next.finally(...)` would
+      // otherwise propagate when `fn()` rejects. See bug note above.
     });
     return next;
   }

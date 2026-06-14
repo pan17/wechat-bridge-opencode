@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-06-15
+
+### Fixed
+- **Bridge crashed with `TypeError: fetch failed` on WeChat API timeouts** (e.g. `ilinkai.weixin.qq.com:443` connect timeout). Root cause: `enqueueOutbound`'s cleanup chain `next.finally(() => { ... })` returns a new promise that inherits `next`'s rejection. The original `next` was caught and logged by `session.ts` ("onReply error for …"), but the sibling `finally` promise had no `.catch` and became an unhandled rejection — under Node ≥15's default policy this kills the process. Fix: attach `.catch(() => { })` to the finally chain so the cleanup runs but the rejection is suppressed; the original `next` is still returned to the caller and the caller's `.catch` (in `session.ts`) keeps working.
+- **Defense-in-depth: process-level `unhandledRejection` / `uncaughtException` handlers** in the CLI entry point. Any future unhandled rejection or uncaught exception is logged to stderr with a stack trace and the bridge keeps running, instead of crashing the long-lived bridge process. Specific known cases (e.g. WeChat API timeouts) are also fixed at the source so they don't fire — this is a safety net for regressions.
+
 ## [1.3.2] - 2026-06-15
 
 ### Fixed

@@ -517,6 +517,29 @@ async function main(): Promise<void> {
   }
 }
 
+// Safety net: catch unhandled promise rejections and uncaught exceptions
+// so a single network blip or a missed .catch doesn't crash the bridge
+// under Node ≥15's default unhandled-rejection policy. Log to stderr and
+// keep running. Specific known cases are also fixed at the source (see
+// enqueueOutbound's finally chain in src/bridge.ts); this is
+// defense-in-depth for any future regression.
+//
+// We deliberately do NOT exit on these. The WeChat bridge is a long-
+// running process: a single transient failure (e.g. WeChat API timeout
+// cascading into an unhandled rejection) should not bring down the
+// entire connection. If a real fatal error occurs, the bridge's own
+// shutdown handlers (SIGINT/SIGTERM) and the top-level main() catch
+// above will exit cleanly.
+process.on("unhandledRejection", (reason) => {
+  const ts = new Date().toISOString().substring(11, 19);
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  console.error(`[${ts}] unhandledRejection: ${err.stack ?? err.message}`);
+});
+process.on("uncaughtException", (err) => {
+  const ts = new Date().toISOString().substring(11, 19);
+  console.error(`[${ts}] uncaughtException: ${err.stack ?? err.message}`);
+});
+
 main().catch((err) => {
   console.error(`Fatal: ${String(err)}`);
   process.exit(1);
