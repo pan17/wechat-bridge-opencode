@@ -43,18 +43,20 @@ src/config.ts                   — Config types, defaults, server connection co
 src/types.ts                    — Shared types (MessagePart, ModelRef, MediaContent)
 src/vendor.d.ts                 — Type declarations for untyped npm packages
 src/types/
-  events.ts                     — SSE event types (message.*, session.*, question.*)
+  events.ts                     — SSE event types (message.*, session.*, question.*, permission.*)
   question.ts                   — Question tool types (QuestionPrompt, PendingQuestion, …)
+  permission.ts                 — Permission tool types (PermissionRequest, PendingPermission, AutoPermissionMode, …)
 src/server/
   client.ts                     — OpenCode Server HTTP client (fetch wrapper)
   session.ts                    — Simplified SessionManager (no subprocess, just HTTP)
   event-pipeline.ts             — Persistent /global/event SSE connection with reconnect
-src/__tests__/                  — Vitest unit tests (7 files, 141 tests)
+src/__tests__/                  — Vitest unit tests (9 files, 202 tests)
 src/adapter/
   inbound.ts                    — WeChat message → MessagePart[] (text, image, file)
   outbound.ts                   — Server reply → WeChat text (formatting, splitting)
-  workspace-cmd.ts              — Parse /workspace, /session, /agent, /model, /reasoning, /help, /reject-question commands
+  workspace-cmd.ts              — Parse /workspace, /session, /agent, /model, /reasoning, /help, /reject-question, /reject-permission, /auto-permission commands
   question-format.ts            — Format & parse question replies (Q{n}={value} / Q{n}-{value} grammar)
+  permission-format.ts          — Format & parse permission replies (1/2/3 / P{n}={once|always|reject} grammar)
   thinking-format.ts            — Reasoning summary + tool summary formatting
 src/weixin/
   auth.ts                       — WeChat iLink login (QR code, token persistence)
@@ -138,11 +140,11 @@ src/weixin/
 2. **New Server API call**: Add method to `src/server/client.ts`, use in `src/server/session.ts` or `src/bridge.ts`
 3. **New CLI option**: Add to `parseArgs()` in `bin/wechat-opencode.ts`, update `usage()`, pass through to config
 4. **New question tool support**: Add event type to `src/types/events.ts` + handler in `src/server/session.ts` switch; mirror in `src/types/events.ts`; add HTTP methods to `src/server/client.ts`; format/parse in `src/adapter/question-format.ts`; wire bridge callbacks in `src/bridge.ts`. See `.omo/plans/question-tool-design.md` for the canonical pattern.
+5. **New permission tool support**: Mirror the question pattern with the following differences — (a) the agent's `permission.asked` payload lives in `src/types/permission.ts` (mirrors OpenCode V1 schema); (b) HTTP method is `POST /permission/:id/reply` with `reply: "once"|"always"|"reject"`; (c) format/parse uses positional 1/2/3 + bare keywords + `P{n}=…` grammar; (d) bridge must auto-reject when `lastEnqueuedContextToken` is null (so the agent doesn't block); (e) add the `/auto-permission [off|once|always|status]` command (alias `/ap`) and `/reject-permission` (alias `/rp`); (f) auto-mode toggles must persist to `~/.wechat-bridge-opencode/.wechat-bridge-state.json`. See `.omo/plans/permission-tool-design.md` for the canonical pattern.
 
 ## Constraints
 
 - **Direct messages only** — group chats are intentionally ignored
-- **Permission requests are auto-approved** — handled server-side by OpenCode
 - **Single-user** — one WeChat user, one OpenCode session at a time
 - **Runtime state** stored in `~/.wechat-opencode/` (auth tokens, daemon PID, logs, user states)
 
@@ -234,18 +236,17 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 ### Question (/reject-question)
 | Command | Description |
 |---------|-------------|
-| `/reject-question` (alias `/rq`) | Dismiss a pending LLM `question` tool request. The agent receives `QuestionRejectedError: "The user dismissed this question"` and proceeds without an answer. Only meaningful when `pendingQuestion` is non-null on the SessionManager (no-op otherwise). |
+| `/reject-question` (alias `/rq`) | Dismiss a pending LLM `question` request. The agent receives `QuestionRejectedError` and proceeds without an answer. No-op if no question is pending. |
 
-The bridge surfaces OpenCode's `question` tool to WeChat whenever the agent calls it (events `question.asked` / `replied` / `rejected` on `/global/event`). User reply grammar:
+The bridge surfaces OpenCode's `question` tool to WeChat (`question.asked` / `replied` / `rejected` events). Reply grammar: `Q{n}={value}` to pick, `Q{n}-{text}` to force a custom answer, or positional `1 --- 2 --- 3` for ordered single-answers. Multi-question, multi-select, and dash-marker custom text are supported; mobile whitespace around `=` is tolerated. 30-minute soft timeout auto-rejects unanswered questions. Full grammar and edge cases in `.omo/plans/question-tool-design.md`.
 
-| Input | Meaning |
-|-------|---------|
-| `Q{n}=1` | Choose option 1 for question n |
-| `Q{n}=1, 3` | Multi-select options 1 and 3 for question n |
-| `Q{n}-text` | Force a custom answer (the dash always treats content as text, even "1, 3") |
-| `Q1=1 Q2-这题我有自己想法 Q3=3` | Multi-question reply (order doesn't matter) |
-| `1 --- 2 --- 3` | Positional fallback (must be in order) |
-| `1` (no prefix, multi-question) | Downgraded: Q1 gets the answer, rest default |
+### Permission (/reject-permission, /auto-permission)
+| Command | Description |
+|---------|-------------|
+| `/reject-permission` (alias `/rp`) | Dismiss all pending permission cards. No-op if none pending. |
+| `/auto-permission` (alias `/ap`) | Auto-accept mode: `off` (default — show card), `once` (auto-`once`), `always` (auto-`always`). Subcommand `status` queries current mode. Persists across restarts. |
 
-Mobile keyboards auto-insert spaces around operators — the parser tolerates `Q1 = 1`, `Q2 - 文字`, `Q1= 1`, `Q1 =1`. A 30-minute soft timeout auto-rejects unanswered questions and notifies the user.
+The bridge surfaces OpenCode's `permission.asked` events to WeChat as a card with `once` / `always` / `reject` choices. Reply grammar: `1`/`2`/`3` (positional), `once`/`always`/`reject` (keywords), or `P{n}={value}` for per-permission control when 2+ are pending. 30-minute soft timeout auto-rejects. Full grammar, card format, and v2 cascade semantics in `.omo/plans/permission-tool-design.md`.
+
+> Server-side `always` rules live in `InstanceState.approved` (in-memory only). They are lost on `opencode serve` restart; the bridge does NOT shadow-store them.
 

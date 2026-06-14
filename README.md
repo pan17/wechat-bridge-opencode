@@ -17,6 +17,7 @@
 - **文件传输** — 支持任意类型文件收发
 - **音视频传输** — 完整的音频和视频消息支持
 - **LLM 问答支持** — 转发 OpenCode `question` 工具的提问到微信，支持选项 / 多选 / 自定义答案；30 分钟软超时自动 reject
+- **工具权限审批** — WeChat 弹权限卡片，支持 `once` / `always` / `reject` 三选一；`/auto-permission` 可切换自动接收模式；30 分钟软超时自动 reject
 - **二维码登录** — 终端渲染二维码，扫码登录微信
 - **OpenCode Server** — 基于 HTTP API，不再需要 ACP 子进程
 - **后台模式** — 使用 `--daemon` 参数后台运行
@@ -184,22 +185,25 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 ### LLM 问答（`/reject-question`）
 
-当 OpenCode 的 Agent 调用 `question` 工具时，Bridge 会把问题原文转发到微信私聊，用户在微信端回复答案后回传到 server。
+当 OpenCode 的 Agent 调用 `question` 工具时，Bridge 会把问题原文转发到微信私聊，用户在微信端回复后回传到 server。
 
-**微信端输入格式**（`Q{n}={value}` 选 / `Q{n}-{value}` 强制 custom）：
+**微信端输入格式**：`Q{n}={value}` 选 / `Q{n}-{text}` 强制自定义 / 位置 `1 --- 2 --- 3`（单题有序）。支持多题、多选、自定义文字混合；手机自动空格容忍。
 
-| 场景 | 输入示例 |
-|------|---------|
-| 单选 | `Q1=1` |
-| 多选 | `Q1=1, 3`（逗号分隔） |
-| 强制自定义文字（即使内容像数字） | `Q1-这题我有自己想法` 或 `Q1-3`（强制为文字 "3"） |
-| 多题 | `Q1=1 Q2-自定义 Q3=3`（顺序无关） |
-| 跳题（用默认值） | 只发 `Q2=2`，Q1 / Q3 自动用首选项 |
-| 手机自动空格 | `Q1 = 1`、`Q2 - 文字` 都能识别 |
-
-**显式拒绝**：发 `/reject-question`（或 `/rq`）让 Agent 跳过这个问题（agent 会收到 "The user dismissed this question"）。
+**显式拒绝**：发 `/reject-question`（或 `/rq`）让 Agent 跳过这个问题。
 
 **软超时**：30 分钟无应答自动 reject 并在微信发 `⏱ Question timed out` 通知。
+
+### 工具权限（/reject-permission, /auto-permission）
+
+当 OpenCode 的 Agent 调用某个 `permission` 为 `ask` 的工具时，Bridge 会把权限请求以卡片形式转发到微信私聊，用户选择 `once` / `always` / `reject` 后回传 server。
+
+**微信端输入格式**：`1`（once）/ `2`（always）/ `3`（reject），或关键字 `once` / `always` / `reject`；多个 pending 时用 `P1=once P2=reject` 区分。
+
+**显式拒绝**：发 `/reject-permission`（或 `/rp`）一键 reject 所有等待中的权限请求。
+
+**自动接收开关**：发 `/auto-permission`（或 `/ap`）切换模式 `off`（默认）/ `once` / `always`。**注意**：`always` 规则存在 server 内存中，`opencode serve` 重启后丢失，需要重新允许。
+
+**软超时**：30 分钟无应答自动 reject 并在微信发 `⏱ Permission timed out` 通知。
 
 ## 环境要求
 
@@ -220,7 +224,6 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 ## 注意事项
 
 - 仅支持私信（群聊会被忽略）
-- 权限请求自动批准
 - `send-wechat` 工具自动安装到 `~/.config/opencode/tools/send-wechat.ts`
 ## 致谢
 

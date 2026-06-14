@@ -80,6 +80,33 @@ export interface RejectQuestionCommand {
   kind: "reject-question";
 }
 
+/**
+ * `/reject-permission` (alias `/rp`) — explicitly dismiss a pending
+ * permission card (replies `reject` for every pending request). Only
+ * meaningful when `pendingPermissions` is non-empty on the
+ * SessionManager (otherwise no-op). See
+ * `.omo/plans/permission-tool-design.md` §8.2.
+ */
+export interface RejectPermissionCommand {
+  kind: "reject-permission";
+}
+
+/**
+ * `/auto-permission` (alias `/ap`) — toggle the auto-accept mode for
+ * OpenCode permission requests. Three modes:
+ *   - `off`   — show a WeChat card on every permission request (default)
+ *   - `once`  — auto-reply `"once"` without showing a card
+ *   - `always` — auto-reply `"always"` (server stores an in-memory rule)
+ *
+ * Without subcommand or with `status`, reports the current mode. The
+ * setting persists across bridge restarts in
+ * `.wechat-bridge-state.json`.
+ */
+export interface AutoPermissionCommand {
+  kind: "auto-permission";
+  mode: "off" | "once" | "always" | "status";
+}
+
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^\/(?:workspace|ws)\s+(.+)$/i);
@@ -358,6 +385,44 @@ export function parseRejectQuestionCommand(text: string): RejectQuestionCommand 
   return null;
 }
 
+/**
+ * Parse `/reject-permission` (or short alias `/rp`) to dismiss a
+ * pending permission card. Only matches the bare command — no extra
+ * args allowed. The dispatcher (bridge.handlePermissionReply) treats
+ * this as a priority command: if permissions are pending, it rejects
+ * all of them, then sends a confirmation message.
+ */
+export function parseRejectPermissionCommand(text: string): RejectPermissionCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/reject-permission" || trimmed === "/rp") {
+    return { kind: "reject-permission" };
+  }
+  return null;
+}
+
+/**
+ * Parse `/auto-permission` (or short alias `/ap`) to query or change
+ * the auto-accept mode. Three subcommands:
+ *
+ *   `/auto-permission`           → status (default mode)
+ *   `/auto-permission off`       → turn off (back to WeChat cards)
+ *   `/auto-permission once`      → auto-allow per call only
+ *   `/auto-permission always`    → auto-allow + persist server-side rules
+ *   `/auto-permission status`    → show current mode
+ *
+ * Returns null for unrecognized subcommands (so the dispatcher can
+ * fall through to a regular slash-command hint).
+ */
+export function parseAutoPermissionCommand(text: string): AutoPermissionCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/auto-permission" || trimmed === "/ap") {
+    return { kind: "auto-permission", mode: "status" };
+  }
+  const m = trimmed.match(/^\/(?:auto-permission|ap)\s+(off|once|always|status)\s*$/);
+  if (!m) return null;
+  return { kind: "auto-permission", mode: m[1] as "off" | "once" | "always" | "status" };
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ cwd: string }>,
   activeCwd: string | null,
@@ -619,6 +684,12 @@ export function formatHelp(): string {
     "  /reject-question         显式拒绝当前等待中的 LLM 问题（仅在有 pending question 时有效）",
     "  （简写: /rq）",
     "",
+    "── Permission ──",
+    "  /reject-permission       显式拒绝当前等待中的工具权限请求（仅在有 pending permission 时有效）",
+    "  （简写: /rp）",
+    "  /auto-permission         切换权限自动接收模式: off | once | always | status",
+    "  （简写: /ap）",
+    "",
     "  /help                    显示本帮助信息",
   ].join("\n");
 }
@@ -691,6 +762,12 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "── Question ──",
     "  /reject-question         显式拒绝当前等待中的 LLM 问题（仅在有 pending question 时有效）",
     "  （简写: /rq）",
+    "",
+    "── Permission ──",
+    "  /reject-permission       显式拒绝当前等待中的工具权限请求（仅在有 pending permission 时有效）",
+    "  （简写: /rp）",
+    "  /auto-permission         切换权限自动接收模式: off | once | always | status",
+    "  （简写: /ap）",
     "",
     "── 帮助 ──",
     "  /help                    显示本帮助信息",

@@ -37,6 +37,7 @@ function loadUserState(file) {
       cwd: u.cwd,
       showThoughts: state.showThoughts,
       showTools: state.showTools,
+      autoPermissionMode: state.autoPermissionMode,
     };
   }
   return null;
@@ -55,6 +56,7 @@ function saveUserState(file, userState) {
   };
   if (userState.showThoughts !== undefined) payload.showThoughts = userState.showThoughts;
   if (userState.showTools !== undefined)    payload.showTools    = userState.showTools;
+  if (userState.autoPermissionMode !== undefined) payload.autoPermissionMode = userState.autoPermissionMode;
   fs.writeFileSync(file, JSON.stringify(payload, null, 2), "utf-8");
 }
 
@@ -102,5 +104,145 @@ describe("persistence round-trip — top-level display flags", () => {
     const raw = fs.readFileSync(stateFile, "utf-8");
     expect(raw).not.toContain('"showThoughts"');
     expect(raw).toContain('"showTools"');
+  });
+});
+
+describe("persistence round-trip — autoPermissionMode", () => {
+  test("regression: /ap once survives bridge restart", () => {
+    // Simulate: user just set /ap once, handler wrote userState to disk
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      autoPermissionMode: "once",
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+
+    // Simulate: bridge restart, loadUserState runs
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.autoPermissionMode).toBe("once");
+
+    // Simulate: bridge's startup check (bridge.ts:361-362)
+    //   if (this.userState?.autoPermissionMode !== undefined)
+    //     this.sessionManager.setAutoPermissionMode(...)
+    expect(loaded?.autoPermissionMode).toBeDefined();
+  });
+
+  test("regression: /ap always survives bridge restart", () => {
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      autoPermissionMode: "always",
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.autoPermissionMode).toBe("always");
+  });
+
+  test("regression: /ap off survives bridge restart", () => {
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      autoPermissionMode: "off",
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.autoPermissionMode).toBe("off");
+  });
+
+  test("undefined autoPermissionMode is omitted on save (backward compat)", () => {
+    // Old state files (pre-permission-tool) have no autoPermissionMode key
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      showThoughts: true,
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.autoPermissionMode).toBeUndefined();
+
+    // User types /ap once → handler saves; existing showThoughts must NOT be wiped
+    loaded.autoPermissionMode = "once";
+    saveUserState(stateFile, loaded);
+
+    const raw = fs.readFileSync(stateFile, "utf-8");
+    const reparsed = JSON.parse(raw);
+    expect(reparsed.autoPermissionMode).toBe("once");
+    expect(reparsed.showThoughts).toBe(true);
+  });
+
+  test("user switches modes — only the latest value persists", () => {
+    writeInitial();
+    const loaded = loadUserState(stateFile);
+
+    loaded.autoPermissionMode = "once";
+    saveUserState(stateFile, loaded);
+    expect(JSON.parse(fs.readFileSync(stateFile, "utf-8")).autoPermissionMode).toBe("once");
+
+    loaded.autoPermissionMode = "always";
+    saveUserState(stateFile, loaded);
+    expect(JSON.parse(fs.readFileSync(stateFile, "utf-8")).autoPermissionMode).toBe("always");
+
+    loaded.autoPermissionMode = "off";
+    saveUserState(stateFile, loaded);
+    expect(JSON.parse(fs.readFileSync(stateFile, "utf-8")).autoPermissionMode).toBe("off");
+  });
+});
+
+// ─── Source-level regression: wechatMsgCount reset ordering ───
+//
+// Bug: the WeChat 10-msg gateway counter was reset at line 748 of
+// `bridge.ts`, AFTER the permission/question early returns at lines
+// 696-733. When the user typed `1` or `/ap once` to a pending
+// permission card, the early return skipped the reset — the counter
+// carried over to the agent's next reply, triggering a "10 messages
+// already" warning mid-turn. The fix moves the reset ABOVE the early
+// returns (any incoming user message resets the counter).
+//
+// This test reads `dist/src/bridge.js` (the compiled artifact) and
+// asserts the reset line number is lower than the first `return;`
+// inside the permission-pending branch. We anchor on `handlePermissionReply`
+// (unique to handleMessage, never appears in the shutdown handler) to
+// avoid false-positive `return;` matches in other methods.
+describe("regression: wechatMsgCount reset runs before permission/question early returns", () => {
+  test("bridge.ts: counter reset is positioned before hasPendingPermission check", () => {
+    const fs2 = require("node:fs");
+    const path2 = require("node:path");
+    // dist/src/bridge.js is the compiled output; same line numbers as bridge.ts
+    const bridgeJs = path2.join(__dirname, "..", "..", "dist", "src", "bridge.js");
+    const src = fs2.readFileSync(bridgeJs, "utf-8");
+    const lines = src.split("\n");
+
+    // Find the line in `handleMessage` that calls `handlePermissionReply`.
+    // This is unique to handleMessage (the shutdown handler uses
+    // `rejectPendingPermission` directly, not handlePermissionReply).
+    const handlePermissionReplyCall = lines.findIndex((l) =>
+      l.includes("this.handlePermissionReply"),
+    );
+    expect(handlePermissionReplyCall).toBeGreaterThan(-1);
+
+    // The permission-pending `if` lives in the same method, a few lines
+    // above the call. Walk backwards to find it.
+    let permissionCheckLine = -1;
+    for (let i = handlePermissionReplyCall; i >= 0; i--) {
+      if (lines[i].includes("hasPendingPermission") && lines[i].includes("if")) {
+        permissionCheckLine = i;
+        break;
+      }
+    }
+    expect(permissionCheckLine).toBeGreaterThan(-1);
+
+    // The first `return;` after the permission-pending `if` is the
+    // early return we're protecting against.
+    let permissionReturnLine = -1;
+    for (let i = permissionCheckLine; i < lines.length; i++) {
+      if (/^\s*return;\s*$/.test(lines[i])) {
+        permissionReturnLine = i;
+        break;
+      }
+    }
+    expect(permissionReturnLine).toBeGreaterThan(-1);
+
+    // The first `this.wechatMsgCount = 0` line is the reset. It must
+    // appear BEFORE the permission-pending early return — otherwise
+    // the counter would not reset for permission replies.
+    const resetLine = lines.findIndex((l) => l.includes("this.wechatMsgCount = 0"));
+    expect(resetLine).toBeGreaterThan(-1);
+    expect(resetLine).toBeLessThan(permissionReturnLine);
   });
 });

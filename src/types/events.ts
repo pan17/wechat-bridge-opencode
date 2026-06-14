@@ -25,6 +25,10 @@ import type {
   QuestionRepliedEvent,
   QuestionRejectedEvent,
 } from "./question.js";
+import type {
+  PermissionRequest,
+  PermissionRepliedSseProps,
+} from "./permission.js";
 
 export type SessionStatusType = "idle" | "busy" | "retry";
 
@@ -197,6 +201,33 @@ export interface QuestionRejectedSseEvent {
   properties: QuestionRejectedEvent;
 }
 
+// ─── Permission events (agent called the `permission` tool) ───
+//
+// OpenCode's `permission` tool blocks the agent on a Deferred until the
+// user replies `once`, `always`, or `reject`. The server emits two
+// events so the bridge can:
+//   1. `permission.asked`    — surface the request to WeChat (a card)
+//   2. `permission.replied`  — race-safe: clear the local slot keyed by
+//                              requestID. Also covers cascaded sibling
+//                              rejections (server emits one event per
+//                              cascaded sibling, all with `reply="reject"`).
+//
+// There is NO `permission.rejected` event — the server uses
+// `permission.replied` with `reply: "reject"` for both user-initiated
+// and auto-cascaded rejections.
+//
+// See `.omo/plans/permission-tool-design.md` §3b for rationale.
+
+export interface PermissionAskedEvent {
+  type: "permission.asked";
+  properties: PermissionRequest;
+}
+
+export interface PermissionRepliedSseEvent {
+  type: "permission.replied";
+  properties: PermissionRepliedSseProps;
+}
+
 /** The full union we handle. Other event types are ignored. */
 export type OpenCodeEvent =
   | MessagePartDeltaEvent
@@ -208,7 +239,9 @@ export type OpenCodeEvent =
   | SessionErrorEvent
   | QuestionAskedEvent
   | QuestionRepliedSseEvent
-  | QuestionRejectedSseEvent;
+  | QuestionRejectedSseEvent
+  | PermissionAskedEvent
+  | PermissionRepliedSseEvent;
 
 /** Outer envelope from /global/event. /event emits the inner payload directly. */
 export interface GlobalEvent {

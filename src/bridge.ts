@@ -20,8 +20,11 @@ import { SessionManager } from "./server/session.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
 import { formatForWeChat } from "./adapter/outbound.js";
 import { formatQuestionForWeChat, parseQuestionReply } from "./adapter/question-format.js";
+import { formatPermissionCard, parsePermissionReply, formatPermissionSummary } from "./adapter/permission-format.js";
 import type { MediaContent } from "./types.js";
 import type { QuestionPrompt } from "./types/question.js";
+import type { AutoPermissionMode } from "./types/permission.js";
+import { DEFAULT_AUTO_PERMISSION_MODE } from "./types/permission.js";
 import {
   parseWorkspaceCommand,
   parseSessionCommand,
@@ -34,6 +37,8 @@ import {
   parseStopCommand,
   parseRestartCommand,
   parseRejectQuestionCommand,
+  parseRejectPermissionCommand,
+  parseAutoPermissionCommand,
   parseVersionCommand,
   parseHelpCommand,
   formatHelpWithNativeCommands,
@@ -147,6 +152,12 @@ interface UserState {
   cwd: string;
   showThoughts?: boolean;
   showTools?: boolean;
+  /**
+   * Auto-accept mode for OpenCode permission requests. Persisted across
+   * bridge restarts. See `AutoPermissionMode` in
+   * `src/types/permission.ts` for semantics.
+   */
+  autoPermissionMode?: AutoPermissionMode;
 }
 
 export class WeChatOpencodeBridge {
@@ -302,6 +313,35 @@ export class WeChatOpencodeBridge {
           "⏱ Question timed out after 30 minutes. Proceeding without answer. (Use /next to reset counter.)",
         );
       },
+      // Permission lifecycle hooks. Same shape as question: render the
+      // card on `asked`, notify on timeout, let the sessionManager
+      // handle the HTTP reply/reject. Only called when auto-mode is
+      // `off` (the default) — `once`/`always` auto-replies bypass
+      // these callbacks entirely.
+      onPermissionAsked: async (contextToken, request, requestID) => {
+        // Compute index/total so the card can show the right syntax:
+        // single-pending cards say "Reply with 1 | 2 | 3"; multi-
+        // pending cards say "Send 1 to apply to ALL or P1=once P2=…".
+        // The new permission was just added to the pending map by
+        // SessionManager.setPendingPermission before this callback
+        // runs, so listPendingPermissions() includes it.
+        const allPending = this.sessionManager!.listPendingPermissions();
+        const total = allPending.length;
+        const index = allPending.findIndex((p) => p.requestID === requestID);
+        const card = formatPermissionCard(
+          request,
+          index >= 0 ? index + 1 : undefined,
+          total > 1 ? total : undefined,
+        );
+        await this.sendReply(contextToken, card);
+        this.log(`[permission] card sent: id=${requestID.slice(0, 12)}… permission=${request.permission} patterns=${request.patterns.length} (${total} pending)`);
+      },
+      onPermissionTimedOut: async (contextToken, requestID) => {
+        await this.sendReply(
+          contextToken,
+          `⏱ Permission timed out after 30 minutes. The tool call was rejected. (Use /next to reset counter.)`,
+        );
+      },
     });
 
     // Restore persisted display flags (only if defined to avoid clobbering
@@ -313,6 +353,17 @@ export class WeChatOpencodeBridge {
         showTools: this.userState.showTools,
       });
     }
+
+    // Restore persisted auto-permission mode (same partial-update
+    // principle: default to `off` when absent). The sessionManager
+    // consults this on every `permission.asked` event — `off` shows
+    // the WeChat card, `once`/`always` auto-reply without one.
+    if (this.userState?.autoPermissionMode !== undefined) {
+      this.sessionManager.setAutoPermissionMode(this.userState.autoPermissionMode);
+    } else {
+      this.sessionManager.setAutoPermissionMode(DEFAULT_AUTO_PERMISSION_MODE);
+    }
+    this.log(`[permission] auto-mode: ${this.sessionManager.getAutoPermissionMode()}`);
 
     // 4. Tool API server
     this.startToolApiServer();
@@ -332,6 +383,23 @@ export class WeChatOpencodeBridge {
       }
     } catch (err) {
       this.log(`[question-startup] leaked-question check failed (non-fatal): ${String(err)}`);
+    }
+
+    // 4.6 Same cleanup for leaked permissions. Any permission that was
+    // pending when a previous bridge instance died gets rejected
+    // proactively so the next session isn't blocked. The user already
+    // moved on; re-surfacing those cards would be confusing.
+    try {
+      const leaked = await this.sessionManager.listLeakedPermissions(this.config.agent.cwd);
+      for (const req of leaked) {
+        await this.sessionManager.rejectOrphanPermission(req.id, this.config.agent.cwd);
+        this.log(`[permission-startup] rejected leaked permission id=${req.id.slice(0, 12)}…`);
+      }
+      if (leaked.length > 0) {
+        this.log(`[permission-startup] rejected ${leaked.length} leaked permission(s)`);
+      }
+    } catch (err) {
+      this.log(`[permission-startup] leaked-permission check failed (non-fatal): ${String(err)}`);
     }
 
     // 5. Start the SSE event pipeline so we don't miss any agent events
@@ -370,6 +438,21 @@ export class WeChatOpencodeBridge {
         // best effort during shutdown
       }
     }
+    // Same cleanup for permissions: reject any pending cards so the
+    // server's `Deferred.await()` doesn't block forever. Iterate all
+    // pending requestIDs (Map-keyed, unlike the question tool's single
+    // slot). Server's reject cascade handles siblings automatically.
+    if (this.sessionManager?.hasPendingPermission()) {
+      const pending = this.sessionManager.listPendingPermissions();
+      this.log(`[permission-shutdown] rejecting ${pending.length} pending permission(s)`);
+      for (const p of pending) {
+        try {
+          await this.sessionManager.rejectPendingPermission(p.requestID);
+        } catch {
+          // best effort during shutdown
+        }
+      }
+    }
     this.sessionManager = null;
     if (this.toolApiServer) {
       await new Promise<void>((resolve) => this.toolApiServer!.close(() => resolve()));
@@ -390,11 +473,13 @@ export class WeChatOpencodeBridge {
             cwd: string;
             showThoughts?: boolean;
             showTools?: boolean;
+            autoPermissionMode?: "off" | "once" | "always";
           }
         | {
             users?: Array<{ userId: string; sessionId?: string; cwd: string }>;
             showThoughts?: boolean;
             showTools?: boolean;
+            autoPermissionMode?: "off" | "once" | "always";
           };
       if ("users" in state && state.users && state.users.length > 0) {
         const u = state.users[0];
@@ -404,6 +489,7 @@ export class WeChatOpencodeBridge {
           cwd: u.cwd,
           showThoughts: state.showThoughts,
           showTools: state.showTools,
+          autoPermissionMode: state.autoPermissionMode,
         };
       } else if ("sessionId" in state || "cwd" in state) {
         this.userState = {
@@ -412,6 +498,7 @@ export class WeChatOpencodeBridge {
           cwd: (state as { cwd: string }).cwd,
           showThoughts: state.showThoughts,
           showTools: state.showTools,
+          autoPermissionMode: (state as { autoPermissionMode?: "off" | "once" | "always" }).autoPermissionMode,
         };
       }
     } catch {
@@ -435,6 +522,7 @@ export class WeChatOpencodeBridge {
       };
       if (this.userState.showThoughts !== undefined) payload.showThoughts = this.userState.showThoughts;
       if (this.userState.showTools !== undefined) payload.showTools = this.userState.showTools;
+      if (this.userState.autoPermissionMode !== undefined) payload.autoPermissionMode = this.userState.autoPermissionMode;
       fs.writeFileSync(stateFile, JSON.stringify(payload, null, 2));
     } catch {
       // Best effort
@@ -598,6 +686,38 @@ export class WeChatOpencodeBridge {
     const contextToken = msg.context_token;
     if (!userId || !contextToken) return;
 
+    // Any incoming user message resets the WeChat 10-msg gateway counter.
+    // This MUST run before the permission/question early returns below —
+    // otherwise, replies to a pending permission card (e.g. typing `1`
+    // or `/ap once` while a card is showing) wouldn't reset, and the
+    // counter would carry over to the agent's next reply. See the bug
+    // report: "我用了，没发现持久化存储到json里面呢" session.
+    this.wechatMsgCount = 0;
+
+    // If a permission is pending, the next user message is (almost
+    // always) the decision. Route to handlePermissionReply which
+    // checks for priority commands (/rp, /ap, /help, /status) before
+    // parsing the text as a once/always/reject choice. Permission
+    // check runs BEFORE question (see `.omo/plans/permission-tool-
+    // design.md` §7.6 — permission cards have higher urgency since
+    // the agent is blocked on a tool call).
+    if (this.sessionManager?.hasPendingPermission()) {
+      const text = this.extractTextFromMessage(msg);
+      if (text === null) {
+        // Non-text message (image/file/voice) while waiting for a
+        // permission decision. Tell the user we need text and bail.
+        this.sendReply(
+          contextToken,
+          "⚠️ 当前正在等待 permission 回复，请用文本回复（1 / 2 / 3 或 `P1=once`）。",
+        ).catch(() => {});
+        return;
+      }
+      this.handlePermissionReply(contextToken, text).catch((err: unknown) => {
+        this.log(`handlePermissionReply error: ${String(err)}`);
+      });
+      return;
+    }
+
     // If a question is pending, the next user message is (almost always)
     // the answer. Route to handleQuestionReply which checks for priority
     // commands (/stop, /next, /restart, /reject-question) before
@@ -631,9 +751,6 @@ export class WeChatOpencodeBridge {
       this.userState.userId = userId;
     }
     this.saveUserState();
-
-    // User reply resets the WeChat 10-message gateway limit
-    this.wechatMsgCount = 0;
 
     // Auto-flush pending cache on any user message
     if (this.pendingOutbound.length > 0 && !/^\/next\b/.test(this.extractTextFromMessage(msg)?.trim() ?? "")) {
@@ -778,11 +895,145 @@ export class WeChatOpencodeBridge {
    * /help):
    *   /help, /status
    *
-   * Anything else is parsed as a question answer using the Qn= / Qn-
+    * Anything else is parsed as a question answer using the Qn= / Qn-
    * grammar from `parseQuestionReply`. Slash commands we don't recognize
    * (e.g. /workspace, /agent) will fail to parse as an answer and we'll
    * tell the user to either answer normally or use /reject-question.
    */
+
+  /**
+   * Handle the user's reply while a permission is pending. Called from
+   * `handleMessage` as an early-return when `sessionManager.hasPendingPermission()`.
+   *
+   * Priority commands first (reject all pending, then dispatch):
+   *   /reject-permission (alias /rp) — dismiss all pending cards
+   *
+   * Informational commands (run without rejecting; permissions stay
+   * pending so the user can still decide):
+   *   /help, /status, /auto-permission …
+   *
+   * Anything else is parsed as a permission decision (1/2/3, bare
+   * keywords, `P{n}=…`, `P{n}-text`) via `parsePermissionReply`.
+   */
+  private async handlePermissionReply(contextToken: string, text: string): Promise<void> {
+    const pending = this.sessionManager?.listPendingPermissions() ?? [];
+    if (pending.length === 0) return; // defensive — race could have cleared it
+
+    const trimmed = text.trim();
+
+    // ── Priority commands: reject all pending first ──
+    if (parseRejectPermissionCommand(trimmed)) {
+      this.log(`[permission] rejecting all ${pending.length} pending via /rp`);
+      for (const p of pending) {
+        await this.sessionManager!.rejectPendingPermission(p.requestID);
+      }
+      await this.sendReply(contextToken, "❌ Permission rejected.");
+      return;
+    }
+    // /stop, /next, /restart are NOT priority here — the agent is
+    // blocked on a tool call. The user must either reply with a
+    // decision OR /rp to free the slot. Sending /stop without first
+    // rejecting the permission would still leave the slot dangling.
+
+    // ── Informational commands: run without rejecting ──
+    if (parseHelpCommand(trimmed)) {
+      this.sendHelpReply(contextToken).catch(() => {});
+      return;
+    }
+    const stCmd = parseStatusCommand(trimmed);
+    if (stCmd) {
+      this.handleStatusCommand(contextToken, stCmd).catch(() => {});
+      return;
+    }
+    const apCmd = parseAutoPermissionCommand(trimmed);
+    if (apCmd) {
+      this.handleAutoPermissionCommand(contextToken, apCmd).catch(() => {});
+      return;
+    }
+
+    // ── Default: parse as permission decision ──
+    const parsed = parsePermissionReply(trimmed, pending);
+    for (const w of parsed.warnings) this.log(`[permission] parse warning: ${w}`);
+
+    if (parsed.decisions.length === 0) {
+      // Surface the parser's specific warning(s) so the user knows
+      // exactly what's wrong. Default to the generic hint when no
+      // warning was produced (rare — means the input was neither a
+      // P{n}= segment nor a recognizable bare keyword).
+      const hint = parsed.warnings.length > 0
+        ? parsed.warnings.join(" / ")
+        : pending.length === 1
+          ? "Send 1 (once), 2 (always), 3 (reject), or /rp."
+          : `Send 1/2/3 (applies to all ${pending.length}), P{n}=value (per-permission), or /rp.`;
+      await this.sendReply(
+        contextToken,
+        `⚠️ Unrecognized reply. ${hint}`,
+      );
+      return;
+    }
+
+    for (const decision of parsed.decisions) {
+      try {
+        await this.sessionManager!.answerPendingPermission(
+          decision.requestID,
+          decision.reply,
+          decision.message,
+        );
+      } catch (err) {
+        // Server returned 4xx — most likely the permission was already
+        // resolved (race with server cascade, another client, or
+        // timeout firing while user was typing).
+        this.log(`[permission] reply HTTP failed: ${String(err)}`);
+        await this.sendReply(
+          contextToken,
+          "⏱ Permission 已过期（可能已被自动处理）。请重发消息。",
+        );
+      }
+    }
+    await this.sendReply(
+      contextToken,
+      `✅ Permission handled: ${parsed.decisions.map((d) => d.reply).join(", ")}.`,
+    );
+  }
+
+  /**
+   * Handle `/auto-permission` (alias `/ap`) — toggle the auto-accept
+   * mode. Persists the change to `.wechat-bridge-state.json` via the
+   * existing `saveUserState` (which writes the full state, including
+   * autoPermissionMode).
+   *
+   * Subcommands: `off` / `once` / `always` / `status`.
+   */
+  private async handleAutoPermissionCommand(
+    contextToken: string,
+    cmd: ReturnType<typeof parseAutoPermissionCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    if (cmd!.mode === "status") {
+      const current = this.sessionManager.getAutoPermissionMode();
+      await this.sendReply(contextToken, `🔒 Auto-permission mode: **${current}**`);
+      return;
+    }
+
+    const newMode = cmd!.mode as "off" | "once" | "always";
+    this.sessionManager.setAutoPermissionMode(newMode);
+    if (this.userState) {
+      this.userState.autoPermissionMode = newMode;
+      this.saveUserState();
+    }
+    const desc = newMode === "off"
+      ? "shown as WeChat cards (current behavior)"
+      : newMode === "once"
+      ? "auto-allowed (one-shot) — no card"
+      : "auto-allowed permanently (server-side rules; lost on opencode restart)";
+    await this.sendReply(
+      contextToken,
+      `🔒 Auto-permission set to **${newMode}**. Future requests: ${desc}.`,
+    );
+    this.log(`[permission] auto-mode set to ${newMode}`);
+  }
+
   private async handleQuestionReply(contextToken: string, text: string): Promise<void> {
     const pending = this.sessionManager?.getPendingQuestion();
     if (!pending) return; // defensive — race could have cleared it
@@ -1436,6 +1687,20 @@ export class WeChatOpencodeBridge {
         }
       }
 
+      // Append a "⏳ Permission pending" line if any permission cards are
+      // waiting. Same rationale as the question line above.
+      const permPending = sessionManager.listPendingPermissions();
+      if (permPending.length > 0) {
+        const permSummary = formatPermissionSummary(permPending);
+        if (permSummary) statusText += `\n${permSummary}`;
+      }
+
+      // Append the auto-permission mode line. Always show it so users
+      // can confirm their current preference at a glance. The command
+      // hint points to /auto-permission for changing it.
+      const autoMode = sessionManager.getAutoPermissionMode();
+      statusText += `\n🔒 Auto-permission: ${autoMode}   (use /auto-permission [off|once|always|status] to change)`;
+
       await this.sendReply(contextToken, statusText);
     });
   }
@@ -1736,6 +2001,12 @@ export class WeChatOpencodeBridge {
       "thought-display",
       "tool-display",
       "stop", "restart", "next", "version",
+      // Permission commands (parsed by parseAutoPermissionCommand /
+      // parseRejectPermissionCommand, never forwarded to agent when
+      // pending; otherwise safe to list as bridge commands so the
+      // "unknown slash command" hint doesn't trigger on them).
+      "auto-permission", "ap",
+      "reject-permission", "rp",
     ];
     if (bridgeCommands.includes(cmdName)) return null;
 

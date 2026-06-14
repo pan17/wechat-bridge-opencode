@@ -16,6 +16,7 @@ Bridge WeChat direct messages to OpenCode Server (HTTP API), with full bidirecti
 - **Images** — Send/receive images with WeChat CDN support
 - **Files** — Send/receive files of any type
 - **Audio/Video** — Full audio and video message support
+- **Permission cards** — Surface OpenCode's `permission.asked` events to WeChat as `once` / `always` / `reject` cards; `/auto-permission` toggles auto-accept mode; 30-min soft timeout
 - **QR Login** — Terminal QR code rendering for WeChat login
 - **OpenCode Server** — HTTP API based, no ACP subprocess required
 - **Daemon Mode** — Run in background with `--daemon`
@@ -181,6 +182,18 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 |---------|-------------|
 | `/next` | WeChat limits bots to 10 consecutive messages; user reply required to continue. Send `/next` to reset the counter without forwarding to the agent |
 
+### Permission (`/reject-permission`, `/auto-permission`)
+
+When the OpenCode agent calls a tool whose permission rule is `ask`, the bridge sends a permission card to WeChat. The user picks `once`, `always`, or `reject`.
+
+**Reply grammar:** `1` (once) / `2` (always) / `3` (reject), or keywords `once` / `always` / `reject`; for 2+ pending permissions use `P1=once P2=reject` to control each.
+
+**Explicit reject:** `/reject-permission` (alias `/rp`) dismisses all pending permission cards.
+
+**Auto-accept toggle:** `/auto-permission` (alias `/ap`) sets `off` (default) / `once` / `always`. **Note:** `always` rules are stored in server memory and lost when `opencode serve` restarts.
+
+**Soft timeout:** 30 minutes without reply → auto-reject + `⏱ Permission timed out` message.
+
 ## Requirements
 
 - Node.js 20+
@@ -200,7 +213,6 @@ Runtime data stored in `~/.wechat-bridge-opencode`:
 ## Notes
 
 - Direct messages only (group chats ignored)
-- Permission requests are auto-approved
 - `send-wechat` tool auto-installed to `~/.config/opencode/tools/send-wechat.ts`
 
 ## Acknowledgment

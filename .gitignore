@@ -28,5 +28,6 @@ Thumbs.db
 *.njsproj
 *.sln
 
-# OpenCode internal files
-.omo/
+# OpenCode internal state — only ignore transient session continuation,
+# keep design plans in `.omo/plans/` tracked.
+.omo/run-continuation/

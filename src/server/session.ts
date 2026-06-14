@@ -39,6 +39,8 @@ import type {
   MessageUpdatedEvent,
   OpenCodeEvent,
   Part,
+  PermissionAskedEvent,
+  PermissionRepliedSseEvent,
   QuestionAskedEvent,
   QuestionRepliedSseEvent,
   QuestionRejectedSseEvent,
@@ -54,6 +56,13 @@ import type {
   QuestionPrompt,
   QuestionRequest,
 } from "../types/question.js";
+import type {
+  AutoPermissionMode,
+  PendingPermission,
+  PermissionReply,
+  PermissionRequest,
+} from "../types/permission.js";
+import { DEFAULT_AUTO_PERMISSION_MODE } from "../types/permission.js";
 
 /** Idle debounce: wait this long after the last delta before considering the turn final. */
 const TURN_FINALIZE_DEBOUNCE_MS = 500;
@@ -71,6 +80,16 @@ const TURN_STUCK_TIMEOUT_MS = 5 * 60_000;
  * `.omo/plans/question-tool-design.md` §14 Q1.
  */
 const QUESTION_TIMEOUT_MS = 30 * 60_000;
+/**
+ * Soft timeout for unanswered `permission.asked` events. Mirrors
+ * `QUESTION_TIMEOUT_MS` above — same 30-minute heuristic for the same
+ * "user stepped away" scenario. After this many ms, SessionManager
+ * auto-rejects the permission via `replyToPermission(id, "reject")` and
+ * notifies the bridge. The agent's `Deferred.await()` is woken with
+ * `PermissionV1.RejectedError` (see
+ * `packages/opencode/src/permission/index.ts:132-138`).
+ */
+const PERMISSION_TIMEOUT_MS = 30 * 60_000;
 
 // ─── Helpers ───
 
@@ -151,6 +170,31 @@ export interface SessionManagerOpts {
    * WeChat target.
    */
   onQuestionTimedOut?: (contextToken: string) => Promise<void>;
+  /**
+   * Invoked when a `permission.asked` event arrives and the permission
+   * is queued for the WeChat user. The bridge should format the
+   * permission card (via `formatPermissionCard`) and push it to WeChat.
+   * Must be non-throwing — errors are caught and logged.
+   *
+   * Only called when `autoPermissionMode === "off"` (the default).
+   * When the mode is `"once"` or `"always"`, the bridge doesn't need
+   * to know about each event — SessionManager auto-replies directly.
+   *
+   * Receives the WeChat contextToken (so the bridge can route to the
+   * right chat), the full permission request (so the bridge can render
+   * the tool name + patterns + metadata), and the opencode requestID.
+   */
+  onPermissionAsked?: (
+    contextToken: string,
+    request: PermissionRequest,
+    requestID: string,
+  ) => Promise<void>;
+  /**
+   * Invoked when the permission soft-timeout fires (30 min with no user
+   * reply). The bridge should send a user-visible "timed out" message
+   * to WeChat before the auto-reject lands on the server.
+   */
+  onPermissionTimedOut?: (contextToken: string, requestID: string) => Promise<void>;
 }
 
 interface QueueItem {
@@ -262,6 +306,41 @@ export class SessionManager {
   ) => Promise<void>;
   private onQuestionTimedOut?: (contextToken: string) => Promise<void>;
 
+  // ─── Permission slots (orthogonal to currentTurn, Map-keyed) ───
+  /**
+   * Per-requestID soft timeout handles for pending permissions. Cleared
+   * when the user answers, the user rejects, the server-side
+   * `permission.replied` echo arrives, or the bridge shuts down.
+   *
+   * A Map (vs the question tool's single slot) because multiple parallel
+   * permission requests can coexist — when the agent dispatches
+   * concurrent tool calls (e.g. via the `task` sub-agent tool), each
+   * tool call can ask for permission independently with its own
+   * requestID.
+   */
+  private permissionTimeoutHandles: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  /**
+   * Pending permissions keyed by `requestID`. Independent of
+   * `currentTurn` — a permission can be pending while the turn is also
+   * accumulating (the agent is blocked on the permission Deferred).
+   */
+  private pendingPermissions: Map<string, PendingPermission> = new Map();
+  /** Callbacks set by the bridge; see SessionManagerOpts.onPermission*. */
+  private onPermissionAsked?: (
+    contextToken: string,
+    request: PermissionRequest,
+    requestID: string,
+  ) => Promise<void>;
+  private onPermissionTimedOut?: (contextToken: string, requestID: string) => Promise<void>;
+  /**
+   * Client-side preference for auto-accepting permission requests. When
+   * `off` (default), every `permission.asked` event surfaces a WeChat
+   * card. When `once` or `always`, the SessionManager auto-replies
+   * without invoking `onPermissionAsked`. See `AutoPermissionMode` in
+   * `src/types/permission.ts` for semantics.
+   */
+  private autoPermissionMode: AutoPermissionMode = DEFAULT_AUTO_PERMISSION_MODE;
+
   constructor(opts: SessionManagerOpts) {
     this.client = new OpenCodeServerClient({
       baseUrl: opts.serverUrl,
@@ -278,6 +357,8 @@ export class SessionManager {
     this.useEventStream = opts.useEventStream !== false;
     this.onQuestionAsked = opts.onQuestionAsked;
     this.onQuestionTimedOut = opts.onQuestionTimedOut;
+    this.onPermissionAsked = opts.onPermissionAsked;
+    this.onPermissionTimedOut = opts.onPermissionTimedOut;
   }
 
   /** Current session ID, or null if not yet created. */
@@ -590,6 +671,13 @@ export class SessionManager {
     this.eventPipeline = null;
     this.clearFinalizeTimers();
     this.clearQuestionTimeout();
+    // Clear permission timeouts (best-effort; bridge.stop() iterates
+    // `listPendingPermissions()` and sends the HTTP rejects BEFORE
+    // calling this method, so the timers should already be cleared by
+    // `clearPermissionTimeout` inside `rejectPendingPermission`. This
+    // is just defense-in-depth for paths that bypass the bridge).
+    for (const handle of this.permissionTimeoutHandles.values()) clearTimeout(handle);
+    this.permissionTimeoutHandles.clear();
   }
 
   // ─── Question slot API ───
@@ -786,6 +874,277 @@ export class SessionManager {
     this.clearPendingQuestion(event.properties.requestID, "rejected");
   }
 
+  // ─── Permission slot API ───
+  //
+  // Mirrors the question slot but uses a Map<requestID, …> because
+  // multiple parallel permission requests are possible (concurrent tool
+  // calls). When the agent dispatches parallel tools, each tool call
+  // can ask for permission independently. Independent of `currentTurn`
+  // — a permission can be pending while the turn is also accumulating
+  // (the agent is blocked on the permission tool's Deferred.await).
+
+  /**
+   * True iff at least one permission is currently waiting for the
+   * user's answer. When `requestID` is provided, checks that specific
+   * request only (useful for test assertions and race-safe clears).
+   */
+  hasPendingPermission(requestID?: string): boolean {
+    return requestID
+      ? this.pendingPermissions.has(requestID)
+      : this.pendingPermissions.size > 0;
+  }
+
+  /** Read-only view of one pending permission, or null. */
+  getPendingPermission(requestID: string): PendingPermission | null {
+    return this.pendingPermissions.get(requestID) ?? null;
+  }
+
+  /** Snapshot of all pending permissions (most-recent-first-ish, but Map order is insertion). */
+  listPendingPermissions(): PendingPermission[] {
+    return [...this.pendingPermissions.values()];
+  }
+
+  /**
+   * Submit the user's decision for a pending permission. POSTs to
+   * `/permission/:id/reply` with the reply body. Resolves once the
+   * HTTP call returns (does NOT wait for the SSE `permission.replied`
+   * echo — that echo will redundantly call `clearPendingPermission`
+   * which is idempotent).
+   *
+   * `message` is only forwarded to the server when `reply === "reject"`
+   * — `client.replyToPermission` handles that filter internally.
+   *
+   * Throws on HTTP failure; the bridge should catch and surface a
+   * "permission 已过期" message to the user.
+   */
+  async answerPendingPermission(
+    requestID: string,
+    reply: PermissionReply,
+    message?: string,
+  ): Promise<void> {
+    if (!this.pendingPermissions.has(requestID)) {
+      this.log(`[permission] answerPendingPermission called for unknown id=${requestID.slice(0, 12)}… (no-op)`);
+      return;
+    }
+    try {
+      await this.client.replyToPermission(requestID, reply, message, this.cwd);
+      this.log(`[permission] answered id=${requestID.slice(0, 12)}… reply=${reply}`);
+    } finally {
+      this.clearPendingPermission(requestID);
+    }
+  }
+
+  /**
+   * Dismiss a pending permission (user said `/reject-permission`, the
+   * 30-min soft timeout fired, or bridge shutdown cleanup). POSTs to
+   * `/permission/:id/reply` with `reply="reject"`. No-op if the
+   * permission is not pending locally.
+   *
+   * Race-safe: the local slot is cleared BEFORE the HTTP call so a
+   * concurrent `handlePermissionRepliedSse` (from the server's SSE
+   * echo) finds an empty slot (no-op).
+   *
+   * Returns once the HTTP call resolves. Errors are logged but NOT
+   * rethrown — reject is best-effort (the user already moved on, and
+   * the server's instance dispose finalizer will clean up stragglers).
+   */
+  async rejectPendingPermission(requestID: string, message?: string): Promise<void> {
+    if (!this.pendingPermissions.has(requestID)) return;
+    this.log(`[permission] rejecting id=${requestID.slice(0, 12)}…`);
+    this.clearPendingPermission(requestID);
+    try {
+      await this.client.rejectPendingPermission(requestID, message, this.cwd);
+    } catch (err) {
+      this.log(`[permission] reject HTTP failed (non-fatal): ${String(err)}`);
+    }
+  }
+
+  /**
+   * At bridge startup, return permissions the server has pending for
+   * OUR session that we don't have a local slot for. These are the
+   * "leaked" permissions from a previous bridge instance — they will
+   * never be answered (the user already moved on, or the bridge
+   * crashed mid-permission), so the bridge rejects them proactively.
+   *
+   * Returns an empty array on any error (network, parse, missing
+   * session) so the startup path is non-blocking. Filtering:
+   *   - Only permissions belonging to OUR sessionID (don't touch others')
+   *   - Exclude any requestID we still have a local slot for (race-safe)
+   */
+  async listLeakedPermissions(directory?: string): Promise<PermissionRequest[]> {
+    if (!this.sessionId) return [];
+    try {
+      const all = await this.client.listPendingPermissions(directory);
+      const localIds = new Set(this.pendingPermissions.keys());
+      return all.filter((p) => p.sessionID === this.sessionId && !localIds.has(p.id));
+    } catch (err) {
+      this.log(`[permission-startup] listPendingPermissions failed (non-fatal): ${String(err)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Reject a permission request that is NOT in our local pending
+   * slot (i.e. an orphan from a previous bridge instance discovered
+   * via `listLeakedPermissions`). POSTs `reply: "reject"` without
+   * touching the local map. Errors are logged but NOT rethrown —
+   * this is best-effort startup cleanup.
+   */
+  async rejectOrphanPermission(requestID: string, directory?: string): Promise<void> {
+    try {
+      await this.client.rejectPendingPermission(requestID, undefined, directory);
+    } catch (err) {
+      this.log(`[permission-startup] reject orphan id=${requestID.slice(0, 12)}… failed: ${String(err)}`);
+    }
+  }
+
+  // ─── Auto-accept mode (client-side preference) ───
+
+  /**
+   * Set the auto-accept mode. Called by the bridge on startup (from
+   * persisted state) and when the user runs `/auto-permission …`. When
+   * the mode is `off`, every future `permission.asked` event surfaces
+   * a WeChat card via `onPermissionAsked`. When the mode is `once` or
+   * `always`, the SessionManager auto-replies directly without
+   * invoking the callback.
+   */
+  setAutoPermissionMode(mode: AutoPermissionMode): void {
+    if (mode !== this.autoPermissionMode) {
+      this.log(`[permission] auto-mode changed: ${this.autoPermissionMode} → ${mode}`);
+    }
+    this.autoPermissionMode = mode;
+  }
+
+  /** Current auto-accept mode. Used by `/status` to display it. */
+  getAutoPermissionMode(): AutoPermissionMode {
+    return this.autoPermissionMode;
+  }
+
+  // ─── Permission slot internals ───
+
+  private setPendingPermission(req: PermissionRequest, contextToken: string): void {
+    const entry: PendingPermission = {
+      requestID: req.id,
+      request: req,
+      contextToken,
+      askedAt: Date.now(),
+    };
+    this.pendingPermissions.set(req.id, entry);
+    this.armPermissionTimeout(req.id, contextToken);
+  }
+
+  /**
+   * Clear the local pending slot for a single requestID. Idempotent:
+   * a no-op if the slot is absent OR if the local slot has already
+   * been replaced (means the server cleared a different permission,
+   * possibly from a prior bridge instance whose leaked-permission
+   * cleanup we triggered). The second case is important to avoid
+   * dropping the *current* local permission when an old SSE echo
+   * arrives.
+   */
+  private clearPendingPermission(requestID: string): void {
+    if (!this.pendingPermissions.has(requestID)) return;
+    this.log(`[permission] slot cleared id=${requestID.slice(0, 12)}…`);
+    this.pendingPermissions.delete(requestID);
+    this.clearPermissionTimeout(requestID);
+  }
+
+  private armPermissionTimeout(requestID: string, contextToken: string): void {
+    this.clearPermissionTimeout(requestID);
+    const handle = setTimeout(() => {
+      if (!this.pendingPermissions.has(requestID)) return;
+      this.log(`[permission] soft timeout (${PERMISSION_TIMEOUT_MS}ms) — auto-rejecting id=${requestID.slice(0, 12)}…`);
+      this.onPermissionTimedOut?.(contextToken, requestID).catch((err) => {
+        this.log(`[permission] onPermissionTimedOut callback error: ${String(err)}`);
+      });
+      this.rejectPendingPermission(requestID).catch((err) => {
+        this.log(`[permission] auto-reject HTTP failed: ${String(err)}`);
+      });
+    }, PERMISSION_TIMEOUT_MS);
+    this.permissionTimeoutHandles.set(requestID, handle);
+  }
+
+  private clearPermissionTimeout(requestID: string): void {
+    const handle = this.permissionTimeoutHandles.get(requestID);
+    if (handle) {
+      clearTimeout(handle);
+      this.permissionTimeoutHandles.delete(requestID);
+    }
+  }
+
+  // ─── Permission SSE handlers ───
+
+  /**
+   * Handle a `permission.asked` event. Three paths:
+   *
+   * 1. **auto-mode (`once` / `always`)**: auto-reply without showing
+   *    a WeChat card. The server emits a `permission.replied` echo
+   *    for our reply AND may auto-approve cascaded siblings — those
+   *    echoes are handled by `handlePermissionRepliedSse`.
+   *    If the auto-reply HTTP throws (e.g. 404 because the server
+   *    already resolved the request, possibly from another client),
+   *    we log and do NOT set pending — the request is effectively
+   *    gone on the server.
+   *
+   * 2. **off-mode + contextToken available**: queue pending, notify
+   *    bridge via `onPermissionAsked`, arm 30-min timeout.
+   *
+   * 3. **off-mode + no contextToken**: auto-reject so the agent
+   *    doesn't block forever waiting for a reply no one will see.
+   */
+  private handlePermissionAsked(event: PermissionAskedEvent): void {
+    const req = event.properties;
+
+    // Path 1: auto-mode shortcut.
+    if (this.autoPermissionMode !== "off") {
+      const reply: PermissionReply = this.autoPermissionMode === "once" ? "once" : "always";
+      this.client.replyToPermission(req.id, reply, undefined, this.cwd)
+        .then(() => {
+          this.log(`[permission auto=${this.autoPermissionMode}] auto-replied id=${req.id.slice(0, 12)}… permission=${req.permission}`);
+        })
+        .catch((err) => {
+          // Server already resolved (404) or network blip. Don't set
+          // pending — the request is effectively gone. Sending a card
+          // and waiting for user reply would just produce another 404
+          // on their answer. The 30-min timeout also does NOT fire
+          // here (no pending slot was created).
+          this.log(`[permission auto] reply failed (likely already resolved), id=${req.id.slice(0, 12)}…: ${String(err)}`);
+        });
+      return;
+    }
+
+    // Path 2: off-mode + contextToken → show WeChat card.
+    const contextToken = this.lastEnqueuedContextToken;
+    if (!contextToken) {
+      // Path 3: no contextToken → auto-reject so agent doesn't block.
+      this.log(`[permission] no contextToken for asked id=${req.id.slice(0, 12)}…; auto-rejecting`);
+      this.client.rejectPendingPermission(req.id, undefined, this.cwd).catch((err) => {
+        this.log(`[permission] auto-reject failed: ${String(err)}`);
+      });
+      return;
+    }
+    this.setPendingPermission(req, contextToken);
+    this.log(`[permission] asked id=${req.id.slice(0, 12)}… permission=${req.permission} patterns=${req.patterns.length}`);
+    this.onPermissionAsked?.(contextToken, req, req.id).catch((err) => {
+      this.log(`[permission] onPermissionAsked callback error: ${String(err)}`);
+    });
+  }
+
+  /**
+   * Handle the server's `permission.replied` SSE echo. Clears the
+   * local slot keyed by `requestID` — race-safe (no-op when absent).
+   *
+   * IMPORTANT: when the user replies `reject` to one permission, the
+   * server auto-cascades `reject` to all siblings of the same
+   * `sessionID` (see `packages/opencode/src/permission/index.ts:140-149`)
+   * and emits a separate `permission.replied` event for each cascaded
+   * sibling. This handler clears all of them automatically — no
+   * client-side iteration needed.
+   */
+  private handlePermissionRepliedSse(event: PermissionRepliedSseEvent): void {
+    this.clearPendingPermission(event.properties.requestID);
+  }
+
   // ─── Event handler dispatch ───
 
   private handleEvent(event: OpenCodeEvent): void {
@@ -827,6 +1186,12 @@ export class SessionManager {
         break;
       case "question.rejected":
         this.handleQuestionRejectedSse(event as QuestionRejectedSseEvent);
+        break;
+      case "permission.asked":
+        this.handlePermissionAsked(event as PermissionAskedEvent);
+        break;
+      case "permission.replied":
+        this.handlePermissionRepliedSse(event as PermissionRepliedSseEvent);
         break;
       default:
         // Unknown event — ignore.

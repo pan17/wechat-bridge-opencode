@@ -7,6 +7,7 @@
 
 import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef, McpStatusMap } from "../types.js";
 import type { QuestionRequest } from "../types/question.js";
+import type { PermissionReply, PermissionRequest } from "../types/permission.js";
 
 export interface OpenCodeServerClientOpts {
   baseUrl: string;
@@ -527,6 +528,107 @@ export class OpenCodeServerClient {
       throw new Error(`Question reject failed: ${res.status} ${text}`);
     }
     return { ok: true };
+  }
+
+  // ─── Permissions ───
+  //
+  // Endpoint contract (verified against
+  // `packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts:11-37`):
+  //
+  //   POST /permission/{requestID}/reply
+  //     Body: { "reply": "once"|"always"|"reject", "message?": string }
+  //           // message is only used when reply === "reject"
+  //     Success: 200 { boolean }
+  //     Errors:  400 (bad request), 404 (PermissionNotFoundError — already resolved)
+  //
+  // Reply semantics (packages/opencode/src/permission/index.ts:120-178):
+  //   - "once":   allow this one call only, no persistence.
+  //   - "always": allow + persist allow rules for patterns in the request's
+  //               `always` field to `InstanceState.approved` (in-memory only —
+  //               lost on `opencode serve` restart).
+  //   - "reject": deny this call (and auto-cascade-reject any sibling
+  //               permissions of the same sessionID on the server; the bridge
+  //               sees the cascated `permission.replied` events on SSE and
+  //               clears them automatically — no client-side iteration needed).
+
+  /**
+   * List all pending permission requests across all sessions. Used at
+   * bridge startup to discover permissions left pending from a previous
+   * bridge instance — they will never be answered (the user already moved
+   * on, or the bridge crashed mid-permission), so we reject them
+   * proactively via {@link rejectPendingPermission}.
+   *
+   * Network/parse errors are swallowed: an empty array is the safe
+   * default (caller proceeds without cleanup). Pass `directory` to scope
+   * the request to a specific workspace; without it the server returns
+   * the global permission list and the caller is responsible for
+   * filtering by `sessionID`.
+   */
+  async listPendingPermissions(directory?: string): Promise<PermissionRequest[]> {
+    try {
+      const res = await this.fetch(this.withDirectory("/permission", directory), { method: "GET" });
+      if (!res.ok) return [];
+      return res.json() as Promise<PermissionRequest[]>;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Send a permission decision to the server.
+   *
+   * IMPORTANT: `message` is only forwarded to the server when
+   * `reply === "reject"` — the opencode server only uses it to build
+   * `CorrectedError` feedback (see
+   * `packages/opencode/src/permission/index.ts:132-138`). For `once`
+   * and `always` it is silently dropped; this method omits it from the
+   * request body in those cases to keep the payload honest.
+   *
+   * Throws on non-2xx (including 404 if the requestID is unknown /
+   * already resolved) — caller should catch and surface a user-visible
+   * "permission expired" message.
+   */
+  async replyToPermission(
+    requestID: string,
+    reply: PermissionReply,
+    message: string | undefined,
+    directory?: string,
+  ): Promise<{ ok: boolean }> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (directory) headers["x-opencode-directory"] = directory;
+    const body: Record<string, unknown> = { reply };
+    if (reply === "reject" && message) body.message = message;
+    const res = await this.fetch(
+      `/permission/${encodeURIComponent(requestID)}/reply`,
+      { method: "POST", headers, body: JSON.stringify(body) },
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Permission reply failed: ${res.status} ${text}`);
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Reject a pending permission (user dismissed it via `/rp`, the 30-min
+   * soft timeout fired, or bridge shutdown cleanup). Same endpoint as
+   * {@link replyToPermission} but with `reply="reject"`.
+   *
+   * On the server side, rejecting one permission auto-rejects all
+   * siblings of the same `sessionID` — see
+   * `packages/opencode/src/permission/index.ts:140-149`. The bridge
+   * relies on the cascaded `permission.replied` SSE events to clear
+   * the local slots; no client-side iteration needed.
+   *
+   * Safe to call when no permission is pending — the error is
+   * propagated for logging.
+   */
+  async rejectPendingPermission(
+    requestID: string,
+    message: string | undefined,
+    directory?: string,
+  ): Promise<{ ok: boolean }> {
+    return this.replyToPermission(requestID, "reject", message, directory);
   }
 
   // ─── Internal ───
