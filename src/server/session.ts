@@ -39,6 +39,9 @@ import type {
   MessageUpdatedEvent,
   OpenCodeEvent,
   Part,
+  QuestionAskedEvent,
+  QuestionRepliedSseEvent,
+  QuestionRejectedSseEvent,
   ReasoningPart,
   SessionErrorEvent,
   SessionStatusEvent,
@@ -46,11 +49,28 @@ import type {
   ToolPart,
   TrackedTool,
 } from "../types/events.js";
+import type {
+  PendingQuestion,
+  QuestionPrompt,
+  QuestionRequest,
+} from "../types/question.js";
 
 /** Idle debounce: wait this long after the last delta before considering the turn final. */
 const TURN_FINALIZE_DEBOUNCE_MS = 500;
 /** Hard ceiling: if no event for this long, force-finalize the turn. */
 const TURN_STUCK_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Soft timeout for unanswered `question.asked` events. After this many ms
+ * with no user reply, SessionManager auto-rejects the question (POST
+ * /question/:id/reject) and notifies the bridge so the user sees a
+ * "timed out" message. The agent's Deferred is woken with a
+ * `QuestionRejectedError: "The user dismissed this question"`.
+ *
+ * 30 minutes is a heuristic covering "user stepped away for lunch" while
+ * still preventing the agent from blocking forever. See
+ * `.omo/plans/question-tool-design.md` §14 Q1.
+ */
+const QUESTION_TIMEOUT_MS = 30 * 60_000;
 
 // ─── Helpers ───
 
@@ -109,6 +129,28 @@ export interface SessionManagerOpts {
     password?: string;
     token?: string;
   };
+  /**
+   * Invoked when a `question.asked` event arrives and the question is
+   * queued for the WeChat user. The bridge should format the question
+   * (via `formatQuestionForWeChat`) and push it to WeChat. Must be
+   * non-throwing — errors are caught and logged.
+   *
+   * Receives the WeChat contextToken (so the bridge can route to the
+   * right chat), the questions array, and the opencode requestID (so
+   * the bridge can reference it in `/status` or for debugging).
+   */
+  onQuestionAsked?: (
+    contextToken: string,
+    questions: ReadonlyArray<QuestionPrompt>,
+    requestID: string,
+  ) => Promise<void>;
+  /**
+   * Invoked when the soft-timeout fires (30 min with no user reply).
+   * The bridge should send a user-visible "timed out" message to WeChat
+   * before the auto-reject lands on the server. The contextToken is the
+   * WeChat target.
+   */
+  onQuestionTimedOut?: (contextToken: string) => Promise<void>;
 }
 
 interface QueueItem {
@@ -198,6 +240,28 @@ export class SessionManager {
    */
   private lastEnqueuedContextToken: string | null = null;
 
+  // ─── Question slot (orthogonal to currentTurn) ───
+  /**
+   * Soft timeout handle for the currently-pending question. Cleared when
+   * the user answers, the user rejects, the server-side `question.replied`
+   * / `question.rejected` echo arrives, or the bridge shuts down.
+   */
+  private questionTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Currently-pending question waiting for the WeChat user's answer. Null
+   * when no question is awaiting input. State is independent of
+   * `currentTurn` — a question can be pending while the turn is also
+   * accumulating (the agent is blocked on the question tool's Deferred).
+   */
+  private pendingQuestion: PendingQuestion | null = null;
+  /** Callbacks set by the bridge; see SessionManagerOpts.onQuestion*. */
+  private onQuestionAsked?: (
+    contextToken: string,
+    questions: ReadonlyArray<QuestionPrompt>,
+    requestID: string,
+  ) => Promise<void>;
+  private onQuestionTimedOut?: (contextToken: string) => Promise<void>;
+
   constructor(opts: SessionManagerOpts) {
     this.client = new OpenCodeServerClient({
       baseUrl: opts.serverUrl,
@@ -212,6 +276,8 @@ export class SessionManager {
     this.cancelTyping = opts.cancelTyping;
     this.onSessionReady = opts.onSessionReady;
     this.useEventStream = opts.useEventStream !== false;
+    this.onQuestionAsked = opts.onQuestionAsked;
+    this.onQuestionTimedOut = opts.onQuestionTimedOut;
   }
 
   /** Current session ID, or null if not yet created. */
@@ -523,6 +589,201 @@ export class SessionManager {
     await this.eventPipeline.stop();
     this.eventPipeline = null;
     this.clearFinalizeTimers();
+    this.clearQuestionTimeout();
+  }
+
+  // ─── Question slot API ───
+  //
+  // Independent of the turn state machine — a `question.asked` event
+  // arrives while a turn is actively accumulating (the agent is blocked
+  // on the question tool's Deferred.await). We don't finalize the turn;
+  // we just record that we're waiting for the user's answer. When the
+  // answer lands, the tool part is updated to `completed` and the turn
+  // continues normally.
+
+  /** True iff a question is currently waiting for the user's answer. */
+  hasPendingQuestion(): boolean {
+    return this.pendingQuestion !== null;
+  }
+
+  /** Read-only view of the current pending question, or null. */
+  getPendingQuestion(): PendingQuestion | null {
+    return this.pendingQuestion;
+  }
+
+  /**
+   * Submit the user's answers to a pending question. POSTs to
+   * `/question/:id/reply` with the answer array. Resolves once the HTTP
+   * call returns (does NOT wait for the SSE `question.replied` echo —
+   * that echo will redundantly call `clearPendingQuestion` which is
+   * idempotent).
+   *
+   * Throws on HTTP failure; the bridge should catch and surface a
+   * "question 已过期" message to the user.
+   */
+  async answerPendingQuestion(
+    answers: ReadonlyArray<ReadonlyArray<string>>,
+  ): Promise<void> {
+    const pending = this.pendingQuestion;
+    if (!pending) {
+      this.log(`[question] answerPendingQuestion called with no pending question (no-op)`);
+      return;
+    }
+    try {
+      await this.client.replyToQuestion(pending.requestID, answers, this.cwd);
+      this.log(`[question] answered id=${pending.requestID} (${answers.length} answer(s))`);
+    } finally {
+      this.clearPendingQuestion(pending.requestID, "replied");
+    }
+  }
+
+  /**
+   * Dismiss a pending question (user said /reject-question, /stop,
+   * /next, /restart, or the 30-min soft timeout fired). POSTs to
+   * `/question/:id/reject`. No-op if no question is pending.
+   *
+   * Returns once the HTTP call resolves. Errors are logged but NOT
+   * rethrown — reject is best-effort (the user already moved on, and
+   * the server's instance dispose finalizer will clean up stragglers).
+   */
+  async rejectPendingQuestion(): Promise<void> {
+    const pending = this.pendingQuestion;
+    if (!pending) return;
+    this.log(`[question] rejecting id=${pending.requestID}`);
+    this.clearPendingQuestion(pending.requestID, "rejected");
+    try {
+      await this.client.rejectQuestion(pending.requestID, this.cwd);
+    } catch (err) {
+      this.log(`[question] reject HTTP failed (non-fatal): ${String(err)}`);
+    }
+  }
+
+  /**
+   * At bridge startup, return questions the server has pending for OUR
+   * session that we don't have a local slot for. These are the
+   * "leaked" questions from a previous bridge instance — they will
+   * never be answered (the user already moved on, or the bridge
+   * crashed mid-question), so the bridge rejects them proactively.
+   *
+   * Returns an empty array on any error (network, parse, missing
+   * session) so the startup path is non-blocking. Filtering:
+   *   - Only questions belonging to OUR sessionID (don't touch others')
+   *   - Exclude any requestID we still have a local slot for (race-safe)
+   */
+  async listLeakedQuestions(directory?: string): Promise<QuestionRequest[]> {
+    if (!this.sessionId) return [];
+    try {
+      const all = await this.client.listQuestions(directory);
+      const localId = this.pendingQuestion?.requestID;
+      return all.filter((q) => {
+        if (q.sessionID !== this.sessionId) return false;
+        if (localId && q.id === localId) return false;
+        return true;
+      });
+    } catch (err) {
+      this.log(`[question-startup] listQuestions failed (non-fatal): ${String(err)}`);
+      return [];
+    }
+  }
+
+  // ─── Question slot internals ───
+
+  private setPendingQuestion(req: QuestionRequest, contextToken: string): void {
+    this.pendingQuestion = {
+      requestID: req.id,
+      questions: req.questions,
+      contextToken,
+      askedAt: Date.now(),
+      tool: req.tool,
+    };
+    this.armQuestionTimeout();
+  }
+
+  /**
+   * Clear the local pending slot. Idempotent: a no-op if the local slot
+   * is null OR if the local requestID doesn't match (means the server
+   * cleared a different question, possibly from a prior bridge instance
+   * whose leaked-question cleanup we triggered). The second case is
+   * important to avoid dropping the *current* local question when an
+   * old SSE echo arrives.
+   */
+  private clearPendingQuestion(requestID: string, reason: "replied" | "rejected"): void {
+    if (!this.pendingQuestion) return;
+    if (this.pendingQuestion.requestID !== requestID) {
+      this.log(
+        `[question] clearPendingQuestion(${reason}) for id=${requestID.slice(0, 12)}… ` +
+          `ignored — local is id=${this.pendingQuestion.requestID.slice(0, 12)}…`,
+      );
+      return;
+    }
+    this.log(`[question] slot cleared (${reason}) id=${requestID.slice(0, 12)}…`);
+    this.pendingQuestion = null;
+    this.clearQuestionTimeout();
+  }
+
+  private armQuestionTimeout(): void {
+    this.clearQuestionTimeout();
+    this.questionTimeoutHandle = setTimeout(() => {
+      const pending = this.pendingQuestion;
+      if (!pending) return;
+      this.log(`[question] soft timeout (${QUESTION_TIMEOUT_MS}ms) — auto-rejecting id=${pending.requestID}`);
+      this.onQuestionTimedOut?.(pending.contextToken).catch((err) => {
+        this.log(`[question] onQuestionTimedOut callback error: ${String(err)}`);
+      });
+      this.rejectPendingQuestion().catch((err) => {
+        this.log(`[question] auto-reject HTTP failed: ${String(err)}`);
+      });
+    }, QUESTION_TIMEOUT_MS);
+  }
+
+  private clearQuestionTimeout(): void {
+    if (this.questionTimeoutHandle) {
+      clearTimeout(this.questionTimeoutHandle);
+      this.questionTimeoutHandle = null;
+    }
+  }
+
+  // ─── Question SSE handlers ───
+
+  private handleQuestionAsked(event: QuestionAskedEvent): void {
+    const req = event.properties;
+    if (this.pendingQuestion) {
+      // Defensive: the previous question should have been cleared by
+      // either the user's reply, the timeout, or the SSE echo. If we
+      // somehow get a second `question.asked` for a different id
+      // before clearing, drop the new one — the agent shouldn't be
+      // asking two questions in parallel from the same session.
+      this.log(
+        `[question] dropping new asked id=${req.id.slice(0, 12)}… — ` +
+          `previous unanswered id=${this.pendingQuestion.requestID.slice(0, 12)}…`,
+      );
+      return;
+    }
+    // We MUST have a contextToken to route the formatted question to
+    // the right WeChat chat. If we don't (first message of a fresh
+    // session is a question — rare), auto-reject so the agent doesn't
+    // block forever waiting for a reply no one will see.
+    const contextToken = this.lastEnqueuedContextToken;
+    if (!contextToken) {
+      this.log(`[question] no contextToken for asked id=${req.id.slice(0, 12)}…; auto-rejecting`);
+      this.client.rejectQuestion(req.id, this.cwd).catch((err) => {
+        this.log(`[question] auto-reject failed: ${String(err)}`);
+      });
+      return;
+    }
+    this.setPendingQuestion(req, contextToken);
+    this.log(`[question] asked id=${req.id.slice(0, 12)}… (${req.questions.length} question(s))`);
+    this.onQuestionAsked?.(contextToken, req.questions, req.id).catch((err) => {
+      this.log(`[question] onQuestionAsked callback error: ${String(err)}`);
+    });
+  }
+
+  private handleQuestionRepliedSse(event: QuestionRepliedSseEvent): void {
+    this.clearPendingQuestion(event.properties.requestID, "replied");
+  }
+
+  private handleQuestionRejectedSse(event: QuestionRejectedSseEvent): void {
+    this.clearPendingQuestion(event.properties.requestID, "rejected");
   }
 
   // ─── Event handler dispatch ───
@@ -557,6 +818,15 @@ export class SessionManager {
         break;
       case "session.error":
         this.handleSessionError(event as SessionErrorEvent);
+        break;
+      case "question.asked":
+        this.handleQuestionAsked(event as QuestionAskedEvent);
+        break;
+      case "question.replied":
+        this.handleQuestionRepliedSse(event as QuestionRepliedSseEvent);
+        break;
+      case "question.rejected":
+        this.handleQuestionRejectedSse(event as QuestionRejectedSseEvent);
         break;
       default:
         // Unknown event — ignore.

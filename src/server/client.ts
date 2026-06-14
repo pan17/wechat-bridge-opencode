@@ -6,6 +6,7 @@
  */
 
 import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef, McpStatusMap } from "../types.js";
+import type { QuestionRequest } from "../types/question.js";
 
 export interface OpenCodeServerClientOpts {
   baseUrl: string;
@@ -443,6 +444,89 @@ export class OpenCodeServerClient {
     } catch {
       return [];
     }
+  }
+
+  // ─── Questions ───
+
+  /**
+   * List all pending question requests across all sessions.
+   * Used at bridge startup to discover questions left pending from a
+   * previous bridge instance — they will never be answered (the user
+   * already moved on, or the bridge crashed mid-question), so we reject
+   * them proactively via {@link rejectQuestion}.
+   *
+   * Network/parse errors are swallowed: an empty array is the safe default
+   * (caller proceeds without cleanup). Pass `directory` to scope the
+   * request to a specific workspace; without it, the server returns the
+   * global question list and the caller is responsible for filtering by
+   * `sessionID`.
+   */
+  async listQuestions(directory?: string): Promise<QuestionRequest[]> {
+    try {
+      const res = await this.fetch(this.withDirectory("/question", directory), { method: "GET" });
+      if (!res.ok) return [];
+      return res.json() as Promise<QuestionRequest[]>;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Reply to a pending question with the user's answers.
+   *
+   * `answers.length` MUST equal the number of questions in the original
+   * request (the server validates this). Each inner array contains the
+   * selected option labels (or a single custom text string for `Q{n}-`
+   * marker answers). Order of inner arrays matches the order of questions
+   * in the `question.asked` event.
+   *
+   * Throws on non-2xx (including 400 if the requestID is unknown / already
+   * answered) — caller should catch and surface a user-visible message.
+   */
+  async replyToQuestion(
+    requestID: string,
+    answers: ReadonlyArray<ReadonlyArray<string>>,
+    directory?: string,
+  ): Promise<{ ok: boolean }> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (directory) headers["x-opencode-directory"] = directory;
+    const res = await this.fetch(
+      `/question/${encodeURIComponent(requestID)}/reply`,
+      { method: "POST", headers, body: JSON.stringify({ answers }) },
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Question reply failed: ${res.status} ${text}`);
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Reject a pending question (user dismissed it).
+   *
+   * The server will wake the agent's `Deferred.await()` with a
+   * `QuestionRejectedError: "The user dismissed this question"`. The
+   * agent typically continues with a fallback or reports the dismiss.
+   *
+   * Throws on non-2xx (e.g. 400 if the requestID is unknown). Safe to
+   * call when no question is pending on the server side — the error is
+   * propagated to the caller for logging.
+   */
+  async rejectQuestion(
+    requestID: string,
+    directory?: string,
+  ): Promise<{ ok: boolean }> {
+    const headers: Record<string, string> = {};
+    if (directory) headers["x-opencode-directory"] = directory;
+    const res = await this.fetch(
+      `/question/${encodeURIComponent(requestID)}/reject`,
+      { method: "POST", headers },
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Question reject failed: ${res.status} ${text}`);
+    }
+    return { ok: true };
   }
 
   // ─── Internal ───

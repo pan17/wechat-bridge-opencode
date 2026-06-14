@@ -74,6 +74,16 @@ export interface RestartCommand {
   kind: "restart";
 }
 
+/**
+ * `/reject-question` (alias `/rq`) — explicitly dismiss a pending question
+ * from the LLM. Only meaningful when `pendingQuestion` is non-null on the
+ * SessionManager (otherwise no-op). See `.omo/plans/question-tool-design.md`
+ * §10.3 and §14 Q2.
+ */
+export interface RejectQuestionCommand {
+  kind: "reject-question";
+}
+
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^\/(?:workspace|ws)\s+(.+)$/i);
@@ -345,6 +355,21 @@ export function parseRestartCommand(text: string): RestartCommand | null {
   return null;
 }
 
+/**
+ * Parse `/reject-question` (or short alias `/rq`) to dismiss a pending
+ * question. Only matches the bare command — no extra args allowed. The
+ * dispatcher (bridge.handleQuestionReply) treats this as a priority
+ * command: if a question is pending, it rejects first, then optionally
+ * resumes the normal flow (currently: just sends a confirmation message).
+ */
+export function parseRejectQuestionCommand(text: string): RejectQuestionCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/reject-question" || trimmed === "/rq") {
+    return { kind: "reject-question" };
+  }
+  return null;
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ cwd: string }>,
   activeCwd: string | null,
@@ -583,6 +608,10 @@ export function formatHelp(): string {
     "── 消息计数 ──",
     "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
     "",
+    "── Question ──",
+    "  /reject-question         显式拒绝当前等待中的 LLM 问题（仅在有 pending question 时有效）",
+    "  （简写: /rq）",
+    "",
     "  /help                    显示本帮助信息",
   ].join("\n");
 }
@@ -649,6 +678,10 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "",
     "── 消息计数 ──",
     "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
+    "",
+    "── Question ──",
+    "  /reject-question         显式拒绝当前等待中的 LLM 问题（仅在有 pending question 时有效）",
+    "  （简写: /rq）",
     "",
     "── 帮助 ──",
     "  /help                    显示本帮助信息",

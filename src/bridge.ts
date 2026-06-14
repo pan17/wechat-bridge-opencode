@@ -19,7 +19,9 @@ import type { WeixinMessage } from "./weixin/types.js";
 import { SessionManager } from "./server/session.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
 import { formatForWeChat } from "./adapter/outbound.js";
+import { formatQuestionForWeChat, parseQuestionReply } from "./adapter/question-format.js";
 import type { MediaContent } from "./types.js";
+import type { QuestionPrompt } from "./types/question.js";
 import {
   parseWorkspaceCommand,
   parseSessionCommand,
@@ -31,6 +33,7 @@ import {
   parseToolDisplayCommand,
   parseStopCommand,
   parseRestartCommand,
+  parseRejectQuestionCommand,
   parseVersionCommand,
   parseUpgradeCommand,
   parseHelpCommand,
@@ -335,6 +338,22 @@ export class WeChatOpencodeBridge {
         password: this.config.server.password,
         token: this.config.server.token,
       },
+      // Question lifecycle hooks. The sessionManager invokes these when
+      // a `question.asked` SSE event lands (or when the 30-min soft
+      // timeout fires). We render the question to WeChat and notify the
+      // user on timeout, then let the sessionManager manage the actual
+      // HTTP reply/reject.
+      onQuestionAsked: async (contextToken, questions, requestID) => {
+        const formatted = formatQuestionForWeChat(questions);
+        await this.sendReply(contextToken, formatted);
+        this.log(`[question] formatted for WeChat: id=${requestID.slice(0, 12)}…, ${questions.length} question(s)`);
+      },
+      onQuestionTimedOut: async (contextToken) => {
+        await this.sendReply(
+          contextToken,
+          "⏱ Question timed out after 30 minutes. Proceeding without answer. (Use /next to reset counter.)",
+        );
+      },
     });
 
     // Restore persisted display flags (only if defined to avoid clobbering
@@ -349,6 +368,23 @@ export class WeChatOpencodeBridge {
 
     // 4. Tool API server
     this.startToolApiServer();
+
+    // 4.5 Clean up any leaked questions from a previous bridge instance.
+    // If the bridge crashed or restarted while a question was pending,
+    // the server's `/question` endpoint will still list it; we reject
+    // them proactively so the server's pending Map doesn't grow. This
+    // is a best-effort cleanup — failures are logged but non-fatal.
+    try {
+      const leaked = await this.sessionManager.listLeakedQuestions(this.config.agent.cwd);
+      for (const req of leaked) {
+        this.log(`[question-startup] rejecting leaked question id=${req.id.slice(0, 12)}…`);
+      }
+      if (leaked.length > 0) {
+        this.log(`[question-startup] rejected ${leaked.length} leaked question(s)`);
+      }
+    } catch (err) {
+      this.log(`[question-startup] leaked-question check failed (non-fatal): ${String(err)}`);
+    }
 
     // 5. Start the SSE event pipeline so we don't miss any agent events
     //    (session.status, message.part.delta, sub-agent completions, etc.).
@@ -373,6 +409,18 @@ export class WeChatOpencodeBridge {
     // Stop the SSE event pipeline before tearing down the session manager.
     if (this.sessionManager) {
       await this.sessionManager.stopEventPipeline();
+    }
+    // If a question was still pending when the user quit, reject it so the
+    // server's `Deferred.await()` doesn't block forever. Best-effort:
+    // network/parse errors are swallowed because the bridge is shutting
+    // down anyway. The server's instance dispose finalizer would
+    // eventually clean up stragglers, but we don't want to wait.
+    if (this.sessionManager?.hasPendingQuestion()) {
+      try {
+        await this.sessionManager.rejectPendingQuestion();
+      } catch {
+        // best effort during shutdown
+      }
     }
     this.sessionManager = null;
     if (this.toolApiServer) {
@@ -602,6 +650,29 @@ export class WeChatOpencodeBridge {
     const contextToken = msg.context_token;
     if (!userId || !contextToken) return;
 
+    // If a question is pending, the next user message is (almost always)
+    // the answer. Route to handleQuestionReply which checks for priority
+    // commands (/stop, /next, /restart, /reject-question) before
+    // parsing the text as an answer. This early-return is essential —
+    // we must NOT let the answer text accidentally trigger slash-command
+    // parsing and lose the answer.
+    if (this.sessionManager?.hasPendingQuestion()) {
+      const text = this.extractTextFromMessage(msg);
+      if (text === null) {
+        // Non-text message (image/file/voice) while waiting for an
+        // answer. Tell the user we need text and bail.
+        this.sendReply(
+          contextToken,
+          "⚠️ 当前正在等待 question 答案，请用文本回复（数字或自定义文字，例如 `Q1=1` 或 `Q1-我的想法`）。",
+        ).catch(() => {});
+        return;
+      }
+      this.handleQuestionReply(contextToken, text).catch((err: unknown) => {
+        this.log(`handleQuestionReply error: ${String(err)}`);
+      });
+      return;
+    }
+
     // Track context token for send-wechat tool replies
     this.currentContextToken = contextToken;
 
@@ -750,6 +821,107 @@ export class WeChatOpencodeBridge {
     this.enqueueMessage(msg, contextToken).catch((err) => {
       this.log(`Failed to enqueue message: ${String(err)}`);
     });
+  }
+
+  /**
+   * Handle the user's reply while a question is pending. Called from
+   * `handleMessage` as an early-return when `sessionManager.hasPendingQuestion()`.
+   *
+   * Priority commands first (reject the question, then run the command):
+   *   /reject-question (alias /rq) — explicit dismiss
+   *   /stop                          — reject + abort the agent
+   *   /next                          — reject + flush pending WeChat cache
+   *   /restart                       — reject + restart the server
+   *
+   * Informational commands (run without rejecting; the question stays
+   * pending so the user can still answer it after reading /status or
+   * /help):
+   *   /help, /status
+   *
+   * Anything else is parsed as a question answer using the Qn= / Qn-
+   * grammar from `parseQuestionReply`. Slash commands we don't recognize
+   * (e.g. /workspace, /agent) will fail to parse as an answer and we'll
+   * tell the user to either answer normally or use /reject-question.
+   */
+  private async handleQuestionReply(contextToken: string, text: string): Promise<void> {
+    const pending = this.sessionManager?.getPendingQuestion();
+    if (!pending) return; // defensive — race could have cleared it
+
+    const trimmed = text.trim();
+
+    // ── Priority commands: reject first, then dispatch ──
+    if (parseRejectQuestionCommand(trimmed)) {
+      await this.sessionManager!.rejectPendingQuestion();
+      await this.sendReply(contextToken, "❌ Question dismissed.");
+      return;
+    }
+    if (parseStopCommand(trimmed)) {
+      await this.sessionManager!.rejectPendingQuestion();
+      this.handleStopCommand(contextToken, parseStopCommand(trimmed)!).catch((err: unknown) => {
+        this.log(`Stop command (during pending question) error: ${String(err)}`);
+      });
+      return;
+    }
+    if (/^\/next\b/.test(trimmed)) {
+      await this.sessionManager!.rejectPendingQuestion();
+      this.flushPending(contextToken).catch((err: unknown) => {
+        this.log(`/next (during pending question) error: ${String(err)}`);
+      });
+      return;
+    }
+    if (parseRestartCommand(trimmed)) {
+      await this.sessionManager!.rejectPendingQuestion();
+      this.handleRestartCommand(contextToken, parseRestartCommand(trimmed)!).catch((err: unknown) => {
+        this.log(`Restart command (during pending question) error: ${String(err)}`);
+      });
+      return;
+    }
+
+    // ── Informational commands: run without rejecting ──
+    if (parseHelpCommand(trimmed)) {
+      this.sendHelpReply(contextToken).catch((err: unknown) => {
+        this.log(`Help command (during pending question) error: ${String(err)}`);
+      });
+      return;
+    }
+    const stCmd = parseStatusCommand(trimmed);
+    if (stCmd) {
+      this.handleStatusCommand(contextToken, stCmd).catch((err: unknown) => {
+        this.log(`Status command (during pending question) error: ${String(err)}`);
+      });
+      return;
+    }
+
+    // ── Default: parse as question answer ──
+    const parseResult = parseQuestionReply(trimmed, pending.questions);
+    // Log warnings (out-of-range numbers, unrecognized segments, etc.)
+    for (const w of parseResult.warnings) {
+      this.log(`[question] parse warning: ${w}`);
+    }
+    // Some valid question has no answer (e.g. all numbers out of range)
+    const anyEmpty = parseResult.answers.some((a) => a.length === 0);
+    if (anyEmpty) {
+      await this.sendReply(
+        contextToken,
+        "⚠️ No valid answer detected. Please reply with option numbers (e.g. \"1\") or type your own answer. Use /reject-question to dismiss.",
+      );
+      return;
+    }
+    // Show typing indicator while the agent resumes
+    this.sendTypingIndicator(contextToken).catch((err: unknown) => {
+      this.log(`sendTyping (during question reply) error: ${String(err)}`);
+    });
+    try {
+      await this.sessionManager!.answerPendingQuestion(parseResult.answers);
+    } catch (err) {
+      // Server returned 4xx — most likely the question was already
+      // answered (race) or rejected (timeout fired while user was typing)
+      this.log(`[question] answer HTTP failed: ${String(err)}`);
+      await this.sendReply(
+        contextToken,
+        "⏱ Question 已过期（可能已被其他端回答或超时）。请重发消息。",
+      );
+    }
   }
 
   // ─── Directory commands (/workspace or /ws) ───
@@ -1286,7 +1458,7 @@ export class WeChatOpencodeBridge {
       // Server doesn't expose /mcp, or call failed — just skip the section.
     }
 
-    const statusText = formatStatus({
+    let statusText = formatStatus({
       session: sessionInfo,
       workspace: cwd,
       agent: currentMode ?? "(not set)",
@@ -1295,6 +1467,21 @@ export class WeChatOpencodeBridge {
       contextUsage: contextUsage ? { used: contextUsage.totalTokens, size: contextUsage.contextSize } : null,
       mcpStatus,
     });
+
+    // Append a "⏳ Question pending" line if a question is waiting. We
+    // mutate the returned string here (rather than inside formatStatus)
+    // to keep the formatter a pure function. Showing elapsed seconds
+    // helps the user decide whether to /reject-question and let the
+    // agent proceed.
+    if (this.sessionManager?.hasPendingQuestion()) {
+      const pending = this.sessionManager.getPendingQuestion();
+      if (pending) {
+        const elapsedSec = Math.max(0, Math.floor((Date.now() - pending.askedAt) / 1000));
+        const qLabel = `Q${pending.questions.length} question${pending.questions.length > 1 ? "s" : ""}`;
+        const idShort = pending.requestID.slice(0, 12);
+        statusText += `\n⏳ Question pending (${qLabel}, ${elapsedSec}s elapsed, id=${idShort}…)`;
+      }
+    }
 
     await this.sendReply(contextToken, statusText);
   }

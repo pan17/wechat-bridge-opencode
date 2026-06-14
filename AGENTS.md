@@ -42,14 +42,20 @@ src/bridge.ts                   — Main orchestrator (WeChat poll ↔ OpenCode 
 src/config.ts                   — Config types, defaults, server connection config
 src/types.ts                    — Shared types (MessagePart, ModelRef, MediaContent)
 src/vendor.d.ts                 — Type declarations for untyped npm packages
+src/types/
+  events.ts                     — SSE event types (message.*, session.*, question.*)
+  question.ts                   — Question tool types (QuestionPrompt, PendingQuestion, …)
 src/server/
   client.ts                     — OpenCode Server HTTP client (fetch wrapper)
   session.ts                    — Simplified SessionManager (no subprocess, just HTTP)
-src/__tests__/                  — Vitest unit tests (5 files, 97 tests)
+  event-pipeline.ts             — Persistent /global/event SSE connection with reconnect
+src/__tests__/                  — Vitest unit tests (7 files, 141 tests)
 src/adapter/
   inbound.ts                    — WeChat message → MessagePart[] (text, image, file)
   outbound.ts                   — Server reply → WeChat text (formatting, splitting)
-  workspace-cmd.ts              — Parse /workspace, /session, /agent, /model, /reasoning, /help commands
+  workspace-cmd.ts              — Parse /workspace, /session, /agent, /model, /reasoning, /help, /reject-question commands
+  question-format.ts            — Format & parse question replies (Q{n}={value} / Q{n}-{value} grammar)
+  thinking-format.ts            — Reasoning summary + tool summary formatting
 src/weixin/
   auth.ts                       — WeChat iLink login (QR code, token persistence)
   monitor.ts                    — Long-poll for new messages
@@ -131,6 +137,7 @@ src/weixin/
 1. **New message type**: Update `MessageType` enum in `src/weixin/types.ts`, add handling in `src/adapter/inbound.ts`
 2. **New Server API call**: Add method to `src/server/client.ts`, use in `src/server/session.ts` or `src/bridge.ts`
 3. **New CLI option**: Add to `parseArgs()` in `bin/wechat-opencode.ts`, update `usage()`, pass through to config
+4. **New question tool support**: Add event type to `src/types/events.ts` + handler in `src/server/session.ts` switch; mirror in `src/types/events.ts`; add HTTP methods to `src/server/client.ts`; format/parse in `src/adapter/question-format.ts`; wire bridge callbacks in `src/bridge.ts`. See `.omo/plans/question-tool-design.md` for the canonical pattern.
 
 ## Constraints
 
@@ -138,6 +145,7 @@ src/weixin/
 - **Permission requests are auto-approved** — handled server-side by OpenCode
 - **Single-user** — one WeChat user, one OpenCode session at a time
 - **Runtime state** stored in `~/.wechat-opencode/` (auth tokens, daemon PID, logs, user states)
+- **LLM question tool requires `opencode.json` permission** — add `"question": "allow"` under `permission` in the project's `opencode.json`; without it the server rejects the tool call and the bridge never sees the question
 
 ## WeChat Commands
 
@@ -219,6 +227,24 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 | Command | Description |
 |---------|-------------|
 | `/next` | WeChat limits bots to 10 consecutive messages; user reply required to continue. Send `/next` to reset the counter without forwarding to the agent |
+
+### Question (/reject-question)
+| Command | Description |
+|---------|-------------|
+| `/reject-question` (alias `/rq`) | Dismiss a pending LLM `question` tool request. The agent receives `QuestionRejectedError: "The user dismissed this question"` and proceeds without an answer. Only meaningful when `pendingQuestion` is non-null on the SessionManager (no-op otherwise). |
+
+The bridge surfaces OpenCode's `question` tool to WeChat whenever the agent calls it (events `question.asked` / `replied` / `rejected` on `/global/event`). User reply grammar:
+
+| Input | Meaning |
+|-------|---------|
+| `Q{n}=1` | Choose option 1 for question n |
+| `Q{n}=1, 3` | Multi-select options 1 and 3 for question n |
+| `Q{n}-text` | Force a custom answer (the dash always treats content as text, even "1, 3") |
+| `Q1=1 Q2-这题我有自己想法 Q3=3` | Multi-question reply (order doesn't matter) |
+| `1 --- 2 --- 3` | Positional fallback (must be in order) |
+| `1` (no prefix, multi-question) | Downgraded: Q1 gets the answer, rest default |
+
+Mobile keyboards auto-insert spaces around operators — the parser tolerates `Q1 = 1`, `Q2 - 文字`, `Q1= 1`, `Q1 =1`. A 30-minute soft timeout auto-rejects unanswered questions and notifies the user.
 
 ### Help
 | Command | Description |

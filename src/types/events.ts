@@ -13,9 +13,18 @@
  *   - session.status          — busy/idle/retry transitions
  *   - session.idle            — session became idle (alt signal for some servers)
  *   - session.error           — server-side error
+ *   - question.asked          — LLM called `question` tool; user must answer
+ *   - question.replied        — bridge or client replied; race-safe slot clear
+ *   - question.rejected       — bridge or client dismissed; race-safe slot clear
  *
  * Reference: opencode server /event payload shape.
  */
+
+import type {
+  QuestionRequest,
+  QuestionRepliedEvent,
+  QuestionRejectedEvent,
+} from "./question.js";
 
 export type SessionStatusType = "idle" | "busy" | "retry";
 
@@ -160,6 +169,34 @@ export interface SessionErrorEvent {
   };
 }
 
+// ─── Question events (LLM called the `question` tool) ───
+//
+// OpenCode's `question` tool blocks the agent on a Deferred until the user
+// answers (or dismisses). The server emits three events so the bridge can:
+//   1. `question.asked`     — surface the question to the user (WeChat here)
+//   2. `question.replied`   — race-safe: clear the local pendingQuestion slot
+//   3. `question.rejected`  — race-safe: same as replied, for dismiss path
+//
+// The `properties` of each event mirror the opencode source schema in
+// `packages/opencode/src/question/index.ts`; the underlying types live in
+// `./question.js` so they're shared with the SessionManager state and the
+// HTTP client methods.
+
+export interface QuestionAskedEvent {
+  type: "question.asked";
+  properties: QuestionRequest;
+}
+
+export interface QuestionRepliedSseEvent {
+  type: "question.replied";
+  properties: QuestionRepliedEvent;
+}
+
+export interface QuestionRejectedSseEvent {
+  type: "question.rejected";
+  properties: QuestionRejectedEvent;
+}
+
 /** The full union we handle. Other event types are ignored. */
 export type OpenCodeEvent =
   | MessagePartDeltaEvent
@@ -168,7 +205,10 @@ export type OpenCodeEvent =
   | MessageRemovedEvent
   | SessionStatusEvent
   | SessionIdleEvent
-  | SessionErrorEvent;
+  | SessionErrorEvent
+  | QuestionAskedEvent
+  | QuestionRepliedSseEvent
+  | QuestionRejectedSseEvent;
 
 /** Outer envelope from /global/event. /event emits the inner payload directly. */
 export interface GlobalEvent {

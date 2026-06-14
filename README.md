@@ -12,6 +12,7 @@
 - **图片传输** — 支持发送/接收图片，支持微信 CDN 下载
 - **文件传输** — 支持任意类型文件收发
 - **音视频传输** — 完整的音频和视频消息支持
+- **LLM 问答支持** — 转发 OpenCode `question` 工具的提问到微信，支持选项 / 多选 / 自定义答案；30 分钟软超时自动 reject
 - **二维码登录** — 终端渲染二维码，扫码登录微信
 - **OpenCode Server** — 基于 HTTP API，不再需要 ACP 子进程
 - **后台模式** — 使用 `--daemon` 参数后台运行
@@ -172,6 +173,25 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 |------|------|
 | `/next` | 微信限制连续发送 10 条消息，超出后需用户回复才能继续。发送 `/next` 重置计数，不转发给 Agent |
 
+### LLM 问答（`/reject-question`）
+
+当 OpenCode 的 Agent 调用 `question` 工具时，Bridge 会把问题原文转发到微信私聊，用户在微信端回复答案后回传到 server。
+
+**微信端输入格式**（`Q{n}={value}` 选 / `Q{n}-{value}` 强制 custom）：
+
+| 场景 | 输入示例 |
+|------|---------|
+| 单选 | `Q1=1` |
+| 多选 | `Q1=1, 3`（逗号分隔） |
+| 强制自定义文字（即使内容像数字） | `Q1-这题我有自己想法` 或 `Q1-3`（强制为文字 "3"） |
+| 多题 | `Q1=1 Q2-自定义 Q3=3`（顺序无关） |
+| 跳题（用默认值） | 只发 `Q2=2`，Q1 / Q3 自动用首选项 |
+| 手机自动空格 | `Q1 = 1`、`Q2 - 文字` 都能识别 |
+
+**显式拒绝**：发 `/reject-question`（或 `/rq`）让 Agent 跳过这个问题（agent 会收到 "The user dismissed this question"）。
+
+**软超时**：30 分钟无应答自动 reject 并在微信发 `⏱ Question timed out` 通知。
+
 ## 环境要求
 
 - Node.js 20+
@@ -193,6 +213,18 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 - 仅支持私信（群聊会被忽略）
 - 权限请求自动批准
 - `send-wechat` 工具自动安装到 `~/.config/opencode/tools/send-wechat.ts`
+- **LLM 问答需要 `opencode.json` 显式允许 question 工具**（默认拒绝用户交互工具）：
+
+  ```json
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+      "question": "allow"
+    }
+  }
+  ```
+
+  没有这一项，Agent 试图调用 `question` 时会被 server 拒绝、问题不会到达微信。
 
 ## 致谢
 
