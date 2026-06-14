@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-06-14
+
+### Added
+- **Permission tool: full WeChat interaction.** New cards for OpenCode `permission.asked` events with `once` / `always` / `reject` choices. Mirrors the question tool's design pattern (`src/types/permission.ts`, `src/server/client.ts` `listPendingPermissions` / `replyToPermission` / `rejectPendingPermission`, `src/server/session.ts` permission state machine, `src/adapter/permission-format.ts` format/parse, `src/bridge.ts` integration).
+- **`/auto-permission` command** (alias `/ap`): toggle auto-accept mode (`off` / `once` / `always`); status visible in `/status`. Tri-state persisted to `~/.wechat-bridge-state.json` and restored on bridge restart.
+- **`/reject-permission` command** (alias `/rp`): dismiss all pending permission cards.
+- **30-minute soft timeout** for unanswered permission cards (auto-reject).
+- **Multi-permission support:** multiple concurrent `permission.asked` events tracked per requestID; server cascade `reject` clears siblings automatically. v2: bare `1`/`2`/`3` and keywords cascade to ALL pending; `P{n}=…` for per-permission control.
+- `src/types/permission.ts`, `src/adapter/permission-format.ts` — Permission tool types and card formatter/parser
+
+### Changed
+- **`handleMessage` ordering:** permission check runs BEFORE question check (higher urgency — agent blocked on tool call).
+- **WeChat 10-msg counter:** now resets on any incoming user message, not just `/next` (fixes early warning during permission card replies).
+- **Doc simplification:** AGENTS.md, README.md, README.en.md — question/permission sections collapsed from ~60 lines to ~5 lines each; full grammar in `.omo/plans/`.
+- `.gitignore`: narrowed from `.omo/` to `.omo/run-continuation/` — tracks design plans, ignores transient session state.
+
+### Fixed
+- **`/ap` mode not persisted** — `loadUserState` / `saveUserState` both forgot the `autoPermissionMode` field; mode was in-memory only and lost on restart.
+- **Stale docs claim "permission requests are auto-approved"** — originated from v0.1.0 ACP era, never matched current HTTP architecture.
+- **Multi-pending UX bug:** bare `1`/`2`/`3` rejected when 2+ cards pending (fixed by cascading to all).
 
 ## [1.2.0] - 2026-06-14
 

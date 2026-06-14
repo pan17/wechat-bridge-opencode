@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-bridge-opencode` v1.2.0 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-bridge-opencode` v1.3.0 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -22,7 +22,7 @@ npm test             # Run vitest unit tests (97 tests across 5 files)
 npm run test:watch   # Vitest in watch mode
 ```
 
-**Tests:** Vitest 4.1.8 unit tests live in `src/__tests__/` (97 tests across 5 files). No linter is configured.
+**Tests:** Vitest 4.1.8 unit tests live in `src/__tests__/` (215 tests across 9 files). No linter is configured.
 
 ### Running the CLI locally
 
@@ -50,7 +50,7 @@ src/server/
   client.ts                     — OpenCode Server HTTP client (fetch wrapper)
   session.ts                    — Simplified SessionManager (no subprocess, just HTTP)
   event-pipeline.ts             — Persistent /global/event SSE connection with reconnect
-src/__tests__/                  — Vitest unit tests (9 files, 202 tests)
+src/__tests__/                  — Vitest unit tests (9 files, 215 tests)
 src/adapter/
   inbound.ts                    — WeChat message → MessagePart[] (text, image, file)
   outbound.ts                   — Server reply → WeChat text (formatting, splitting)
