@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Default for `/thought-display` and `/tool-display` flipped from OFF to ON.** First-time installs now see 🧠 Thought summaries and 🔧 Tool summaries in WeChat without having to discover and toggle the commands. Users who already toggled either flag keep their saved choice (`~/.wechat-bridge-state.json`); users who never toggled inherit the new defaults on next bridge start. AGENTS.md / README.md / README.en.md / `/help` output all reflect the new default.
+- Deprecated `config.agent.showThoughts` / `config.agent.showTools` defaults flipped to `true` for consistency (these fields are no longer consulted at runtime — only the `/thought-display` / `/tool-display` state path drives display).
+
 ## [1.3.0] - 2026-06-14
 
 ### Added

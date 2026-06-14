@@ -118,8 +118,8 @@ export function defaultConfig(): WeChatOpencodeConfig {
       command: "",
       args: [],
       cwd: process.cwd(),
-      showThoughts: false,
-      showTools: false,
+      showThoughts: true,
+      showTools: true,
     },
     agents: { ...BUILT_IN_AGENTS },
     session: {

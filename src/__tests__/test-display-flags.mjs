@@ -33,8 +33,22 @@ function makeSm() {
 }
 
 describe("setShowFlags partial update", () => {
+  test("defaults are showThoughts=true, showTools=true (WeChat users see summaries by default)", () => {
+    // Regression: prior defaults were {false, false}. Flipped to {true, true}
+    // so first-time installs see 🧠 Thought and 🔧 Tools lines without
+    // having to discover and toggle `/thought-display on` /
+    // `/tool-display on`. Users who explicitly turned either flag off
+    // get their choice back from `~/.wechat-bridge-state.json`; users
+    // who never toggled inherit the new defaults.
+    const sm = makeSm();
+    expect(sm.getShowFlags()).toEqual({ showThoughts: true, showTools: true });
+  });
+
   test("is partial-update safe (does not clobber omitted flags)", () => {
     const sm = makeSm();
+    expect(sm.getShowFlags()).toEqual({ showThoughts: true, showTools: true });
+
+    sm.setShowFlags({ showThoughts: false, showTools: false });
     expect(sm.getShowFlags()).toEqual({ showThoughts: false, showTools: false });
 
     sm.setShowFlags({ showThoughts: true, showTools: true });

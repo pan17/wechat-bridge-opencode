@@ -2091,6 +2091,165 @@ test("showThoughts=off with no reasoning: tool summary still flushes at text bou
 });
 
 // ────────────────────────────────────────────────────────────────────────
+// Regression: showThoughts=off must NOT emit a 🧠 Thought line to WeChat
+// under the production dispatch path (R → text type-change →
+// flushCurrentPart). The earlier
+// "handleReasoningPart in showThoughts=off mode does NOT call onReply"
+// test only exercised the legacy `handleReasoningPart` method, which
+// was made dead code by the type-change-flushing refactor (commit
+// 61fba70). The actual production path goes through
+// `handlePartUpdated` → `flushCurrentPart`'s `case "reasoning"`, which
+// previously forgot the `showThoughtsSnapshot` guard that
+// `maybeFlushToolSummary` correctly applies on the tool side. This
+// regression still matters even though the runtime default flipped to
+// true: a user who has explicitly toggled `/thought-display off`
+// (persisted as `showThoughts: false` in their state file) must still
+// see ZERO thought lines, regardless of how many type changes happen
+// during the turn.
+// ────────────────────────────────────────────────────────────────────────
+
+test("REGRESSION: showThoughts=off end-to-end (R → text via flushCurrentPart) emits NO thought line", async () => {
+  const replyCalls = [];
+  const sm = new SessionManager({
+    serverUrl: "http://127.0.0.1:65535",
+    cwd: process.cwd(),
+    log: () => {},
+    onReply: async (_ctx, text) => { replyCalls.push(text); },
+    onMediaReply: async () => {},
+    sendTyping: async () => {},
+  });
+  // First-install state: live flag is false (the SessionManager default
+  // for a brand-new bridge instance), and the snapshot captured at
+  // turn-start is also false. No /thought-display on was ever issued.
+  sm["setShowFlags"]({ showThoughts: false, showTools: false });
+
+  // Override the turn-start snapshot to mirror what beginTurn would
+  // have captured from the live flag above (false). makeTurnForReasoningTest
+  // defaults to true so other on-mode tests can use it as-is.
+  const turn = makeTurnForReasoningTest({ showThoughtsSnapshot: false });
+  sm["currentTurn"] = turn;
+  expect(turn.showThoughtsSnapshot).toBe(false);
+
+  // The natural production stream for a model that emits a single
+  // reasoning part followed by a text part: R → text. The type-change
+  // at the boundary fires `flushCurrentPart` for the R, which is the
+  // code path that previously leaked the thought line.
+  driveStream(sm, turn, [
+    { id: "rp-1", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "reasoning",
+      text: "**Planning the answer**\n\nThis long body must NEVER reach WeChat when /thought-display is off." },
+    { id: "tp-1", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "text",
+      text: "Here's the answer." },
+  ]);
+
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  sm["flushNowForTest"]();
+
+  // Only the text part should reach WeChat. The thought line MUST NOT.
+  const thoughtLines = replyCalls.filter((m) => m.startsWith("🧠 Thought"));
+  expect(thoughtLines.length).toBe(0);
+  expect(replyCalls.length).toBe(1);
+  expect(replyCalls[0]).toBe("Here's the answer.");
+
+  // And the part must NOT be marked sent — if a future turn (or a
+  // mid-turn /thought-display on) needed it, dedup wouldn't have
+  // silently dropped it.
+  expect(turn.sentReasoningPartIds.has("rp-1")).toBeFalsy();
+});
+
+test("REGRESSION: showThoughts=off still respects the snapshot when there are tools (R → tool → text)", async () => {
+  const replyCalls = [];
+  const sm = new SessionManager({
+    serverUrl: "http://127.0.0.1:65535",
+    cwd: process.cwd(),
+    log: () => {},
+    onReply: async (_ctx, text) => { replyCalls.push(text); },
+    onMediaReply: async () => {},
+    sendTyping: async () => {},
+  });
+  // showThoughts OFF, showTools ON. The tool-summary path is
+  // independent and should still fire — only the thought line is gated.
+  sm["setShowFlags"]({ showThoughts: false, showTools: true });
+
+  const turn = makeTurnForReasoningTest({
+    showThoughtsSnapshot: false,
+    showToolsSnapshot: true,
+  });
+  sm["currentTurn"] = turn;
+
+  driveStream(sm, turn, [
+    { id: "rp-1", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "reasoning",
+      text: "**Picking a tool to call**\n\nBody." },
+    { id: "tool-bash", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "tool",
+      tool: "bash", callID: "b1", state: { status: "completed", title: "echo hi" } },
+    { id: "tp-1", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "text",
+      text: "All done." },
+  ]);
+
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  sm["flushNowForTest"]();
+
+  // Tool summary + text, NO thought line.
+  const thoughtLines = replyCalls.filter((m) => m.startsWith("🧠 Thought"));
+  expect(thoughtLines.length).toBe(0);
+  expect(replyCalls.length).toBe(2);
+  expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[1]).toBe("All done.");
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Default-ON lock-in: first install (no setShowFlags call, live flag is
+// the SessionManager default) must produce BOTH the 🧠 Thought line
+// and the 🔧 Tools summary when the model emits reasoning + tool +
+// text. Mirrors the production snapshot path: live flags default to
+// {true, true}, beginTurn snapshots them, type-change flushes emit the
+// summaries. Without this test, the next person who flips the defaults
+// back to false (or breaks the snapshot wiring) gets no signal.
+// ────────────────────────────────────────────────────────────────────────
+
+test("DEFAULT-ON: first install (no setShowFlags) emits thought line + tool summary + text for R → tool → text", async () => {
+  const replyCalls = [];
+  const sm = new SessionManager({
+    serverUrl: "http://127.0.0.1:65535",
+    cwd: process.cwd(),
+    log: () => {},
+    onReply: async (_ctx, text) => { replyCalls.push(text); },
+    onMediaReply: async () => {},
+    sendTyping: async () => {},
+  });
+  // Deliberately do NOT call setShowFlags — this asserts the SessionManager
+  // runtime default of {true, true}.
+  expect(sm.getShowFlags()).toEqual({ showThoughts: true, showTools: true });
+
+  // The fixture defaults showToolsSnapshot to false (most tests want an
+  // off-tool-snapshot turn); override to true so the snapshot matches
+  // the new live default. showThoughtsSnapshot already defaults to true
+  // and matches.
+  const turn = makeTurnForReasoningTest({ showToolsSnapshot: true });
+  sm["currentTurn"] = turn;
+  expect(turn.showThoughtsSnapshot).toBe(true);
+  expect(turn.showToolsSnapshot).toBe(true);
+
+  driveStream(sm, turn, [
+    { id: "rp-1", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "reasoning",
+      text: "**Plan**\n\nBody." },
+    { id: "tool-bash", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "tool",
+      tool: "bash", callID: "b1", state: { status: "completed", title: "echo hi" } },
+    { id: "tp-1", sessionID: turn.sessionId, messageID: turn.assistantMessageId, type: "text",
+      text: "All done." },
+  ]);
+
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  sm["flushNowForTest"]();
+
+  // All three summary types land in WeChat in chronological order:
+  //   thought → tool summary → text
+  expect(replyCalls.length).toBe(3);
+  expect(replyCalls[0].startsWith("🧠 Thought")).toBeTruthy();
+  expect(replyCalls[1].startsWith("🔧 Tools:")).toBeTruthy();
+  expect(replyCalls[2]).toBe("All done.");
+});
+
+// ────────────────────────────────────────────────────────────────────────
 // vitest handles test discovery, async awaiting, pass/fail reporting,
 // and process exit. Nothing to do at the bottom of this file.
 // ────────────────────────────────────────────────────────────────────────

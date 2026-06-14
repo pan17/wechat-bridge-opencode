@@ -97,7 +97,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, and **MCP servers configured in the current workspace** (with failure reasons). Agent/model/reasoning/MCP fetched from the current workspace; defaults from config when no history |
+| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, and **MCP server status** (with failure reasons). Agent/Model/Reasoning/MCP are fetched from the OpenCode Server via HTTP API (scoped to the current workspace via `?directory=...`; auto-refreshed on workspace switch). For an empty session, Model falls back to the workspace's `model:` field from the server config |
 
 ### Workspace (`/workspace` or `/ws`)
 
@@ -154,7 +154,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | Command | Description |
 |---------|-------------|
-| `/thought-display on` | Show model reasoning in WeChat as a single `🧠 Thought · {summary} · {duration}` line per reasoning block (no body — only the summary) |
+| `/thought-display on` (default) | Show model reasoning in WeChat as a single `🧠 Thought · {summary} · {duration}` line per reasoning block (no body — only the summary) |
 | `/thought-display off` | Hide reasoning from WeChat (only logged to bridge log) |
 | `/thought-display status` | Show current thought display state |
 
@@ -164,7 +164,7 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 
 | Command | Description |
 |---------|-------------|
-| `/tool-display on` | Show tool summary at end of turn (emoji + tool name + opencode-generated title, e.g. `✅ webfetch https://httpbin.org/get`, `✅ bash exit 0`) |
+| `/tool-display on` (default) | Show tool summary at end of turn (emoji + tool name + opencode-generated title, e.g. `✅ webfetch https://httpbin.org/get`, `✅ bash exit 0`) |
 | `/tool-display off` | Hide tool summary |
 | `/tool-display status` | Show current tool display state |
 

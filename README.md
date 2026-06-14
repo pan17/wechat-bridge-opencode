@@ -98,7 +98,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | 命令 | 说明 |
 |------|------|
-| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量，以及**当前工作区配置的 MCP servers 状态**（含失败原因）。Agent/Model/Reasoning/MCP 从当前工作区获取，无历史消息时取配置默认值 |
+| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量，以及 **MCP servers 状态**（含失败原因）。Agent/Model/Reasoning/MCP 通过 OpenCode Server 的 HTTP API 拉取（按当前工作区 `?directory=...` 限定，切换工作区时自动刷新）；空会话时 Model 取 server 配置中工作区的 `model:` 字段 |
 
 ### 工作区（`/workspace` 或 `/ws`）
 
@@ -155,7 +155,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | 命令 | 说明 |
 |------|------|
-| `/thought-display on` | 在微信中以单行 `🧠 Thought · {摘要} · {duration}` 显示模型推理（仅摘要，不含正文） |
+| `/thought-display on`（默认） | 在微信中以单行 `🧠 Thought · {摘要} · {duration}` 显示模型推理（仅摘要，不含正文） |
 | `/thought-display off` | 隐藏推理内容（仅记录到 bridge 日志） |
 | `/thought-display status` | 查看当前思考显示状态 |
 
@@ -165,7 +165,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | 命令 | 说明 |
 |------|------|
-| `/tool-display on` | 在每轮结束时显示工具摘要（emoji + 工具名 + opencode 生成的标题；如 `✅ webfetch https://httpbin.org/get`、`✅ bash exit 0`） |
+| `/tool-display on`（默认） | 在每轮结束时显示工具摘要（emoji + 工具名 + opencode 生成的标题；如 `✅ webfetch https://httpbin.org/get`、`✅ bash exit 0`） |
 | `/tool-display off` | 隐藏工具摘要 |
 | `/tool-display status` | 查看当前工具显示状态 |
 

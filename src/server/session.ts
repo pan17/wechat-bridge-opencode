@@ -230,8 +230,14 @@ export class SessionManager {
   private currentReasoning?: string;
 
   // Display flags
-  private showThoughts = false;
-  private showTools = false;
+  // Defaults are ON: WeChat users expect to see reasoning summaries and
+  // tool summaries by default. Flip via `/thought-display off` /
+  // `/tool-display off`, which persists to `~/.wechat-bridge-state.json`.
+  // Note: users who never toggled either flag inherit these defaults on
+  // first install; users with a saved state see their last explicit
+  // choice restored at startup (see `bridge.ts:350-355`).
+  private showThoughts = true;
+  private showTools = true;
 
   // Context usage
   private totalTokens = 0;
@@ -1586,6 +1592,21 @@ export class SessionManager {
           // replay). `sentReasoningPartIds` is the dedup set.
           if (turn.sentReasoningPartIds.has(partID)) break;
           if (!turn.currentReasoningText.trim()) break;
+          // Honor the turn-start snapshot of /thought-display. Mirrors
+          // the `if (!turn.showToolsSnapshot) return;` guard at the top
+          // of `maybeFlushToolSummary` — without this, off-mode (the
+          // default on first install) still leaks the 🧠 Thought line
+          // to WeChat because the unified type-change-flushing path
+          // here replaced the old `dispatchReasoningPart` which DID
+          // check the flag. The legacy `handleReasoningPart` /
+          // `dispatchReasoningPart` methods that correctly gated on
+          // `flags.showThoughts` are now dead code, so this is the only
+          // gate in the production dispatch path. Off-mode metrics
+          // (`reasoningCharCount` / `reasoningStartMs` / `reasoningEndMs`)
+          // are still updated by `accumulateReasoningDelta` during
+          // streaming, so `finalizeTurn`'s bridge-log summary line
+          // continues to work.
+          if (!turn.showThoughtsSnapshot) break;
 
           const now = Date.now();
           const startMs = turn.currentReasoningStartMs ?? now;
