@@ -145,9 +145,18 @@ src/weixin/
 - **Permission requests are auto-approved** — handled server-side by OpenCode
 - **Single-user** — one WeChat user, one OpenCode session at a time
 - **Runtime state** stored in `~/.wechat-opencode/` (auth tokens, daemon PID, logs, user states)
-- **LLM question tool requires `opencode.json` permission** — add `"question": "allow"` under `permission` in the project's `opencode.json`; without it the server rejects the tool call and the bridge never sees the question
 
 ## WeChat Commands
+
+### Help (/help)
+| Command | Description |
+|---------|-------------|
+| `/help` (`/h`, `/?`) | Show all available commands |
+
+### Status (/status)
+| Command | Description |
+|---------|-------------|
+| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage. Agent/model/reasoning fetched from server; defaults from config when no history |
 
 ### Workspace (/workspace or /ws)
 | Command | Description |
@@ -188,16 +197,11 @@ src/weixin/
 | `/reasoning switch <level>` | Switch reasoning level |
 | `/reasoning status` | Show current reasoning level |
 
-### Status (/status)
-| Command | Description |
-|---------|-------------|
-| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage. Agent/model/reasoning fetched from server; defaults from config when no history |
-
 ### Stop (/stop)
 | Command | Description |
 |---------|-------------|
 | `/stop` | Cancel the running agent |
-| `/restart` | New session (clear context) |
+| `/restart` | Restart OpenCode Server (external server mode: recover previous session only) |
 
 ### Thought Display (/thought-display)
 | Command | Description |
@@ -246,7 +250,3 @@ The bridge surfaces OpenCode's `question` tool to WeChat whenever the agent call
 
 Mobile keyboards auto-insert spaces around operators — the parser tolerates `Q1 = 1`, `Q2 - 文字`, `Q1= 1`, `Q1 =1`. A 30-minute soft timeout auto-rejects unanswered questions and notifies the user.
 
-### Help
-| Command | Description |
-|---------|-------------|
-| `/help` | Show all available commands |

@@ -2,6 +2,10 @@
 
 [中文](README.md) | [English](README.en.md)
 
+![npm](https://img.shields.io/npm/v/wechat-bridge-opencode?style=flat-square&logo=npm)
+![npm downloads](https://img.shields.io/npm/dm/wechat-bridge-opencode?style=flat-square&logo=npm)
+![License](https://img.shields.io/github/license/pan17/wechat-opencode?style=flat-square)
+
 将微信私聊消息桥接到 OpenCode Server（HTTP API），支持文本、图片、文件、音视频的双向传输。
 
 <img src="./resources/发送.jpg" alt="发送" width="49%" /> <img src="./resources/接收.jpg" alt="接收" width="49%" />
@@ -83,6 +87,18 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 ## 微信命令
 
+### 帮助（`/help`）
+
+| 命令 | 说明 |
+|------|------|
+| `/help`（`/h`、`/?`） | 显示所有可用命令的帮助信息 |
+
+### 状态（`/status`）
+
+| 命令 | 说明 |
+|------|------|
+| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量，以及**当前工作区配置的 MCP servers 状态**（含失败原因）。Agent/Model/Reasoning/MCP 从当前工作区获取，无历史消息时取配置默认值 |
+
 ### 工作区（`/workspace` 或 `/ws`）
 
 | 命令 | 说明 |
@@ -127,18 +143,12 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 | `/reasoning switch <level>` | 切换推理级别 |
 | `/reasoning status` | 显示当前推理级别 |
 
-### 状态（`/status`）
-
-| 命令 | 说明 |
-|------|------|
-| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量，以及**当前工作区配置的 MCP servers 状态**（含失败原因）。Agent/Model/Reasoning/MCP 从当前工作区获取，无历史消息时取配置默认值 |
-
 ### 停止（`/stop`）
 
 | 命令 | 说明 |
 |------|------|
 | `/stop` | 停止正在运行的 Agent |
-| `/restart` | 新会话（清除上下文） |
+| `/restart` | 重启 OpenCode Server（外部 server 模式仅恢复会话） |
 
 ### 思考显示（`/thought-display`）
 
@@ -213,22 +223,13 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 - 仅支持私信（群聊会被忽略）
 - 权限请求自动批准
 - `send-wechat` 工具自动安装到 `~/.config/opencode/tools/send-wechat.ts`
-- **LLM 问答需要 `opencode.json` 显式允许 question 工具**（默认拒绝用户交互工具）：
-
-  ```json
-  {
-    "$schema": "https://opencode.ai/config.json",
-    "permission": {
-      "question": "allow"
-    }
-  }
-  ```
-
-  没有这一项，Agent 试图调用 `question` 时会被 server 拒绝、问题不会到达微信。
-
 ## 致谢
 
 本项目基于 [wechat-acp](https://github.com/formulahendry/wechat-acp)（作者 [formulahendry](https://github.com/formulahendry)）二次开发，感谢原作者的贡献！
+
+## 免责声明
+
+本项目**并非** OpenCode 团队或微信官方团队开发，与上述两者**不存在任何隶属关系**，纯属个人学习项目。
 
 ## 许可证
 

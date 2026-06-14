@@ -2,6 +2,10 @@
 
 [中文](README.md) | [English](README.en.md)
 
+![npm](https://img.shields.io/npm/v/wechat-bridge-opencode?style=flat-square&logo=npm)
+![npm downloads](https://img.shields.io/npm/dm/wechat-bridge-opencode?style=flat-square&logo=npm)
+![License](https://img.shields.io/github/license/pan17/wechat-opencode?style=flat-square)
+
 Bridge WeChat direct messages to OpenCode Server (HTTP API), with full bidirectional support for text, images, files, audio, and video.
 
 <img src="./resources/发送.jpg" alt="Send" width="49%" /> <img src="./resources/接收.jpg" alt="Receive" width="49%" />
@@ -82,6 +86,18 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 ## WeChat Commands
 
+### Help (`/help`)
+
+| Command | Description |
+|---------|-------------|
+| `/help` (`/h`, `/?`) | Show all available commands |
+
+### Status (`/status`)
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, and **MCP servers configured in the current workspace** (with failure reasons). Agent/model/reasoning/MCP fetched from the current workspace; defaults from config when no history |
+
 ### Workspace (`/workspace` or `/ws`)
 
 | Command | Description |
@@ -126,18 +142,12 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 | `/reasoning switch <level>` | Switch reasoning level |
 | `/reasoning status` | Show current reasoning level |
 
-### Status (`/status`)
-
-| Command | Description |
-|---------|-------------|
-| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, and **MCP servers configured in the current workspace** (with failure reasons). Agent/model/reasoning/MCP fetched from the current workspace; defaults from config when no history |
-
 ### Stop (`/stop`)
 
 | Command | Description |
 |---------|-------------|
 | `/stop` | Stop the running agent |
-| `/restart` | New session (clear context) |
+| `/restart` | Restart OpenCode Server (external server mode: recover previous session only) |
 
 ### Thought Display (`/thought-display`)
 
@@ -197,6 +207,10 @@ Runtime data stored in `~/.wechat-bridge-opencode`:
 ## Acknowledgment
 
 This project is based on [wechat-acp](https://github.com/formulahendry/wechat-acp) by [formulahendry](https://github.com/formulahendry). Thanks for the original work!
+
+## Disclaimer
+
+This project is **not** developed by the OpenCode team or the official WeChat team, and has **no affiliation** with either. It is purely a personal learning project.
 
 ## License
 
