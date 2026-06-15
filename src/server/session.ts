@@ -410,6 +410,65 @@ export class SessionManager {
   }
 
   /**
+   * Drop any in-flight turn without forwarding its buffered content to WeChat.
+   *
+   * Used by session/workspace switch (`switchSession`, `switchWorkspace`)
+   * when the user explicitly moves away from a session that may still be
+   * streaming. Unlike `finalizeTurn`, this method does NOT call `onReply` —
+   * any unsent text / reasoning / tool summary in `currentTurn` is silently
+   * discarded, because the user has moved on and forwarding stale content
+   * would just confuse the WeChat thread.
+   *
+   * Does NOT abort the OLD session on the server. The server-side session
+   * continues to run; we just stop tracking it locally. Events for it will
+   * be dropped by the sessionID filter in `handleEvent` after the caller
+   * updates `this.sessionId`.
+   *
+   * What this cleans up (matching what `finalizeTurn` would touch, minus
+   * the user-facing side effects):
+   *   - `currentTurn` is set to null (any `currentText` / `currentReasoningText`
+   *     / unsent tool summary goes with it)
+   *   - `finalizeTimer` (500ms debounce) and `stuckTimer` (5min stuck timeout)
+   *     are cleared so they can't fire stale state after the switch
+   *   - `pendingEchoes` is cleared — those contextTokens belong to prompts
+   *     for the OLD session that the server has already created; the user
+   *     has moved on, so we don't want to begin new turns for them
+   *   - typing indicator for the OLD turn's contextToken is cancelled
+   *     (single-user mode makes this the same WeChat user, but
+   *     `cancelTyping` is idempotent and safe)
+   *   - `isSessionBusy` is reset to false — the OLD session's status events
+   *     were setting it; the NEW session's first status event will set it
+   *     correctly. Without the reset, the first finalize debounce after the
+   *     switch could be skipped thinking background tasks are still running.
+   */
+  private discardInFlightTurn(): void {
+    const turn = this.currentTurn;
+    if (!turn) {
+      // No active turn — still clear any leftover echoes / timers (defense
+      // in depth; shouldn't normally exist without a turn, but no harm).
+      this.clearFinalizeTimers();
+      if (this.pendingEchoes.length > 0) {
+        this.log(`[switch] dropping ${this.pendingEchoes.length} stale pending echo(es) without active turn`);
+        this.pendingEchoes = [];
+      }
+      return;
+    }
+    this.log(
+      `[switch] discarding in-flight turn (was sessionId=${turn.sessionId.slice(0, 8)}…, ` +
+        `sentTextParts=${turn.sentTextPartIds.size}, accumulated reasoning=${turn.reasoningCharCount}ch)`,
+    );
+    const oldCtx = turn.contextToken;
+    turn.status = "interrupted";
+    this.currentTurn = null;
+    this.clearFinalizeTimers();
+    this.pendingEchoes = [];
+    this.isSessionBusy = false;
+    if (oldCtx) {
+      this.cancelTyping?.(oldCtx).catch(() => {});
+    }
+  }
+
+  /**
    * Switch to a different session (workspace switch).
    *
    * Resolution order:
@@ -421,6 +480,9 @@ export class SessionManager {
    *   3. If no prior session exists in `cwd`, create a new one.
    *
    * State handling:
+   *   - Any in-flight turn from the PREVIOUS session is discarded
+   *     (no `onReply` calls — the user has moved on). See
+   *     `discardInFlightTurn` for rationale.
    *   - Resumed session: agent/model/reasoning are synced from the session's
    *     last assistant message via `syncStateFromServer` (overwriting any
    *     stale values from the previous workspace).
@@ -467,6 +529,18 @@ export class SessionManager {
       targetSessionId = info.id;
     }
 
+    // Discard any in-flight turn from the PREVIOUS session BEFORE we change
+    // `this.sessionId`. Without this, the OLD turn's buffered text/reasoning/
+    // tool summary could be flushed to WeChat by:
+    //   - the deferred 500ms finalize debounce (if it armed just before the
+    //     switch), or
+    //   - the 5-minute stuck timeout, or
+    //   - the first new prompt in the NEW session triggering
+    //     `handleMessageUpdated`'s "different user ID" path.
+    // See `discardInFlightTurn` for full rationale. Must run BEFORE the
+    // sessionId assignment below so the assignment is the LAST thing in this
+    // function — anything after this synchronous block runs in the same tick.
+    this.discardInFlightTurn();
     this.sessionId = targetSessionId;
     this.cwd = cwd;
 
@@ -515,6 +589,20 @@ export class SessionManager {
 
   /**
    * Switch to a specific session by ID.
+   *
+   * State handling (mirrors `switchWorkspace`):
+   *   - Any in-flight turn from the PREVIOUS session is discarded
+   *     (no `onReply` calls). See `discardInFlightTurn` for rationale.
+   *   - Stale `currentMode` / `currentModelId` / `currentReasoning` from the
+   *     previous session are cleared BEFORE `syncStateFromServer` so the
+   *     sync can repopulate them from the target session's last assistant
+   *     message (when present). For brand-new target sessions with no
+   *     messages, `refreshAgents` / `refreshProviders` below set defaults
+   *     from the new workspace's opencode.json — same pattern as
+   *     `switchWorkspace`'s new-session branch. Without this clear,
+   *     switching to a session in a workspace that defines a different
+   *     agent would carry the OLD agent name into the next prompt and
+   *     fail with `Agent not found`.
    */
   async switchSession(sessionId: string, cwd: string): Promise<void> {
     this.log(`Loading session ${sessionId} (cwd: ${cwd})`);
@@ -524,10 +612,26 @@ export class SessionManager {
     } catch {
       throw new Error(`Session ${sessionId} not found on server`);
     }
+    // Discard any in-flight turn from the PREVIOUS session BEFORE we change
+    // `this.sessionId` (same rationale as in `switchWorkspace`). Doing this
+    // FIRST means the sessionId swap below is the LAST state change of this
+    // synchronous block — events arriving in the next tick see the new
+    // sessionId AND an empty currentTurn.
+    this.discardInFlightTurn();
+    // Clear stale agent/model/reasoning from the previous session/workspace
+    // so the sync below (or the post-switch refresh) repopulates from the
+    // NEW context. Without this clear, switching to a brand-new session in
+    // a workspace whose default agent differs from the previous one would
+    // carry the OLD agent name forward and fail with `Agent not found`.
+    this.currentMode = undefined;
+    this.currentModelId = undefined;
+    this.currentReasoning = undefined;
     this.sessionId = sessionId;
     this.cwd = cwd;
     this.onSessionReady?.(sessionId);
-    // Sync agent/model from the session's last message
+    // Sync agent/model from the session's last message (overwrites the
+    // undefineds above when the target session has messages; falls back to
+    // server config for empty sessions).
     await this.syncStateFromServer(sessionId);
     // Same reasoning as switchWorkspace: the new session lives in a
     // different workspace than the one whose agents/providers are cached.
