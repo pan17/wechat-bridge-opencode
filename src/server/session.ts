@@ -192,10 +192,36 @@ export interface SessionManagerOpts {
   ) => Promise<void>;
   /**
    * Invoked when the permission soft-timeout fires (30 min with no user
-   * reply). The bridge should send a user-visible "timed out" message
-   * to WeChat before the auto-reject lands on the server.
+   * reply). The bridge should send a user-visible "timed out" message to
+   * WeChat before the auto-reject lands on the server.
    */
   onPermissionTimedOut?: (contextToken: string, requestID: string) => Promise<void>;
+  /**
+   * Invoked for SSE events that target a NON-current session on the
+   * OpenCode Server. The bridge wires this to its `SessionNotifier`,
+   * which decides whether to surface the event as a WeChat notification
+   * (gated by `/notify` settings and dedup).
+   *
+   * Why this hook exists: the `/global/event` SSE stream is server-wide
+   * — it carries events for EVERY session, not just the current one.
+   * Before this hook, the sessionId filter in `handleEvent` silently
+   * dropped those events (line 1411-1418). The cross-session notification
+   * feature relies on receiving them.
+   *
+   * Only events that have a `sessionID` in their `properties` and that
+   * sessionID differs from `this.sessionId` are forwarded. The current
+   * session's events continue to flow through the normal
+   * `handleEvent` switch. Events with no `sessionID` (e.g. server-wide
+   * `installation.update-available`) are NOT forwarded — they have no
+   * target session to attribute to.
+   *
+   * The callback receives the RAW `OpenCodeEvent` so the notifier can
+   * pattern-match on `event.type` exactly the same way `handleEvent`
+   * does. Must be non-throwing — errors are caught and logged inside
+   * the notifier so a bad notification dispatch never takes down the
+   * SSE pipeline.
+   */
+  onOtherSessionEvent?: (event: OpenCodeEvent) => void | Promise<void>;
 }
 
 interface QueueItem {
@@ -349,6 +375,15 @@ export class SessionManager {
   ) => Promise<void>;
   private onPermissionTimedOut?: (contextToken: string, requestID: string) => Promise<void>;
   /**
+   * Optional callback invoked from `handleEvent` for events whose
+   * `sessionID` does NOT match `this.sessionId` — see
+   * `SessionManagerOpts.onOtherSessionEvent` for the design rationale
+   * and what the notifier is expected to do. Errors thrown from the
+   * callback are caught and logged so a buggy notifier cannot take
+   * down the SSE pipeline.
+   */
+  private onOtherSessionEvent?: (event: OpenCodeEvent) => void | Promise<void>;
+  /**
    * Client-side preference for auto-accepting permission requests. When
    * `off` (default), every `permission.asked` event surfaces a WeChat
    * card. When `once` or `always`, the SessionManager auto-replies
@@ -375,11 +410,25 @@ export class SessionManager {
     this.onQuestionTimedOut = opts.onQuestionTimedOut;
     this.onPermissionAsked = opts.onPermissionAsked;
     this.onPermissionTimedOut = opts.onPermissionTimedOut;
+    this.onOtherSessionEvent = opts.onOtherSessionEvent;
   }
 
   /** Current session ID, or null if not yet created. */
   getSessionId(): string | null {
     return this.sessionId;
+  }
+
+  /**
+   * Expose the underlying OpenCode HTTP client. Used by the
+   * cross-session notifier (see `src/notifier.ts`) to look up
+   * session titles for `notify` messages. The notifier only
+   * needs the structural subset `NotifierClient.getSession`,
+   * so exposing the full client here is intentional — any
+   * future feature that needs more server endpoints can
+   * piggyback on the same reference.
+   */
+  getOpenCodeClient(): OpenCodeServerClient {
+    return this.client;
   }
 
   /**
@@ -1412,7 +1461,25 @@ export class SessionManager {
     if (this.sessionId && "properties" in event && event.properties && "sessionID" in event.properties) {
       const sid = (event.properties as { sessionID?: string }).sessionID;
       if (sid && sid !== this.sessionId) {
-        // Event for a different session — ignore.
+        // Event for a different session — forward to the
+        // cross-session notifier (if wired) and DROP from the
+        // current-session dispatch path. The notifier decides
+        // whether to surface the event as a WeChat notification
+        // (gated by `/notify` settings + dedup). It must be
+        // non-throwing — but we wrap in try/catch defensively
+        // so a buggy notifier cannot take down the SSE pipeline.
+        if (this.onOtherSessionEvent) {
+          try {
+            const ret = this.onOtherSessionEvent(event);
+            if (ret && typeof (ret as Promise<unknown>).catch === "function") {
+              (ret as Promise<unknown>).catch((err: unknown) => {
+                this.log(`[session] onOtherSessionEvent async error: ${String(err)}`);
+              });
+            }
+          } catch (err) {
+            this.log(`[session] onOtherSessionEvent sync error: ${String(err)}`);
+          }
+        }
         return;
       }
     }

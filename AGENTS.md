@@ -255,3 +255,36 @@ The bridge surfaces OpenCode's `permission.asked` events to WeChat as a card wit
 
 > Server-side `always` rules live in `InstanceState.approved` (in-memory only). They are lost on `opencode serve` restart; the bridge does NOT shadow-store them.
 
+### Cross-session notifications (/notify)
+| Command | Description |
+|---------|-------------|
+| `/notify` (alias `/n`) | Configure notifications for OTHER (non-current) OpenCode sessions running on the same server. Mirrors OpenCode Desktop's notification UX. |
+| `/notify on\|off` | Master switch. Default: `on`. |
+| `/notify status` | Show current configuration. |
+| `/notify types <type> on\|off` | Toggle a single event type. `<type>` is one of `question` / `permission` / `error` / `completion`. |
+
+The OpenCode Server's `/global/event` SSE stream carries events for ALL sessions on the server, not just the current one. Normally `SessionManager.handleEvent` silently drops events whose `sessionID` doesn't match the current session (line 1411-1418). With `/notify` enabled, the bridge additionally forwards those events to WeChat as notifications so the user can decide whether to switch sessions.
+
+**Notification types**:
+- `question` — another session is waiting on an LLM `question` tool call
+- `permission` — another session needs a tool permission grant
+- `error` — another session hit `session.error` (provider auth, rate limit, etc.)
+- `completion` — another session's turn finished (busy→idle transition)
+
+**Notification format** (one-liner + switch hint):
+```
+📨 Session "fix-auth-bug" 等待你的输入
+   Q: 用 OAuth 还是 JWT?
+   /session switch "fix-auth-bug" 查看
+```
+
+**Persistence**: Master + per-type settings persist to `~/.wechat-bridge-opencode/.wechat-bridge-state.json` alongside `showThoughts` / `autoPermissionMode`. Survives bridge restarts.
+
+**Implementation**:
+- `SessionManager.handleEvent` filter (session.ts:1411-1418) — instead of `return`, now invokes the `onOtherSessionEvent` callback for non-current events (errors caught + logged)
+- `src/notifier.ts` — `SessionNotifier` class: title cache (TTL 5min), dedupe (30s per session+type), settings gate, busy→idle transition tracking
+- `src/adapter/notify-format.ts` — pure formatters for the 4 notification kinds + `/notify status` body + defensive error string extraction
+- `src/adapter/workspace-cmd.ts` — `parseNotifyCommand` + help rows + `formatStatus` `notifySettings` field
+
+Idle→busy transitions are NOT notified (the user didn't ask to know a session *started* — only that it *needs attention* or *finished*). The `completion` event uses busy→idle transition tracking so a session that was already idle at startup doesn't fire a spurious "completed" notification.
+

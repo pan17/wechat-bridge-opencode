@@ -18,6 +18,7 @@
 
 import type { McpServerStatus } from "../types.js";
 import type { SessionStatus } from "../types/events.js";
+import type { NotifySettings } from "../config.js";
 
 export interface WorkspaceCommand {
   kind: "list" | "add" | "switch" | "remove" | "status";
@@ -119,6 +120,28 @@ export interface RejectPermissionCommand {
 export interface AutoPermissionCommand {
   kind: "auto-permission";
   mode: "off" | "once" | "always" | "status";
+}
+
+/**
+ * `/notify` (alias `/n`) — configure the cross-session notification
+ * feature. When enabled, the bridge forwards events from OTHER (non-
+ * current) sessions on the OpenCode Server to WeChat, so the user
+ * knows when a long-running background session needs attention or has
+ * finished. Mirrors OpenCode Desktop's notification UX.
+ *
+ * Three subcommands:
+ *   - `/notify on|off`                  — master switch
+ *   - `/notify status`                  — show current settings
+ *   - `/notify types <type> on|off`     — per-event-type toggle
+ *
+ * `<type>` is one of `question` | `permission` | `error` | `completion`.
+ * The setting persists across bridge restarts in
+ * `.wechat-bridge-state.json`.
+ */
+export interface NotifyCommand {
+  kind: "notify";
+  mode: "on" | "off" | "status";
+  type?: "question" | "permission" | "error" | "completion";
 }
 
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
@@ -454,6 +477,45 @@ export function parseAutoPermissionCommand(text: string): AutoPermissionCommand 
   return { kind: "auto-permission", mode: m[1] as "off" | "once" | "always" | "status" };
 }
 
+/**
+ * Parse `/notify` (or short alias `/n`) to configure cross-session
+ * notifications. Three sub-shapes:
+ *
+ *   `/notify`                → { kind: "notify", mode: "status" }  (default: show current settings)
+ *   `/notify on|off|status`  → { kind: "notify", mode: … }
+ *   `/notify types <type> on|off`  → { kind: "notify", mode: "on"|"off", type: … }
+ *
+ * `<type>` is one of `question` | `permission` | `error` | `completion`.
+ * The bare `/notify` defaults to `status` so users get a readout of
+ * their current configuration without having to type the subcommand.
+ * Returns null for unrecognized input so the dispatcher can fall
+ * through to the regular "unknown slash command" hint.
+ */
+export function parseNotifyCommand(text: string): NotifyCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  // Bare command → status (most common entry point: "what's my notify config?")
+  if (trimmed === "/notify" || trimmed === "/n") {
+    return { kind: "notify", mode: "status" };
+  }
+  // /notify on|off|status
+  const m1 = trimmed.match(/^\/(?:notify|n)\s+(on|off|status)\s*$/);
+  if (m1) {
+    return { kind: "notify", mode: m1[1] as "on" | "off" | "status" };
+  }
+  // /notify types <type> on|off
+  const m2 = trimmed.match(
+    /^\/(?:notify|n)\s+types\s+(question|permission|error|completion)\s+(on|off)\s*$/,
+  );
+  if (m2) {
+    return {
+      kind: "notify",
+      mode: m2[2] as "on" | "off",
+      type: m2[1] as "question" | "permission" | "error" | "completion",
+    };
+  }
+  return null;
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ cwd: string }>,
   activeCwd: string | null,
@@ -554,6 +616,16 @@ export function formatStatus(opts: {
    * `0`), per user-facing design.
    */
   otherBusySessions?: number | null;
+  /**
+   * Cross-session notification settings. Surfaced as a single compact
+   * line — `🔔 Notify: ✅ On (q ✅ p ✅ e ✅ c ✅)` — so the user can
+   * see at a glance whether other-session events are being pushed and
+   * which categories are active. Pass `undefined` to omit the line
+   * (rendered when the bridge hasn't loaded settings yet, e.g. when
+   * the notifier is null). See `src/config.ts#NotifySettings` and
+   * `src/notifier.ts` for the feature.
+   */
+  notifySettings?: NotifySettings | null;
 }): string {
   const lines: string[] = ["📊 Status:"];
 
@@ -601,6 +673,23 @@ export function formatStatus(opts: {
     lines.push(`  📈 Other running sessions: ${opts.otherBusySessions}`);
   } else {
     lines.push("  📈 Other running sessions: (unknown)");
+  }
+
+  // Cross-session notification config (compact, one line). Letter codes
+  // match the `/notify types <type>` grammar: q=question, p=permission,
+  // e=error, c=completion. When disabled at the master level we omit
+  // the per-type glyphs entirely so the user sees the master state
+  // first and isn't misled by a "q ✅" that doesn't actually fire.
+  if (opts.notifySettings) {
+    const ns = opts.notifySettings;
+    if (ns.enabled) {
+      const t = ns.types;
+      lines.push(
+        `  🔔 Notify: ✅ On (q ${t.question ? "✅" : "❌"} p ${t.permission ? "✅" : "❌"} e ${t.error ? "✅" : "❌"} c ${t.completion ? "✅" : "❌"})`,
+      );
+    } else {
+      lines.push("  🔔 Notify: ❌ Off   (use /notify on to enable)");
+    }
   }
 
   // MCP servers (show all so the user can see what's loaded, with failures
@@ -771,6 +860,13 @@ export function formatHelp(): string {
     "  /auto-permission         切换权限自动接收模式: off | once | always | status",
     "  （简写: /ap）",
     "",
+    "── 通知 ──",
+    "  /notify                  推送其他正在运行的 OpenCode 会话事件到微信",
+    "  /notify on|off           总开关（默认 on）",
+    "  /notify status           查看当前配置",
+    "  /notify types <type> on|off  切换单个事件 (question/permission/error/completion)",
+    "  （简写: /n ...）",
+    "",
     "  /help                    显示本帮助信息",
   ].join("\n");
 }
@@ -853,6 +949,13 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "  （简写: /rp）",
     "  /auto-permission         切换权限自动接收模式: off | once | always | status",
     "  （简写: /ap）",
+    "",
+    "── 通知 ──",
+    "  /notify                  推送其他正在运行的 OpenCode 会话事件到微信",
+    "  /notify on|off           总开关（默认 on）",
+    "  /notify status           查看当前配置",
+    "  /notify types <type> on|off  切换单个事件 (question/permission/error/completion)",
+    "  （简写: /n ...）",
     "",
     "── 帮助 ──",
     "  /help                    显示本帮助信息",

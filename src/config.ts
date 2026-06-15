@@ -92,6 +92,68 @@ export function defaultStorageDir(): string {
   return path.join(os.homedir(), ".wechat-bridge-opencode");
 }
 
+/**
+ * Cross-session notification feature (`/notify`).
+ *
+ * When the OpenCode Server has multiple sessions in flight (e.g. the
+ * user opened a long-running background session in TUI/Desktop while
+ * chatting with us in WeChat), the bridge normally only sees events
+ * for the *current* session — events for other sessions are silently
+ * dropped by the sessionID filter in `SessionManager.handleEvent`.
+ *
+ * With `NotifySettings` enabled, the bridge additionally forwards
+ * those dropped events to WeChat as notifications so the user can
+ * decide whether to switch sessions. Mirrors the OpenCode Desktop
+ * notification UX: the WeChat message names the session and includes
+ * a `/session switch <n>` hint.
+ *
+ * The settings persist to `~/.wechat-bridge-opencode/.wechat-bridge-state.json`
+ * alongside the existing `showThoughts` / `autoPermissionMode` fields.
+ *
+ * - `enabled` — master switch (default: true). When false, no other-session
+ *   notifications are sent, even if individual `types.*` are true.
+ * - `types` — per-event-type sub-toggles. Each defaults to `true` so the
+ *   user gets the full Desktop-like experience out of the box; a user who
+ *   only wants the most urgent alerts (e.g. errors) can disable `question`
+ *   / `permission` individually without losing everything.
+ *
+ * Event type semantics:
+ *   - `question`   — another session is waiting on an LLM `question` tool
+ *                    call (the user can answer via `/session switch` then Q1=).
+ *   - `permission` — another session needs a tool permission grant.
+ *   - `error`      — another session hit `session.error` (provider auth,
+ *                    rate limit, etc.) and won't auto-recover.
+ *   - `completion` — another session transitioned from `busy` to `idle`
+ *                    (a turn finished). The most common notification —
+ *                    mirrors Desktop's "session X is done" toast.
+ *
+ * Idle→busy transitions are NOT notified (the user didn't ask to know
+ * a session *started* — only that it *needs attention* or *finished*).
+ */
+export interface NotifySettings {
+  enabled: boolean;
+  types: {
+    question: boolean;
+    permission: boolean;
+    error: boolean;
+    completion: boolean;
+  };
+}
+
+/** Default `NotifySettings` when no preference is persisted. */
+export const DEFAULT_NOTIFY_SETTINGS: NotifySettings = {
+  enabled: true,
+  types: {
+    question: true,
+    permission: true,
+    error: true,
+    completion: true,
+  },
+};
+
+/** Type-name union for the per-event sub-toggles (used by parsers/notifier). */
+export type NotifyEventType = keyof NotifySettings["types"];
+
 export function defaultTempDir(storageDir: string): string {
   return path.join(storageDir, "tempfile");
 }

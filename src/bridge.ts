@@ -21,6 +21,8 @@ import { weixinMessageToPrompt } from "./adapter/inbound.js";
 import { formatForWeChat } from "./adapter/outbound.js";
 import { formatQuestionForWeChat, parseQuestionReply } from "./adapter/question-format.js";
 import { formatPermissionCard, parsePermissionReply, formatPermissionSummary } from "./adapter/permission-format.js";
+import { formatNotifyStatus } from "./adapter/notify-format.js";
+import { SessionNotifier } from "./notifier.js";
 import type { MediaContent } from "./types.js";
 import type { QuestionPrompt } from "./types/question.js";
 import type { AutoPermissionMode } from "./types/permission.js";
@@ -40,6 +42,7 @@ import {
   parseRejectQuestionCommand,
   parseRejectPermissionCommand,
   parseAutoPermissionCommand,
+  parseNotifyCommand,
   parseVersionCommand,
   parseHelpCommand,
   formatHelpWithNativeCommands,
@@ -47,6 +50,8 @@ import {
   formatWorkspaceList,
 } from "./adapter/workspace-cmd.js";
 import type { WeChatOpencodeConfig } from "./config.js";
+import type { NotifySettings } from "./config.js";
+import { DEFAULT_NOTIFY_SETTINGS } from "./config.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 const TOOL_API_PORT = 18792;
@@ -159,6 +164,14 @@ interface UserState {
    * `src/types/permission.ts` for semantics.
    */
   autoPermissionMode?: AutoPermissionMode;
+  /**
+   * Cross-session notification settings (master switch + per-type
+   * toggles). Persisted across bridge restarts; see `NotifySettings`
+   * in `src/config.ts` and the `/notify` command for the user-facing
+   * surface. When absent, `SessionNotifier` falls back to
+   * `DEFAULT_NOTIFY_SETTINGS` (all notifications on).
+   */
+  notify?: NotifySettings;
 }
 
 export class WeChatOpencodeBridge {
@@ -178,6 +191,19 @@ export class WeChatOpencodeBridge {
   private currentContextToken: string | null = null;
   private typingTicket: { ticket: string; expiresAt: number } | null = null;
   private toolApiServer: http.Server | null = null;
+  /**
+   * Cross-session notifier. Created after `sessionManager` (it needs
+   * the SessionManager's OpenCode client to look up session titles),
+   * and wired into SessionManager via the `onOtherSessionEvent`
+   * callback. Lives for the lifetime of the bridge; settings are
+   * persisted to `.wechat-bridge-state.json` and reloaded at startup
+   * via `loadUserState()` + `notifier.applySettings()`.
+   *
+   * Stays `null` until the SessionManager is constructed (mirrors
+   * the `sessionManager` field above). The dispatch chain in
+   * `handleMessage` only routes `/notify` when this is non-null.
+   */
+  private notifier: SessionNotifier | null = null;
 
   // Single-user state (no Map<string, ...>)
   private wechatMsgCount = 0;
@@ -289,6 +315,11 @@ export class WeChatOpencodeBridge {
         } else if (this.userState.sessionId !== sessionId) {
           this.setUserState(sessionId, this.userState.cwd);
         }
+        // Sync the cross-session notifier's "current" pointer.
+        // The notifier uses this to drop events for the active
+        // session (the SessionManager already dispatches those via
+        // its normal `handleEvent` switch — no need to duplicate).
+        this.notifier?.setCurrentSessionId(sessionId);
       },
       // Forward server auth verbatim. The values are sensitive — neither
       // the bridge nor the SessionManager logs them. The client only
@@ -343,7 +374,76 @@ export class WeChatOpencodeBridge {
           `⏱ Permission timed out after 30 minutes. The tool call was rejected. (Use /next to reset counter.)`,
         );
       },
+      // Cross-session notification hook. The SessionManager invokes
+      // this for every SSE event whose `sessionID` does NOT match the
+      // current session — events that the `handleEvent` filter would
+      // otherwise silently drop. We forward to `this.notifier` (created
+      // immediately below). The closure resolves `this.notifier`
+      // lazily because at the time this callback is registered the
+      // notifier hasn't been constructed yet (it needs the
+      // SessionManager's OpenCode client, which only exists after this
+      // `new SessionManager(...)` call returns).
+      onOtherSessionEvent: (event) => {
+        const n = this.notifier;
+        if (n) {
+          // Fire-and-forget. `SessionNotifier.handleEvent` is async
+          // (it awaits the label cache fetch) but catches all errors
+          // internally, so a slow label fetch cannot back-pressure
+          // the SSE pipeline. We don't return its promise because
+          // `SessionManagerOpts.onOtherSessionEvent` accepts
+          // `void | Promise<void>` and the synchronous void path is
+          // cheaper on the SSE hot loop.
+          void n.handleEvent(event);
+        }
+      },
     });
+
+    // Create the cross-session notifier now that the SessionManager
+    // (and therefore its OpenCode client) exists. The notifier reads
+    // session titles via the same client the SessionManager uses, so
+    // there's no second connection to manage. Settings are loaded
+    // from persisted state just below.
+    this.notifier = new SessionNotifier({
+      client: this.sessionManager.getOpenCodeClient(),
+      // Push notifications through the same outbound path the bridge
+      // uses for everything else — respects WeChat's 10-msg / 4000-char
+      // limits and the outbound serialization queue.
+      send: (text) => {
+        const ctx = this.currentContextToken;
+        if (ctx) {
+          return this.sendReply(ctx, text);
+        }
+        // No current context (e.g. notification fires during the brief
+        // window between bridge startup and the first user message).
+        // Buffer it for the next user message; the auto-flush on
+        // incoming messages will deliver it. We use the existing
+        // `"text"` kind (rather than introducing a new `outbound`
+        // kind) so `flushPending` handles it without a code change —
+        // notify text is semantically the same as cached agent text
+        // for delivery purposes.
+        this.pendingOutbound.push({ kind: "text", text, contextToken: "" });
+        return Promise.resolve();
+      },
+      log: (msg) => this.log(msg),
+    });
+
+    // Apply persisted notify settings. The default (`DEFAULT_NOTIFY_SETTINGS`)
+    // is what the notifier was constructed with; only override if we have
+    // a real persisted state.
+    if (this.userState?.notify) {
+      this.notifier.applySettings(this.userState.notify);
+    } else {
+      this.notifier.applySettings(DEFAULT_NOTIFY_SETTINGS);
+    }
+
+    // Sync the notifier with the current session. The SessionManager's
+    // `sessionId` is set by `ensureSession` lazily — for now we just
+    // prime it with whatever the saved state says (the SessionManager
+    // will refresh on its first `ensureSession` call via
+    // `setCurrentSessionId` from the `onSessionReady` callback chain
+    // below; we also push updates explicitly on session/workspace
+    // switches — see those handlers).
+    this.notifier.setCurrentSessionId(this.sessionManager.getSessionId() ?? this.userState?.sessionId ?? null);
 
     // Restore persisted display flags (only if defined to avoid clobbering
     // server-side defaults). setShowFlags is partial-update safe: passing
@@ -475,12 +575,14 @@ export class WeChatOpencodeBridge {
             showThoughts?: boolean;
             showTools?: boolean;
             autoPermissionMode?: "off" | "once" | "always";
+            notify?: NotifySettings;
           }
         | {
             users?: Array<{ userId: string; sessionId?: string; cwd: string }>;
             showThoughts?: boolean;
             showTools?: boolean;
             autoPermissionMode?: "off" | "once" | "always";
+            notify?: NotifySettings;
           };
       if ("users" in state && state.users && state.users.length > 0) {
         const u = state.users[0];
@@ -491,6 +593,7 @@ export class WeChatOpencodeBridge {
           showThoughts: state.showThoughts,
           showTools: state.showTools,
           autoPermissionMode: state.autoPermissionMode,
+          notify: state.notify,
         };
       } else if ("sessionId" in state || "cwd" in state) {
         this.userState = {
@@ -500,6 +603,7 @@ export class WeChatOpencodeBridge {
           showThoughts: state.showThoughts,
           showTools: state.showTools,
           autoPermissionMode: (state as { autoPermissionMode?: "off" | "once" | "always" }).autoPermissionMode,
+          notify: (state as { notify?: NotifySettings }).notify,
         };
       }
     } catch {
@@ -524,6 +628,7 @@ export class WeChatOpencodeBridge {
       if (this.userState.showThoughts !== undefined) payload.showThoughts = this.userState.showThoughts;
       if (this.userState.showTools !== undefined) payload.showTools = this.userState.showTools;
       if (this.userState.autoPermissionMode !== undefined) payload.autoPermissionMode = this.userState.autoPermissionMode;
+      if (this.userState.notify !== undefined) payload.notify = this.userState.notify;
       fs.writeFileSync(stateFile, JSON.stringify(payload, null, 2));
     } catch {
       // Best effort
@@ -532,9 +637,11 @@ export class WeChatOpencodeBridge {
 
   private setUserState(sessionId: string, cwd: string): void {
     const userId = this.userState?.userId ?? "";
-    // Preserve display flags (`showThoughts` / `showTools`) across workspace
-    // and session switches — without this spread, /workspace switch or
-    // /session switch would silently reset the user's display settings.
+    // Preserve display flags (`showThoughts` / `showTools`) and notify
+    // settings across workspace and session switches — without this
+    // spread, /workspace switch or /session switch would silently
+    // reset the user's display settings and cross-session notify
+    // configuration.
     this.userState = this.userState
       ? { ...this.userState, sessionId, cwd }
       : { userId, sessionId, cwd };
@@ -861,6 +968,14 @@ export class WeChatOpencodeBridge {
       if (restartCmd) {
         this.handleRestartCommand(contextToken, restartCmd).catch((err) => {
           this.log(`Restart command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const notifyCmd = parseNotifyCommand(textContent);
+      if (notifyCmd) {
+        this.handleNotifyCommand(contextToken, notifyCmd).catch((err) => {
+          this.log(`Notify command error: ${String(err)}`);
         });
         return;
       }
@@ -1270,6 +1385,11 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         try {
           await this.sessionManager.switchWorkspace(targetDir, undefined);
           this.setUserState(this.sessionManager.getSessionId() ?? "", targetDir);
+          // Sync notifier's "current" pointer to the freshly-resumed
+          // session. Without this, the notifier would still consider
+          // the OLD session current and could double-notify events
+          // for the new one.
+          this.notifier?.setCurrentSessionId(this.sessionManager.getSessionId());
           await this.sendReply(contextToken, `✅ Ready on\n  ${targetDir}`);
         } catch (err) {
           await this.sendReply(contextToken, `❌ Switch failed: ${String(err)}`);
@@ -1375,6 +1495,11 @@ const apCmd = parseAutoPermissionCommand(trimmed);
             await this.sendReply(contextToken, `🔄 Switching to "${target.title ?? "(untitled)"}"`);
             await this.sessionManager.switchSession(target.sessionId, newCwd);
             this.setUserState(target.sessionId, newCwd);
+            // Sync notifier's "current" pointer — see the
+            // /workspace switch handler above for the same
+            // rationale. Crucial when the user had the
+            // cross-session notify feature enabled.
+            this.notifier?.setCurrentSessionId(target.sessionId);
             await this.sendReply(contextToken, `✅ Ready on ${newCwd}`);
           } else {
             const hint = this.lastSessionListFilter
@@ -1747,6 +1872,7 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         mcpStatus,
         agentStatus,
         otherBusySessions,
+        notifySettings: this.notifier?.getSettings() ?? null,
       });
 
       // Append a "⏳ Question pending" line if a question is waiting. We
@@ -1955,6 +2081,91 @@ const apCmd = parseAutoPermissionCommand(trimmed);
       this.log(`Compact error: ${String(err)}`);
       await this.sendReply(contextToken, `⚠️ Compact failed: ${String(err)}`);
     }
+  }
+
+  // ─── Notify command (/notify) ───
+
+  /**
+   * Handle the `/notify` command — configure the cross-session
+   * notification feature. Mirrors the persistence pattern of
+   * `/auto-permission` (master setting + sub-toggles stored on
+   * `userState`, applied to the notifier in real time, persisted
+   * to `.wechat-bridge-state.json` for restart).
+   *
+   * Subcommands (parsed by `parseNotifyCommand`):
+   *   - `on` / `off`  — master switch
+   *   - `status`      — print current settings
+   *   - `types <t> on|off` — per-event-type toggle (`t` ∈ question|permission|error|completion)
+   */
+  private async handleNotifyCommand(
+    contextToken: string,
+    cmd: ReturnType<typeof parseNotifyCommand>,
+  ): Promise<void> {
+    if (!this.notifier) {
+      await this.sendReply(contextToken, "⚠️ Notify 模块未初始化");
+      return;
+    }
+
+    // Lazy-init userState if absent (covers the rare case where the
+    // user runs /notify before sending any non-slash message). Mirrors
+    // the pattern in `handleMessage` that creates the bare userState
+    // on first user message.
+    if (!this.userState) {
+      this.userState = { userId: "", sessionId: "", cwd: this.config.agent.cwd };
+    }
+
+    switch (cmd!.mode) {
+      case "status": {
+        const s = this.notifier.getSettings();
+        await this.sendReply(contextToken, formatNotifyStatus(s.enabled, s.types));
+        return;
+      }
+      case "on": {
+        const newVal = this.notifier.setEnabled(true);
+        this.userState.notify = this.notifier.getSettings();
+        this.saveUserState();
+        await this.sendReply(
+          contextToken,
+          newVal
+            ? "✅ Cross-session notify: on"
+            : "⚠️ Cross-session notify 已是开启状态",
+        );
+        return;
+      }
+      case "off": {
+        const newVal = this.notifier.setEnabled(false);
+        this.userState.notify = this.notifier.getSettings();
+        this.saveUserState();
+        await this.sendReply(
+          contextToken,
+          !newVal
+            ? "❌ Cross-session notify: off"
+            : "⚠️ Cross-session notify 已是关闭状态",
+        );
+        return;
+      }
+    }
+
+    // If we reach here, the command was `types <t> on|off`.
+    if (!cmd!.type) {
+      await this.sendReply(contextToken, "⚠️ /notify types 需要 <type> on|off");
+      return;
+    }
+    const newVal = this.notifier.setTypeEnabled(cmd!.type, cmd!.mode === "on");
+    this.userState.notify = this.notifier.getSettings();
+    this.saveUserState();
+    const typeLabelMap: Record<string, string> = {
+      question: "Question 通知",
+      permission: "Permission 通知",
+      error: "Error 通知",
+      completion: "Completion 通知",
+    };
+    await this.sendReply(
+      contextToken,
+      newVal
+        ? `✅ ${typeLabelMap[cmd!.type]}: on`
+        : `❌ ${typeLabelMap[cmd!.type]}: off`,
+    );
   }
 
   // ─── Restart command (/restart) ───
@@ -2168,6 +2379,11 @@ const apCmd = parseAutoPermissionCommand(trimmed);
       // "unknown slash command" hint doesn't trigger on them).
       "auto-permission", "ap",
       "reject-permission", "rp",
+      // Cross-session notification command. Same rationale as
+      // permission commands: recognized by the bridge so the
+      // "unknown slash command" hint doesn't fire when the user
+      // mistypes a subcommand.
+      "notify", "n",
     ];
     if (bridgeCommands.includes(cmdName)) return null;
 
