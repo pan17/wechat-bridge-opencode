@@ -28,6 +28,12 @@ Thumbs.db
 *.njsproj
 *.sln
 
-# OpenCode internal state — only ignore transient session continuation,
-# keep design plans in `.omo/plans/` tracked.
-.omo/run-continuation/
+# OpenCode internal state — only design plans in `.omo/plans/` are
+# tracked; everything else under `.omo/` (boulder.json, drafts/,
+# evidence/, notepads/, run-continuation/) is transient / internal.
+# Pattern uses `.omo/*` (not `.omo/`) so that the negation below can
+# re-include `.omo/plans/` — git cannot re-include a file whose parent
+# directory is itself ignored.
+.omo/*
+!.omo/plans/
+!.omo/plans/**

@@ -20,7 +20,6 @@
 - **工具权限审批** — WeChat 弹权限卡片，支持 `once` / `always` / `reject` 三选一；`/auto-permission` 可切换自动接收模式；30 分钟软超时自动 reject
 - **二维码登录** — 终端渲染二维码，扫码登录微信
 - **OpenCode Server** — 基于 HTTP API，不再需要 ACP 子进程
-- **猫娘咪咪** — 开箱即送，首次运行加 `--cat-girl` 自动安装到全局 agents 目录（一次安装永久生效，后续无需再加），微信端 `/agent switch cat-girl` 即可对话
 
 ## 安装与使用
 
@@ -60,7 +59,6 @@ wbo
 | `--login` | 强制重新登录 |
 | `--daemon` | 后台运行 |
 | `--config <文件>` | JSON 配置文件 |
-| `--cat-girl` | 首次运行安装猫娘咪咪到 `~/.config/opencode/agents/`（一次安装，后续无需再加） |
 
 **外部 Server 认证**
 

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Cat-girl feature: removed `--cat-girl` CLI flag, the bundled `presets/cat-girl.md` agent, and the `installCatGirlAgent()` helper. The flag now produces an "Unknown option" error. Users who previously installed the agent via this flag will need to manage it themselves (the file is no longer shipped).
+
 ## [1.3.3] - 2026-06-15
 
 ### Fixed

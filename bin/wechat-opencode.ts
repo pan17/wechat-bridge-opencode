@@ -43,7 +43,6 @@ Options:
   --login                 Force re-login (new QR code)
   --daemon                Run in background after login
   --config <file>         Config file path (JSON)
-  --cat-girl              Install cat-girl agent to ~/.config/opencode/agents/
   -v, --verbose           Verbose logging
   -h, --help              Show this help
 
@@ -63,14 +62,12 @@ function parseArgs(argv: string[]): {
   forceLogin: boolean;
   daemon: boolean;
   configFile?: string;
-  catGirl: boolean;
   verbose: boolean;
   help: boolean;
 } {
   const result = {
     forceLogin: false,
     daemon: false,
-    catGirl: false,
     verbose: false,
     help: false,
   } as ReturnType<typeof parseArgs>;
@@ -107,9 +104,6 @@ function parseArgs(argv: string[]): {
         break;
       case "--daemon":
         result.daemon = true;
-        break;
-      case "--cat-girl":
-        result.catGirl = true;
         break;
       case "--config":
         result.configFile = args[++i];
@@ -371,24 +365,6 @@ function renderQrInTerminal(url: string): void {
   });
 }
 
-// ─── Cat-girl agent install ───
-
-function installCatGirlAgent(): void {
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const sourceFile = path.resolve(__dirname, "../../presets/cat-girl.md");
-  const targetDir = path.join(os.homedir(), ".config", "opencode", "agents");
-  const targetFile = path.join(targetDir, "cat-girl.md");
-
-  if (!fs.existsSync(sourceFile)) {
-    console.error(`Error: cat-girl preset not found at ${sourceFile}`);
-    process.exit(1);
-  }
-
-  fs.mkdirSync(targetDir, { recursive: true });
-  fs.copyFileSync(sourceFile, targetFile);
-  console.log(`Installed cat-girl agent to ${targetFile}`);
-}
-
 // ─── Main ───
 
 async function main(): Promise<void> {
@@ -462,11 +438,6 @@ async function main(): Promise<void> {
   if (args.daemon && !process.env.WECHAT_OPENCODE_DAEMON) {
     daemonize(config);
     return;
-  }
-
-  // Install cat-girl agent before starting opencode serve (must be picked up at startup).
-  if (args.catGirl) {
-    installCatGirlAgent();
   }
 
   // Start opencode serve sidecar unless an external server URL was given.

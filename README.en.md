@@ -19,7 +19,6 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 - **Permission cards** — Surface OpenCode's `permission.asked` events to WeChat as `once` / `always` / `reject` cards; `/auto-permission` toggles auto-accept mode; 30-min soft timeout
 - **QR Login** — Terminal QR code rendering for WeChat login
 - **OpenCode Server** — HTTP API based, no ACP subprocess required
-- **Cat-girl agent** — Built-in cat-girl agent; add `--cat-girl` on first run to install it globally (one-time only, omit on subsequent runs), then use `/agent switch cat-girl` in WeChat to start chatting
 
 ## Installation & Usage
 
@@ -59,7 +58,6 @@ First run will:
 | `--login` | Force re-login |
 | `--daemon` | Run in background |
 | `--config <file>` | JSON config file |
-| `--cat-girl` | Install cat-girl agent to `~/.config/opencode/agents/` on first run (one-time, omit afterwards) |
 
 **External server authentication**
 

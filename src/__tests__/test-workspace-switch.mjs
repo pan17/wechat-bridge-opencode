@@ -95,7 +95,7 @@ function sessionExists(id) {
 describe("SessionManager.switchWorkspace — create new (no prior session in cwd)", () => {
   test("creates a new session and clears stale state", async () => {
     const m = makeManager();
-    m.currentMode = "cat-girl";
+    m.currentMode = "some-stale-agent";
     m.currentModelId = "opencode-go/claude-opus-4-7";
     m.currentReasoning = "high";
 
@@ -107,7 +107,7 @@ describe("SessionManager.switchWorkspace — create new (no prior session in cwd
     expect(m.sessionId).toBe("ses_new_from_switch");
     expect(m.cwd).toBe("/new/workspace");
     // The fix: stale state from the old workspace is cleared so the next
-    // prompt doesn't fail with "Agent not found: cat-girl".
+    // prompt doesn't fail with "Agent not found: some-stale-agent".
     expect(m.currentMode).toBeUndefined();
     expect(m.currentModelId).toBeUndefined();
     expect(m.currentReasoning).toBeUndefined();
@@ -169,7 +169,7 @@ describe("SessionManager.switchWorkspace — resume most recent session in cwd",
 
     const m = makeManager();
     // Stale values from the OLD workspace
-    m.currentMode = "cat-girl";
+    m.currentMode = "some-stale-agent";
     m.currentModelId = "opencode-go/claude-opus-4-7";
     m.currentReasoning = "high";
 
@@ -207,7 +207,7 @@ describe("SessionManager.switchWorkspace — resume most recent session in cwd",
     ]);
 
     const m = makeManager();
-    m.currentMode = "cat-girl";
+    m.currentMode = "some-stale-agent";
 
     await m.switchWorkspace("/target/workspace", undefined);
 
