@@ -18,11 +18,11 @@ npm run build        # Compile TypeScript → dist/
 npm run dev          # Watch mode: tsc --watch
 npm start            # Run compiled CLI: node dist/bin/wechat-opencode.js
 npm run prepack      # Runs build before npm publish
-npm test             # Run vitest unit tests (97 tests across 5 files)
+npm test             # Run vitest unit tests (278 tests across 14 files)
 npm run test:watch   # Vitest in watch mode
 ```
 
-**Tests:** Vitest 4.1.8 unit tests live in `src/__tests__/` (215 tests across 9 files). No linter is configured.
+**Tests:** Vitest 4.1.8 unit tests live in `src/__tests__/` (278 tests across 14 files). No linter is configured.
 
 ### Running the CLI locally
 
@@ -50,7 +50,7 @@ src/server/
   client.ts                     — OpenCode Server HTTP client (fetch wrapper)
   session.ts                    — Simplified SessionManager (no subprocess, just HTTP)
   event-pipeline.ts             — Persistent /global/event SSE connection with reconnect
-src/__tests__/                  — Vitest unit tests (9 files, 215 tests)
+src/__tests__/                  — Vitest unit tests (14 files, 278 tests)
 src/adapter/
   inbound.ts                    — WeChat message → MessagePart[] (text, image, file)
   outbound.ts                   — Server reply → WeChat text (formatting, splitting)
@@ -158,7 +158,7 @@ src/weixin/
 ### Status (/status)
 | Command | Description |
 |---------|-------------|
-| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, and **MCP server status** (with failure reasons). Agent/Model/Reasoning/MCP are fetched from the OpenCode Server via HTTP API (scoped to the current workspace via the `?directory=` query param; auto-refreshed on workspace switch). For an empty session, Model falls back to the workspace's `model:` field from the server config |
+| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, **agent status** (busy/idle/retry driven by the SSE `session.status` event), **count of other running root sessions** on the OpenCode Server (server-wide, excludes current session and sub-agent sessions), and **MCP server status** (with failure reasons). Agent/Model/Reasoning/MCP are fetched from the OpenCode Server via HTTP API (scoped to the current workspace via the `?directory=` query param; auto-refreshed on workspace switch). For an empty session, Model falls back to the workspace's `model:` field from the server config |
 
 ### Workspace (/workspace or /ws)
 | Command | Description |

@@ -8,6 +8,7 @@
 import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef, McpStatusMap } from "../types.js";
 import type { QuestionRequest } from "../types/question.js";
 import type { PermissionReply, PermissionRequest } from "../types/permission.js";
+import type { SessionStatus } from "../types/events.js";
 
 export interface OpenCodeServerClientOpts {
   baseUrl: string;
@@ -123,6 +124,36 @@ export class OpenCodeServerClient {
       const res = await this.fetch(this.withDirectory("/mcp", directory), { method: "GET" });
       if (!res.ok) return {};
       return res.json() as Promise<McpStatusMap>;
+    } catch {
+      return {};
+    }
+  }
+
+  // ─── Session status (server-wide) ───
+
+  /**
+   * Fetch the live status of every session on the OpenCode Server via
+   * `GET /session/status`. Returns a `sessionID → SessionStatus` map (where
+   * `SessionStatus = { type: "busy" | "idle" | "retry", attempt?, message?, next? }`),
+   * or an empty object if the server doesn't expose the endpoint or the
+   * request fails.
+   *
+   * Network / parse errors are swallowed: an empty object is the safe
+   * default — the caller treats `{}` as "we couldn't tell" and renders an
+   * `(unknown)` placeholder in the user-facing output. There is no
+   * `directory` filter: the endpoint is server-wide by design (used by
+   * `/status` to surface OTHER sessions running against the same opencode
+   * serve instance, regardless of workspace).
+   *
+   * Typical use case: counting busy sessions across the server so the
+   * operator knows how many parallel agent runs are currently in flight
+   * (see SessionManager.getOtherRunningSessionCount).
+   */
+  async getAllSessionStatuses(): Promise<Record<string, SessionStatus>> {
+    try {
+      const res = await this.fetch("/session/status", { method: "GET" });
+      if (!res.ok) return {};
+      return res.json() as Promise<Record<string, SessionStatus>>;
     } catch {
       return {};
     }

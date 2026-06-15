@@ -46,6 +46,7 @@ import type {
   QuestionRejectedSseEvent,
   ReasoningPart,
   SessionErrorEvent,
+  SessionStatus,
   SessionStatusEvent,
   TextPart,
   ToolPart,
@@ -276,6 +277,15 @@ export class SessionManager {
   private pendingEchoes: string[] = [];
   /** Set true when the server reports session.status=busy. */
   private isSessionBusy = false;
+  /**
+   * Latest `SessionStatus` payload observed on the SSE `session.status`
+   * event stream for the current session. Mirrors `isSessionBusy` but
+   * preserves the full payload (type + attempt/message/next) so `/status`
+   * can render `🟡 Retrying (attempt 2)` etc. — the boolean alone can't
+   * distinguish `idle` from `retry` and would lose the attempt counter.
+   * Defaults to `{ type: "idle" }` until the first SSE event arrives.
+   */
+  private lastAgentStatus: SessionStatus = { type: "idle" };
   /** Timer for the post-delta debounce before finalizing a turn. */
   private finalizeTimer: ReturnType<typeof setTimeout> | null = null;
   /** Hard timeout timer in case events stop arriving entirely. */
@@ -381,6 +391,64 @@ export class SessionManager {
    */
   isAgentBusy(): boolean {
     return this.isSessionBusy;
+  }
+
+  /**
+   * Return the most recent `SessionStatus` payload observed on the SSE
+   * `session.status` stream for the current session. Used by `/status`
+   * to render the 🟢/⚪/🟡 agent state line.
+   *
+   * Defaults to `{ type: "idle" }` until the first `session.status` event
+   * has arrived — this is the safe default (no `busy`/`retry` claim is
+   * made before the server has actually reported status). Returns a
+   * deep-readonly view; callers must not mutate it.
+   */
+  getAgentStatus(): Readonly<SessionStatus> {
+    return this.lastAgentStatus;
+  }
+
+  /**
+   * Count the number of OTHER root sessions (excluding the current
+   * session and excluding sub-agent / child sessions) that the OpenCode
+   * Server currently reports as `busy`. Surfaced by `/status` as the
+   * `📈 Other running sessions: N` line so the operator can see how many
+   * parallel agent runs are in flight on the same server instance.
+   *
+   * Filtering:
+   *   - `listSessionsV2()` returns root sessions only (the server filters
+   *     with `roots=true` and paginates up to 50 pages / 200 per page,
+   *     so any size of session inventory is covered).
+   *   - `parentID` is the server's marker for sub-agent / child
+   *     sessions spawned by the agent's `task` tool; excluding
+   *     non-root entries keeps the count user-meaningful.
+   *   - The current `this.sessionId` is filtered out so we report
+   *     "OTHER" running sessions — the current session's own busy
+   *     state is already shown by `getAgentStatus()`.
+   *
+   * Failure mode: both sub-calls are wrapped in a single `try` so a
+   * network blip on either `/session/status` or `/api/session` just
+   * returns `0` instead of throwing — `0` is the safe default for
+   * `/status` ("we couldn't tell, assume none"). The caller is
+   * expected to render `(unknown)` for `null`, so we do NOT use
+   * `null` here; the bridge promotes `0` to `null` only if it wants
+   * to distinguish "server said zero" from "couldn't reach server".
+   * (Currently the bridge treats both as `0` and renders `0`.)
+   */
+  async getOtherRunningSessionCount(): Promise<number> {
+    try {
+      const rootSessions = await this.client.listSessionsV2();
+      const rootIds = new Set(rootSessions.map((s) => s.id));
+      const allStatuses = await this.client.getAllSessionStatuses();
+      let count = 0;
+      for (const [id, status] of Object.entries(allStatuses)) {
+        if (id !== this.sessionId && rootIds.has(id) && status.type === "busy") {
+          count++;
+        }
+      }
+      return count;
+    } catch {
+      return 0;
+    }
   }
 
   // ─── Session lifecycle ───
@@ -2287,6 +2355,7 @@ export class SessionManager {
 
   private handleSessionStatus(event: SessionStatusEvent): void {
     this.log(`[event] session.status sessionID=${event.properties.sessionID.slice(0, 8)}… status=${event.properties.status.type}`);
+    this.lastAgentStatus = event.properties.status;
     if (event.properties.status.type === "busy") {
       this.isSessionBusy = true;
     } else if (event.properties.status.type === "idle" || event.properties.status.type === "retry") {

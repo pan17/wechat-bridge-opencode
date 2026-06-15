@@ -17,6 +17,7 @@
  */
 
 import type { McpServerStatus } from "../types.js";
+import type { SessionStatus } from "../types/events.js";
 
 export interface WorkspaceCommand {
   kind: "list" | "add" | "switch" | "remove" | "status";
@@ -533,6 +534,26 @@ export function formatStatus(opts: {
    * first) then alphabetically for stable output.
    */
   mcpStatus?: Record<string, McpServerStatus> | null;
+  /**
+   * Current session's agent status (driven by SSE `session.status` events).
+   *   - `undefined`/`null` → no SSE event has arrived yet (or server is
+   *     unreachable) → render `⚪ Agent: (unknown)`.
+   *   - `{ type: "busy" }` → `🟢 Agent: Running`.
+   *   - `{ type: "idle" }` → `⚪ Agent: Idle`.
+   *   - `{ type: "retry", attempt?: N }` → `🟡 Agent: Retrying (attempt N)`
+   *     (defaults to attempt 1 when `attempt` is missing).
+   */
+  agentStatus?: SessionStatus | null;
+  /**
+   * Number of OTHER root sessions on the OpenCode Server that are
+   * currently `busy` (excludes the current session and any sub-agent /
+   * child sessions). Surfaced as the `📈 Other running sessions: N`
+   * line. Omit (or pass `null`) to render `📈 Other running sessions:
+   * (unknown)` — the safe placeholder when the call hasn't been made
+   * or failed. A finite non-negative number always renders (including
+   * `0`), per user-facing design.
+   */
+  otherBusySessions?: number | null;
 }): string {
   const lines: string[] = ["📊 Status:"];
 
@@ -555,6 +576,32 @@ export function formatStatus(opts: {
 
   // Reasoning
   lines.push(`  🧠 Reasoning: ${opts.reasoning}`);
+
+  // Agent status (SSE-driven busy / idle / retry). Render BEFORE the MCP
+  // section so the operator sees whether THIS session is mid-turn right
+  // after the agent/model/reasoning triple.
+  if (opts.agentStatus) {
+    switch (opts.agentStatus.type) {
+      case "busy":
+        lines.push("  🟢 Agent: Running");
+        break;
+      case "idle":
+        lines.push("  ⚪ Agent: Idle");
+        break;
+      case "retry":
+        lines.push(`  🟡 Agent: Retrying (attempt ${opts.agentStatus.attempt ?? 1})`);
+        break;
+    }
+  } else {
+    lines.push("  ⚪ Agent: (unknown)");
+  }
+
+  // Count of other busy root sessions on the OpenCode Server.
+  if (typeof opts.otherBusySessions === "number" && Number.isFinite(opts.otherBusySessions) && opts.otherBusySessions >= 0) {
+    lines.push(`  📈 Other running sessions: ${opts.otherBusySessions}`);
+  } else {
+    lines.push("  📈 Other running sessions: (unknown)");
+  }
 
   // MCP servers (show all so the user can see what's loaded, with failures
   // surfaced prominently). Disabled servers are skipped — they're off by

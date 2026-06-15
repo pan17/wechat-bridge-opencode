@@ -1722,6 +1722,21 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         // Server doesn't expose /mcp, or call failed — just skip the section.
       }
 
+      // Current session's agent status (SSE-driven, synchronous). Defaults
+      // to { type: "idle" } before the first SSE event has arrived, which
+      // is the safe "we don't know yet" reading.
+      const agentStatus = sessionManager.getAgentStatus();
+
+      // Count of OTHER busy root sessions on the OpenCode Server. Failure
+      // here must NOT break /status — wrap in its own try/catch so a
+      // network blip just renders `(unknown)` on the new line.
+      let otherBusySessions: number | null = null;
+      try {
+        otherBusySessions = await sessionManager.getOtherRunningSessionCount();
+      } catch {
+        otherBusySessions = null;
+      }
+
       let statusText = formatStatus({
         session: sessionInfo,
         workspace: cwd,
@@ -1730,6 +1745,8 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         reasoning: currentReasoning,
         contextUsage: contextUsage ? { used: contextUsage.totalTokens, size: contextUsage.contextSize } : null,
         mcpStatus,
+        agentStatus,
+        otherBusySessions,
       });
 
       // Append a "⏳ Question pending" line if a question is waiting. We

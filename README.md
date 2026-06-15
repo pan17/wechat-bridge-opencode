@@ -89,7 +89,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | 命令 | 说明 |
 |------|------|
-| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量，以及 **MCP servers 状态**（含失败原因）。Agent/Model/Reasoning/MCP 通过 OpenCode Server 的 HTTP API 拉取（按当前工作区 `?directory=...` 限定，切换工作区时自动刷新）；空会话时 Model 取 server 配置中工作区的 `model:` 字段 |
+| `/status` | 显示当前会话（含标题）、工作区、Agent、Model、推理级别、上下文用量，**agent 状态**（busy/idle/retry，由 SSE `session.status` 事件驱动），**其他正在运行的会话数**（server-wide root 会话，排除当前会话和子 agent 会话），以及 **MCP servers 状态**（含失败原因）。Agent/Model/Reasoning/MCP 通过 OpenCode Server 的 HTTP API 拉取（按当前工作区 `?directory=...` 限定，切换工作区时自动刷新）；空会话时 Model 取 server 配置中工作区的 `model:` 字段 |
 
 ### 工作区（`/workspace` 或 `/ws`）
 

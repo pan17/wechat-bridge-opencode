@@ -1,5 +1,6 @@
 /**
- * Unit tests for /thought-display, /tool-display, and /compact command parsers.
+ * Unit tests for /thought-display, /tool-display, and /compact command parsers,
+ * plus the agent-status / other-running-sessions extensions to `formatStatus`.
  *
  * Exercises all 14 acceptance cases from .omo/plans/display-commands.md (Task 2):
  *  - 7 cases per parser (on, off, status, enable alias, disable alias,
@@ -10,10 +11,21 @@
  *    and rejection of /compaction (different word), /compact foo (extra args),
  *    and /foo (not a slash command at all).
  *
+ * The formatStatus block covers the two new optional fields added in
+ * the /status-agent-sessions feature:
+ *  - `agentStatus` (busy/idle/retry/null/undefined → 5 cases)
+ *  - `otherBusySessions` (0, 5, null, undefined → 4 cases)
+ *  - one full integration case rendering both lines together
+ *
  * Run via `npm test` (requires `npm run build` first to produce dist/).
  */
 import { describe, test, expect } from "vitest";
-import { parseThoughtDisplayCommand, parseToolDisplayCommand, parseCompactCommand } from "../../dist/src/adapter/workspace-cmd.js";
+import {
+  parseThoughtDisplayCommand,
+  parseToolDisplayCommand,
+  parseCompactCommand,
+  formatStatus,
+} from "../../dist/src/adapter/workspace-cmd.js";
 
 const thoughtCases = [
   { input: "/thought-display on",      expected: { kind: "on" },     label: "on" },
@@ -68,4 +80,105 @@ describe("parseCompactCommand", () => {
       expect(parseCompactCommand(c.input)).toEqual(c.expected);
     });
   }
+});
+
+// ─── formatStatus — agent status & other running sessions ───────────────
+//
+// Minimal base opts for formatStatus; only the two new optional fields
+// vary across cases. Defaults avoid forcing the test to repeat the full
+// opt shape — the rendered output is asserted by substring, not full
+// snapshot, so context noise is acceptable.
+
+const baseStatusOpts = {
+  session: { id: "ses_test", cwd: "/test", title: "Test" },
+  workspace: "/test",
+  agent: "build",
+  model: "anthropic/claude-sonnet-4-5",
+  reasoning: "medium",
+  contextUsage: null,
+};
+
+describe("formatStatus with agent status", () => {
+  test('agentStatus: { type: "busy" } → "🟢 Agent: Running"', () => {
+    const out = formatStatus({ ...baseStatusOpts, agentStatus: { type: "busy" } });
+    expect(out).toContain("🟢 Agent: Running");
+  });
+
+  test('agentStatus: { type: "idle" } → "⚪ Agent: Idle"', () => {
+    const out = formatStatus({ ...baseStatusOpts, agentStatus: { type: "idle" } });
+    expect(out).toContain("⚪ Agent: Idle");
+  });
+
+  test('agentStatus: { type: "retry", attempt: 3 } → "🟡 Agent: Retrying (attempt 3)"', () => {
+    const out = formatStatus({
+      ...baseStatusOpts,
+      agentStatus: { type: "retry", attempt: 3 },
+    });
+    expect(out).toContain("🟡 Agent: Retrying (attempt 3)");
+  });
+
+  test('agentStatus: { type: "retry" } (no attempt) → "🟡 Agent: Retrying (attempt 1)" (default)', () => {
+    const out = formatStatus({
+      ...baseStatusOpts,
+      agentStatus: { type: "retry" },
+    });
+    expect(out).toContain("🟡 Agent: Retrying (attempt 1)");
+  });
+
+  test('agentStatus: null → "⚪ Agent: (unknown)"', () => {
+    const out = formatStatus({ ...baseStatusOpts, agentStatus: null });
+    expect(out).toContain("⚪ Agent: (unknown)");
+  });
+
+  test("agentStatus: undefined (omitted) → \"⚪ Agent: (unknown)\"", () => {
+    const out = formatStatus({ ...baseStatusOpts });
+    expect(out).toContain("⚪ Agent: (unknown)");
+  });
+
+  test("otherBusySessions: 0 → still renders \"📈 Other running sessions: 0\"", () => {
+    const out = formatStatus({ ...baseStatusOpts, otherBusySessions: 0 });
+    expect(out).toContain("📈 Other running sessions: 0");
+  });
+
+  test("otherBusySessions: 5 → renders \"📈 Other running sessions: 5\"", () => {
+    const out = formatStatus({ ...baseStatusOpts, otherBusySessions: 5 });
+    expect(out).toContain("📈 Other running sessions: 5");
+  });
+
+  test("otherBusySessions: null → \"📈 Other running sessions: (unknown)\"", () => {
+    const out = formatStatus({ ...baseStatusOpts, otherBusySessions: null });
+    expect(out).toContain("📈 Other running sessions: (unknown)");
+  });
+
+  test("otherBusySessions: undefined (omitted) → \"📈 Other running sessions: (unknown)\"", () => {
+    const out = formatStatus({ ...baseStatusOpts });
+    expect(out).toContain("📈 Other running sessions: (unknown)");
+  });
+
+  test("integration: full /status render with busy + 3 other sessions + context", () => {
+    const out = formatStatus({
+      ...baseStatusOpts,
+      agentStatus: { type: "busy" },
+      otherBusySessions: 3,
+      contextUsage: { used: 50000, size: 200000 },
+    });
+    // New lines must appear in the right vertical neighborhood — between
+    // Reasoning and the MCP section, and before the Context block. Just
+    // assert both lines exist; ordering is exercised by snapshot below.
+    expect(out).toContain("🟢 Agent: Running");
+    expect(out).toContain("📈 Other running sessions: 3");
+    // formatNumber abbreviates ≥1000 to "<k>k" form (e.g. 50000 → "50.0k").
+    expect(out).toContain("🔥 Context: 50.0k / 200.0k (25%)");
+
+    // Ordering: Agent status + Other running sessions lines must appear
+    // AFTER "Reasoning" but BEFORE "Context". Use indexOf to lock it in.
+    const idxReasoning = out.indexOf("🧠 Reasoning:");
+    const idxAgent = out.indexOf("🟢 Agent: Running");
+    const idxOther = out.indexOf("📈 Other running sessions: 3");
+    const idxContext = out.indexOf("🔥 Context:");
+    expect(idxReasoning).toBeGreaterThanOrEqual(0);
+    expect(idxAgent).toBeGreaterThan(idxReasoning);
+    expect(idxOther).toBeGreaterThan(idxAgent);
+    expect(idxContext).toBeGreaterThan(idxOther);
+  });
 });
