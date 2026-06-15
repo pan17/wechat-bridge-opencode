@@ -18,6 +18,7 @@
 - **OpenCode slash 命令** — bridge 不识别的 `/xxx` 自动作为文本转发给 agent，触发 OpenCode 内置 slash 命令（如 `/init`、`/review`）；发送 `/help` 可查看所有可触发指令
 - **LLM 问答支持** — 转发 OpenCode `question` 工具的提问到微信，支持选项 / 多选 / 自定义答案；30 分钟软超时自动 reject
 - **工具权限审批** — WeChat 弹权限卡片，支持 `once` / `always` / `reject` 三选一；`/auto-permission` 可切换自动接收模式；30 分钟软超时自动 reject
+- **跨会话通知** — 其他 session 的 question/permission/error/completion 事件推送到微信；切换到有 pending 的会话自动弹出卡片
 - **二维码登录** — 终端渲染二维码，扫码登录微信
 - **OpenCode Server** — 基于 HTTP API，不再需要 ACP 子进程
 
@@ -167,6 +168,17 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 | `/tool-display status` | 查看当前工具显示状态 |
 
 设置独立且跨重启持久化(~/.wechat-bridge-opencode/.wechat-bridge-state.json)
+
+### 跨会话通知（`/notify`）
+
+| 命令 | 说明 |
+|------|------|
+| `/notify`（`/n`） | 查看通知状态 |
+| `/notify on\|off` | 总开关 |
+| `/notify types <type> on\|off` | 切换单类事件（question/permission/error/completion） |
+| `/notify status` | 查看当前设置 |
+
+通知推送其他 session 的 question 等待、权限请求、报错、完成事件到微信。切换到有 pending 的会话自动弹出卡片。
 
 ### 系统（`/version`）
 

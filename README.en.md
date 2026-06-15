@@ -17,6 +17,7 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 - **WeChat slash commands** — `/help`, `/workspace`, `/session`, `/agent`, `/model`, `/stop`, `/compact` and 15+ more commands are consumed by the bridge, never forwarded to the agent
 - **OpenCode slash commands** — Any `/xxx` the bridge doesn't recognize is forwarded to the agent as plain text, triggering OpenCode's built-in slash commands (e.g. `/init`, `/review`). Send `/help` to see all available commands
 - **Permission cards** — Surface OpenCode's `permission.asked` events to WeChat as `once` / `always` / `reject` cards; `/auto-permission` toggles auto-accept mode; 30-min soft timeout
+- **Cross-session notifications** — Forward other sessions' question/permission/error/completion events to WeChat; auto-render cards when switching to a pending session
 - **QR Login** — Terminal QR code rendering for WeChat login
 - **OpenCode Server** — HTTP API based, no ACP subprocess required
 
@@ -166,6 +167,17 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 | `/tool-display status` | Show current tool display state |
 
 Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
+
+### Cross-session Notifications (`/notify`)
+
+| Command | Description |
+|---------|-------------|
+| `/notify` (`/n`) | Show notification status |
+| `/notify on\|off` | Master switch |
+| `/notify types <type> on\|off` | Toggle one event type (question/permission/error/completion) |
+| `/notify status` | Show current settings |
+
+Forwards other sessions' question, permission, error, and completion events to WeChat. Auto-renders the card when switching to a session with a pending item.
 
 ### System (`/version`)
 
