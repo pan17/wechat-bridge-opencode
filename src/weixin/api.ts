@@ -79,6 +79,13 @@ async function apiPost<T>(
     if ((err as Error).name === "AbortError") {
       return { ret: 0, msgs: [] } as T;
     }
+    // Unwrap undici's underlying network error (ECONNRESET, ETIMEDOUT, etc.)
+    // so bridge logs surface the real socket-level cause instead of the
+    // generic "TypeError: fetch failed" wrapper.
+    const cause = (err as Error & { cause?: unknown }).cause;
+    if (cause) {
+      throw new Error(`${(err as Error).message}: ${String(cause)}`);
+    }
     throw err;
   }
 }
