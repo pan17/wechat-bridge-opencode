@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-06-15
+
+### Added
+- **`/compact` command** (alias `/summarize`): force-trigger OpenCode Server's context compaction for the current session via `POST /session/:id/summarize`. Uses the session's active model so the summarization LLM matches the user's chosen provider/model. Rejected while the agent is mid-turn (`/stop` first); allowed while a question or permission is pending. See `.omo/plans/compact-command-design.md` for full rationale.
+
+### Fixed
+- **`/next` during a pending question no longer rejects the question.** Previously, `/next` was treated as a priority command that called `rejectPendingQuestion()` before flushing the client-side cache, so the agent received `QuestionRejectedError` even though the user only wanted to see cached output. `/next` is now purely informational during pending state — flushes the cache only, leaving the pending slot intact so the user can still answer afterward.
+- **`/next` during a pending permission now actually works.** Previously, `/next` had no branch in `handlePermissionReply` and fell through to the default "parse as decision" path, surfacing `⚠️ Unrecognized reply`. The command was effectively unusable while a permission card was showing. Same fix: `/next` is now informational — flushes cache, pending slot stays intact, user can still reply `1`/`2`/`3` (or `/rp`) afterward.
+
 ### Removed
 - Cat-girl feature: removed `--cat-girl` CLI flag, the bundled `presets/cat-girl.md` agent, and the `installCatGirlAgent()` helper. The flag now produces an "Unknown option" error. Users who previously installed the agent via this flag will need to manage it themselves (the file is no longer shipped).
 
