@@ -372,6 +372,17 @@ export class SessionManager {
     return this.sessionId;
   }
 
+  /**
+   * Whether the agent is currently mid-turn (executing tools / streaming
+   * tokens). True while a prompt is being processed and before the final
+   * response event arrives. Useful for gating commands that conflict
+   * with an in-flight turn — e.g. `/compact` rejects while busy to avoid
+   * racing against the SSE-driven token bookkeeping.
+   */
+  isAgentBusy(): boolean {
+    return this.isSessionBusy;
+  }
+
   // ─── Session lifecycle ───
 
   /**
@@ -2710,6 +2721,31 @@ export class SessionManager {
     if (this.currentTurn) {
       this.finalizeTurn("interrupted");
     }
+  }
+
+  // ─── Compact ───
+
+  /**
+   * Trigger OpenCode Server's context compaction for the current session.
+   * Thin wrapper around `OpenCodeServerClient.compactSession`, which hits
+   * `POST /session/:id/summarize`. The caller (bridge) supplies the
+   * model that the server should use for the summarization LLM call —
+   * by convention the bridge passes its current model so the compacted
+   * session continues to behave the same.
+   *
+   * Throws if there is no active session or if the HTTP call fails; the
+   * caller is expected to translate the error into a user-facing
+   * WeChat message. No busy-check is done here — callers that want to
+   * reject while the agent is mid-turn should consult `isAgentBusy()`
+   * first; allowing compaction on a paused session (e.g. while a
+   * question is pending) is intentional.
+   */
+  async compactSession(providerID: string, modelID: string): Promise<boolean> {
+    if (!this.sessionId) {
+      throw new Error("No active session to compact");
+    }
+    this.log(`Compacting session ${this.sessionId} (model=${providerID}/${modelID})`);
+    return this.client.compactSession(this.sessionId, providerID, modelID);
   }
 
   // ─── Agent mode ───

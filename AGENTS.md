@@ -205,6 +205,11 @@ src/weixin/
 | `/stop` | Cancel the running agent |
 | `/restart` | Restart OpenCode Server (external server mode: recover previous session only) |
 
+### Context (/compact)
+| Command | Description |
+|---------|-------------|
+| `/compact` (`/summarize`) | Force-trigger OpenCode Server's context compaction for the current session via `POST /session/:id/summarize`. Uses the session's current model. Rejected while the agent is mid-turn (`/stop` first); allowed while a question or permission is pending. See `.omo/plans/compact-command-design.md` for rationale. |
+
 ### Thought Display (/thought-display)
 | Command | Description |
 |---------|-------------|

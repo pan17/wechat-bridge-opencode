@@ -35,6 +35,7 @@ import {
   parseThoughtDisplayCommand,
   parseToolDisplayCommand,
   parseStopCommand,
+  parseCompactCommand,
   parseRestartCommand,
   parseRejectQuestionCommand,
   parseRejectPermissionCommand,
@@ -840,6 +841,14 @@ export class WeChatOpencodeBridge {
         return;
       }
 
+      const compactCmd = parseCompactCommand(textContent);
+      if (compactCmd) {
+        this.handleCompactCommand(contextToken, compactCmd).catch((err) => {
+          this.log(`Compact command error: ${String(err)}`);
+        });
+        return;
+      }
+
       // /next — flush cached messages, do NOT forward to agent
       if (/^\/next\b/.test(textContent.trim())) {
         this.flushPending(contextToken).catch((err) => {
@@ -945,11 +954,21 @@ export class WeChatOpencodeBridge {
       this.handleStatusCommand(contextToken, stCmd).catch(() => {});
       return;
     }
-    const apCmd = parseAutoPermissionCommand(trimmed);
-    if (apCmd) {
-      this.handleAutoPermissionCommand(contextToken, apCmd).catch(() => {});
-      return;
-    }
+const apCmd = parseAutoPermissionCommand(trimmed);
+      if (apCmd) {
+        this.handleAutoPermissionCommand(contextToken, apCmd).catch(() => {});
+        return;
+      }
+
+      // /compact is informational while permissions are pending — it
+      // doesn't touch the pending slots and helps the user free context
+      // before answering. We allow it during the busy-with-question and
+      // busy-with-permission states alike.
+      const compactCmd = parseCompactCommand(trimmed);
+      if (compactCmd) {
+        this.handleCompactCommand(contextToken, compactCmd).catch(() => {});
+        return;
+      }
 
     // ── Default: parse as permission decision ──
     const parsed = parsePermissionReply(trimmed, pending);
@@ -1079,6 +1098,17 @@ export class WeChatOpencodeBridge {
     if (stCmd) {
       this.handleStatusCommand(contextToken, stCmd).catch((err: unknown) => {
         this.log(`Status command (during pending question) error: ${String(err)}`);
+      });
+      return;
+    }
+    // /compact during a pending question is informational: the agent is
+    // paused waiting on the user, but compact just summarizes server-side
+    // history — the question slot stays intact and the user can answer
+    // after compaction completes.
+    const compactCmdDuringQ = parseCompactCommand(trimmed);
+    if (compactCmdDuringQ) {
+      this.handleCompactCommand(contextToken, compactCmdDuringQ).catch((err: unknown) => {
+        this.log(`Compact command (during pending question) error: ${String(err)}`);
       });
       return;
     }
@@ -1796,6 +1826,90 @@ export class WeChatOpencodeBridge {
     }
   }
 
+  // ─── Compact command (/compact, /summarize) ───
+
+  /**
+   * Force-trigger OpenCode Server's context compaction via
+   * `POST /session/:id/summarize`. Uses the session's current model so
+   * the compaction LLM call matches the user's chosen provider/model.
+   * Rejects while the agent is mid-turn to avoid racing the SSE-driven
+   * token bookkeeping, and allows compaction during a paused state
+   * (e.g. while a question is pending) since the summary doesn't
+   * disturb those slots.
+   */
+  private async handleCompactCommand(
+    contextToken: string,
+    _cmd: ReturnType<typeof parseCompactCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) {
+      await this.sendReply(contextToken, "⚠️ Session manager not ready");
+      return;
+    }
+
+    // Refuse while the agent is mid-turn — compacting during an active
+    // response would race with `message.updated` events that update
+    // `totalTokens`. The user can /stop first then /compact.
+    if (this.sessionManager.isAgentBusy()) {
+      await this.sendReply(
+        contextToken,
+        "⚠️ Agent 正在运行，请先 /stop 再 /compact",
+      );
+      return;
+    }
+
+    const sessionId = this.sessionManager.getSessionId();
+    if (!sessionId) {
+      await this.sendReply(contextToken, "⚠️ 当前没有活动会话，无法 compact");
+      return;
+    }
+
+    const currentModel = this.sessionManager.getCurrentModel();
+    if (!currentModel) {
+      await this.sendReply(
+        contextToken,
+        "⚠️ 无法确定当前 model，请先 /model switch 设置后重试",
+      );
+      return;
+    }
+
+    const slash = currentModel.indexOf("/");
+    if (slash <= 0) {
+      await this.sendReply(
+        contextToken,
+        `⚠️ 当前 model 格式异常: "${currentModel}"`,
+      );
+      return;
+    }
+    const providerID = currentModel.slice(0, slash);
+    const modelID = currentModel.slice(slash + 1);
+
+    const beforeUsage = this.sessionManager.getContextUsage();
+    const beforeTokens = beforeUsage?.totalTokens ?? 0;
+    const beforeSize = beforeUsage?.contextSize ?? 0;
+
+    await this.sendReply(contextToken, "🗜️ 开始压缩会话上下文...");
+    try {
+      const ok = await this.sessionManager.compactSession(providerID, modelID);
+      if (!ok) {
+        await this.sendReply(
+          contextToken,
+          "⚠️ Server 返回 false — compact 未生效（可能当前 context 已足够小，或 server 拒绝执行）",
+        );
+        return;
+      }
+      const beforeLine = beforeSize > 0
+        ? `  before: ${beforeTokens} / ${beforeSize}`
+        : `  before: ${beforeTokens} tokens`;
+      await this.sendReply(
+        contextToken,
+        `✅ Compact 完成\n${beforeLine}\n  发送 /status 查看压缩后的用量`,
+      );
+    } catch (err) {
+      this.log(`Compact error: ${String(err)}`);
+      await this.sendReply(contextToken, `⚠️ Compact failed: ${String(err)}`);
+    }
+  }
+
   // ─── Restart command (/restart) ───
 
   private async handleRestartCommand(
@@ -2000,7 +2114,7 @@ export class WeChatOpencodeBridge {
       "reasoning", "help", "h", "?", "status",
       "thought-display",
       "tool-display",
-      "stop", "restart", "next", "version",
+      "stop", "compact", "summarize", "restart", "next", "version",
       // Permission commands (parsed by parseAutoPermissionCommand /
       // parseRejectPermissionCommand, never forwarded to agent when
       // pending; otherwise safe to list as bridge commands so the

@@ -14,7 +14,7 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 
 - **Send** — Text, images, files, audio/video sent from WeChat to the OpenCode agent; media is auto-downloaded to `~/.wechat-bridge-opencode/tempfile/` and forwarded as a file-path attachment
 - **Receive** — Agent replies are forwarded to WeChat; the `send-wechat` tool lets the agent proactively push text, files, and images to WeChat
-- **WeChat slash commands** — `/help`, `/workspace`, `/session`, `/agent`, `/model`, `/stop` and 10+ more commands are consumed by the bridge, never forwarded to the agent
+- **WeChat slash commands** — `/help`, `/workspace`, `/session`, `/agent`, `/model`, `/stop`, `/compact` and 15+ more commands are consumed by the bridge, never forwarded to the agent
 - **OpenCode slash commands** — Any `/xxx` the bridge doesn't recognize is forwarded to the agent as plain text, triggering OpenCode's built-in slash commands (e.g. `/init`, `/review`). Send `/help` to see all available commands
 - **Permission cards** — Surface OpenCode's `permission.asked` events to WeChat as `once` / `always` / `reject` cards; `/auto-permission` toggles auto-accept mode; 30-min soft timeout
 - **QR Login** — Terminal QR code rendering for WeChat login
@@ -140,6 +140,12 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 |---------|-------------|
 | `/stop` | Stop the running agent |
 | `/restart` | Restart OpenCode Server (external server mode: recover previous session only) |
+
+### Context (`/compact`)
+
+| Command | Description |
+|---------|-------------|
+| `/compact` (`/summarize`) | Force-trigger OpenCode Server's context compaction via `POST /session/:id/summarize`. Uses the session's current model for the summarization LLM call; the server replaces the active context with a rolling summary while keeping the full transcript durable. Rejected while the agent is mid-turn (`/stop` first); allowed while a question or permission is pending. See `.omo/plans/compact-command-design.md` for rationale |
 
 ### Thought Display (`/thought-display`)
 

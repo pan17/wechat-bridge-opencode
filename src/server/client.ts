@@ -335,6 +335,40 @@ export class OpenCodeServerClient {
     if (!res.ok) this.log(`Warning: abort failed for session ${sessionId}: ${res.status}`);
   }
 
+  /**
+   * Trigger context compaction (a.k.a. `/compact` in the OpenCode TUI) for a
+   * session via the `POST /session/:id/summarize` endpoint. The server uses
+   * the supplied `providerID`/`modelID` to drive a separate LLM call that
+   * summarises older messages; full history is preserved server-side while
+   * the active context is replaced by the rolling summary. Returns
+   * `boolean` from the server (typically `true` on success). Throws on
+   * HTTP failure so callers can surface a clear error to the user.
+   *
+   * We deliberately omit the optional `auto` flag so the request always
+   * triggers a real compaction — even if the session is currently below
+   * the server's auto-compact threshold, the user explicitly asked for
+   * it.
+   */
+  async compactSession(
+    sessionId: string,
+    providerID: string,
+    modelID: string,
+  ): Promise<boolean> {
+    const res = await this.fetch(
+      `/session/${encodeURIComponent(sessionId)}/summarize`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerID, modelID }),
+        timeoutMs: 120_000,
+      },
+    );
+    if (!res.ok) {
+      throw new Error(`Compact failed: HTTP ${res.status}`);
+    }
+    return res.json() as Promise<boolean>;
+  }
+
   // ─── Agents ───
 
   async listAgents(directory?: string): Promise<

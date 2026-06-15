@@ -62,6 +62,19 @@ export interface StopCommand {
   kind: "stop";
 }
 
+/**
+ * `/compact` (alias `/summarize`) — trigger OpenCode Server's context
+ * compaction for the current session via `POST /session/:id/summarize`.
+ * Mirrors the TUI's `/compact` slash command and Claude Code's `/compact`.
+ * The command is force-triggered: we always send the request even if the
+ * session's current context is well below the server's auto-compact
+ * threshold, because the user explicitly asked for it. See
+ * `.omo/plans/compact-command-design.md` for rationale.
+ */
+export interface CompactCommand {
+  kind: "compact";
+}
+
 export interface VersionCommand {
   kind: "version";
 }
@@ -350,6 +363,23 @@ export function parseStopCommand(text: string): StopCommand | null {
   const trimmed = text.trim().toLowerCase();
   if (trimmed === "/stop") {
     return { kind: "stop" };
+  }
+  return null;
+}
+
+/**
+ * Parse `/compact` (or alias `/summarize`) — manually trigger context
+ * compaction for the current OpenCode session. Only matches the bare
+ * command; trailing args are rejected so the parser doesn't swallow
+ * `/compact foo` or `/summarize now` (those are user-typed messages,
+ * not this command). `/compaction` (with the trailing `ion`) is also
+ * rejected — that's a different OpenCode native command, if it ever
+ * appears, and we don't want to silently hijack it.
+ */
+export function parseCompactCommand(text: string): CompactCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/compact" || trimmed === "/summarize") {
+    return { kind: "compact" };
   }
   return null;
 }
@@ -664,6 +694,10 @@ export function formatHelp(): string {
     "  /stop                    停止正在运行的 Agent",
     "  /restart                 重启 OpenCode Server（外部 server 时仅新建会话）",
     "",
+    "── Context ──",
+    "  /compact                 压缩当前会话的上下文（用当前 model 调用 server summarize）",
+    "  （简写: /summarize）",
+    "",
     "── 系统 ──",
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
     "",
@@ -742,6 +776,10 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "── 停止 ──",
     "  /stop                    停止正在运行的 Agent",
     "  /restart                 重启 OpenCode Server（外部 server 时仅新建会话）",
+    "",
+    "── Context ──",
+    "  /compact                 压缩当前会话的上下文（用当前 model 调用 server summarize）",
+    "  （简写: /summarize）",
     "",
     "── 系统 ──",
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
