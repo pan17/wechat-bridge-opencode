@@ -939,12 +939,19 @@ export class WeChatOpencodeBridge {
       await this.sendReply(contextToken, "❌ Permission rejected.");
       return;
     }
-    // /stop, /next, /restart are NOT priority here — the agent is
-    // blocked on a tool call. The user must either reply with a
-    // decision OR /rp to free the slot. Sending /stop without first
-    // rejecting the permission would still leave the slot dangling.
+    // /stop and /restart remain NOT priority here — both want to terminate
+    // agent/server work. The agent is blocked on a tool call; sending /stop
+    // without first rejecting the permission would leave the slot dangling
+    // on the server side, so the user must /rp first. /next, on the other
+    // hand, is purely a client-side cache flush and does NOT need to reject
+    // anything; we handle it below in the informational block.
 
     // ── Informational commands: run without rejecting ──
+    // /next, /help, /status, /ap, /compact during a pending permission are
+    // all purely client-side / view-only: none of them touch the
+    // server-side pending slot. The user can review cached agent output,
+    // check status, or change settings and still reply 1/2/3 (or /rp to
+    // dismiss) afterward.
     if (parseHelpCommand(trimmed)) {
       this.sendHelpReply(contextToken).catch(() => {});
       return;
@@ -967,6 +974,19 @@ const apCmd = parseAutoPermissionCommand(trimmed);
       const compactCmd = parseCompactCommand(trimmed);
       if (compactCmd) {
         this.handleCompactCommand(contextToken, compactCmd).catch(() => {});
+        return;
+      }
+
+      // /next during a pending permission flushes the client-side cache
+      // only — it does NOT reject the pending slot. The user wants to see
+      // cached agent output (which may include the permission card that
+      // got cached because the bridge had hit its 10-msg outbound limit),
+      // and the pending slot stays intact so they can still reply 1/2/3
+      // afterward.
+      if (/^\/next\b/.test(trimmed)) {
+        this.flushPending(contextToken).catch((err: unknown) => {
+          this.log(`/next (during pending permission) error: ${String(err)}`);
+        });
         return;
       }
 
@@ -1072,13 +1092,6 @@ const apCmd = parseAutoPermissionCommand(trimmed);
       });
       return;
     }
-    if (/^\/next\b/.test(trimmed)) {
-      await this.sessionManager!.rejectPendingQuestion();
-      this.flushPending(contextToken).catch((err: unknown) => {
-        this.log(`/next (during pending question) error: ${String(err)}`);
-      });
-      return;
-    }
     if (parseRestartCommand(trimmed)) {
       await this.sessionManager!.rejectPendingQuestion();
       this.handleRestartCommand(contextToken, parseRestartCommand(trimmed)!).catch((err: unknown) => {
@@ -1088,6 +1101,12 @@ const apCmd = parseAutoPermissionCommand(trimmed);
     }
 
     // ── Informational commands: run without rejecting ──
+    // /next, /help, /status, /compact during a pending question are all
+    // purely client-side / view-only: none of them touch the server-side
+    // pending slot. The user can review cached agent output or session
+    // state and still answer the question afterward. Only /stop and
+    // /restart (above) want to terminate work and therefore must reject
+    // the pending slot first.
     if (parseHelpCommand(trimmed)) {
       this.sendHelpReply(contextToken).catch((err: unknown) => {
         this.log(`Help command (during pending question) error: ${String(err)}`);
@@ -1109,6 +1128,17 @@ const apCmd = parseAutoPermissionCommand(trimmed);
     if (compactCmdDuringQ) {
       this.handleCompactCommand(contextToken, compactCmdDuringQ).catch((err: unknown) => {
         this.log(`Compact command (during pending question) error: ${String(err)}`);
+      });
+      return;
+    }
+    // /next during a pending question flushes the client-side cache only —
+    // it does NOT reject the pending slot. The user wants to see cached
+    // agent output (which may include the question card that got cached
+    // because the bridge had hit its 10-msg outbound limit), and the
+    // pending slot stays intact so they can still answer afterward.
+    if (/^\/next\b/.test(trimmed)) {
+      this.flushPending(contextToken).catch((err: unknown) => {
+        this.log(`/next (during pending question) error: ${String(err)}`);
       });
       return;
     }
