@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-06-15
+
+### Added
+- **Cross-session notification** (`/notify`): bridge now forwards events from OTHER OpenCode sessions to WeChat as notifications (question/permission/error/completion). Master switch + per-type toggles, 30s dedup, 5min label cache. Mirrors OpenCode Desktop's notification UX.
+- **Re-surface pending question/permission on `/session switch`**: when the user switches to a session that has an unanswered question or permission card, the bridge re-renders the card so the user can answer it immediately without scrolling back. The notifier stores the latest payload per non-current session (`pendingBySession` map, cleared on reply/reject/idle).
+- **Sub-agent distinction in notifications**: sub-agent sessions (parentID set) now get a `· 🤖 <agent>` marker in the notification title line, making it clear whether the notification is from a root session or a `task`-tool sub-agent.
+
+### Changed
+- **Notification format**: all 4 notification kinds now show the session's working directory (`📂 <path>`) and the broken `/session switch "X"` hint has been replaced with the correct `/session list 看看其他会话` hint (the command only accepts a numeric index).
+- **First notification no longer uses short-id fallback**: `resolveSessionInfo` now actually awaits the HTTP label fetch on cache miss, so even the very first notification for a brand-new session shows the real title + directory + sub-agent context.
+
+### Fixed
+- **`/status` showing stale `🟢 Agent: Running` after session/workspace switch**: `discardInFlightTurn` now resets `isSessionBusy` + `lastAgentStatus` to `{ type: 'idle' }` in BOTH branches (with-turn and no-turn early-return). Previously, the previous session's `busy` / `retry` badge leaked into the new session's `/status` display until the next SSE event for the new session arrived.
+- **`setCurrentSessionId` was preventing switch-time re-render**: the method was proactively deleting the `pendingBySession` entry for the now-current session, which prevented the bridge's `maybeReSurfacePending` from finding and re-rendering the pending card. Entries are now only cleared on consume (explicit switch) or reply/reject/idle events.
+
 ## [1.3.4] - 2026-06-15
 
 ### Added
