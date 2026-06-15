@@ -56,6 +56,7 @@ import type {
   PendingQuestion,
   QuestionPrompt,
   QuestionRequest,
+  QuestionToolRef,
 } from "../types/question.js";
 import type {
   AutoPermissionMode,
@@ -568,6 +569,13 @@ export class SessionManager {
         this.log(`[switch] dropping ${this.pendingEchoes.length} stale pending echo(es) without active turn`);
         this.pendingEchoes = [];
       }
+      // Still reset the previous session's status display — even with
+      // no active turn locally, `isSessionBusy` / `lastAgentStatus` may
+      // have been set by a `session.status = busy` SSE event for the
+      // OLD session. Those values would otherwise leak into the new
+      // session's `/status` display until the next SSE event arrives.
+      this.isSessionBusy = false;
+      this.lastAgentStatus = { type: "idle" };
       return;
     }
     this.log(
@@ -580,6 +588,11 @@ export class SessionManager {
     this.clearFinalizeTimers();
     this.pendingEchoes = [];
     this.isSessionBusy = false;
+    // Same reason as the no-turn branch above: the new session hasn't
+    // reported its status yet, and we don't want the previous session's
+    // "busy" badge to leak through. The next `session.status` SSE event
+    // for the new session will update both fields.
+    this.lastAgentStatus = { type: "idle" };
     if (oldCtx) {
       this.cancelTyping?.(oldCtx).catch(() => {});
     }
@@ -1010,6 +1023,40 @@ export class SessionManager {
   }
 
   /**
+   * Adopt a pending question from another session (carried over from
+   * the notifier's `pendingBySession` cache when the user explicitly
+   * `/session switch`-es to a session that has a question waiting).
+   * The synthetic slot is indistinguishable from a fresh one — the
+   * existing answer / reject / timeout flow takes over without
+   * branching. No-ops when a question is already pending locally
+   * (the SSE-driven path owns the slot in that case).
+   *
+   * Pass `contextToken` to route replies back to the WeChat chat the
+   * user is currently in (caller responsibility — typically the
+   * bridge's `currentContextToken`). When `contextToken` is empty,
+   * `answerPendingQuestion` will still POST the answer, but the
+   * reply text won't be sent to any chat (we have no target).
+   */
+  adoptPendingQuestion(
+    requestID: string,
+    questions: ReadonlyArray<QuestionPrompt>,
+    contextToken: string,
+    tool?: QuestionToolRef,
+  ): void {
+    if (this.pendingQuestion) {
+      this.log(
+        `[question] adoptPendingQuestion: ignoring requestID=${requestID.slice(0, 12)}… — ` +
+          `local slot already holds id=${this.pendingQuestion.requestID.slice(0, 12)}…`,
+      );
+      return;
+    }
+    this.setPendingQuestion(
+      { id: requestID, sessionID: this.sessionId ?? "", questions, tool },
+      contextToken,
+    );
+  }
+
+  /**
    * Submit the user's answers to a pending question. POSTs to
    * `/question/:id/reply` with the answer array. Resolves once the HTTP
    * call returns (does NOT wait for the SSE `question.replied` echo —
@@ -1212,6 +1259,39 @@ export class SessionManager {
   /** Snapshot of all pending permissions (most-recent-first-ish, but Map order is insertion). */
   listPendingPermissions(): PendingPermission[] {
     return [...this.pendingPermissions.values()];
+  }
+
+  /**
+   * Adopt a pending permission from another session (carried over from
+   * the notifier's `pendingBySession` cache when the user explicitly
+   * `/session switch`-es to a session that has a permission waiting).
+   * No-ops when a permission with the same `requestID` is already
+   * tracked locally.
+   */
+  adoptPendingPermission(
+    requestID: string,
+    request: PermissionRequest,
+    contextToken: string,
+  ): void {
+    if (this.pendingPermissions.has(requestID)) {
+      this.log(
+        `[permission] adoptPendingPermission: ignoring requestID=${requestID.slice(0, 12)}… — already tracked locally`,
+      );
+      return;
+    }
+    this.setPendingPermission(request, contextToken);
+  }
+
+  /**
+   * Override the `lastEnqueuedContextToken` for the current session.
+   * The bridge uses this after `/session switch <n>` to point the
+   * SessionManager at the WeChat chat the user is currently in, so
+   * that a question / permission card adopted via the `adopt*`
+   * methods is sent to the right chat AND its reply routes back to
+   * the same chat.
+   */
+  setLastEnqueuedContextToken(contextToken: string): void {
+    this.lastEnqueuedContextToken = contextToken || null;
   }
 
   /**

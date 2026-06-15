@@ -2,7 +2,9 @@
  * Unit tests for the cross-session notification feature:
  *   - `parseNotifyCommand` in `src/adapter/workspace-cmd.ts`
  *   - `formatNotifyStatus` in `src/adapter/notify-format.ts`
- *   - `formatOtherSessionNotification` (the 4 notification kinds)
+ *   - `formatOtherSessionNotification` (the 4 notification kinds) —
+ *     including the working-directory line and the new
+ *     `/session list` switch hint
  *   - `extractSessionErrorMessage` (defensive error string extraction)
  *   - `formatStatus` integration with the new `notifySettings` opt
  *
@@ -108,6 +110,7 @@ describe("formatOtherSessionNotification", () => {
     const out = formatOtherSessionNotification({
       kind: "question",
       sessionLabel: "fix-auth-bug",
+      sessionDirectory: "F:\\opencodeproject\\api",
       question: {
         question: "用 OAuth 还是 JWT?",
         header: "Auth method",
@@ -116,14 +119,18 @@ describe("formatOtherSessionNotification", () => {
     });
     expect(out).toContain("📨");
     expect(out).toContain('"fix-auth-bug"');
+    expect(out).toContain("F:\\opencodeproject\\api");
     expect(out).toContain("用 OAuth 还是 JWT?");
-    expect(out).toContain("/session switch");
+    expect(out).toContain("/session list 看看其他会话");
+    // The hint must NOT use the old (broken) `/session switch <label>` form
+    expect(out).not.toContain("/session switch");
   });
 
-  test("permission: includes tool name and patterns", () => {
+  test("permission: includes tool name, patterns, and directory", () => {
     const out = formatOtherSessionNotification({
       kind: "permission",
       sessionLabel: "deploy-prod",
+      sessionDirectory: "F:\\opencodeproject\\infra",
       permission: {
         id: "per_test",
         sessionID: "ses_other",
@@ -135,30 +142,86 @@ describe("formatOtherSessionNotification", () => {
     });
     expect(out).toContain("🔐");
     expect(out).toContain('"deploy-prod"');
+    expect(out).toContain("F:\\opencodeproject\\infra");
     expect(out).toContain("bash");
     expect(out).toContain("npm run deploy");
+    expect(out).toContain("/session list 看看其他会话");
   });
 
-  test("error: includes error message", () => {
+  test("error: includes error message and directory", () => {
     const out = formatOtherSessionNotification({
       kind: "error",
       sessionLabel: "migrate-db",
+      sessionDirectory: "F:\\opencodeproject\\db",
       errorMessage: "rate limit exceeded",
     });
     expect(out).toContain("❌");
     expect(out).toContain('"migrate-db"');
+    expect(out).toContain("F:\\opencodeproject\\db");
     expect(out).toContain("rate limit exceeded");
   });
 
-  test("completion: concise, no body needed", () => {
+  test("completion: includes directory line", () => {
     const out = formatOtherSessionNotification({
       kind: "completion",
       sessionLabel: "fix-auth-bug",
+      sessionDirectory: "F:\\opencodeproject\\api",
     });
     expect(out).toContain("✅");
     expect(out).toContain('"fix-auth-bug"');
+    expect(out).toContain("F:\\opencodeproject\\api");
     expect(out).toContain("已完成");
   });
+
+  // ─── Directory display edge cases ───
+
+  test("directory line is omitted when sessionDirectory is undefined", () => {
+    const out = formatOtherSessionNotification({
+      kind: "completion",
+      sessionLabel: "no-dir",
+    });
+    expect(out).toContain("✅");
+    expect(out).toContain('"no-dir"');
+    // No 📂 line at all when directory is missing
+    expect(out).not.toContain("📂");
+  });
+
+  test("directory line is omitted when sessionDirectory is empty string", () => {
+    const out = formatOtherSessionNotification({
+      kind: "question",
+      sessionLabel: "x",
+      sessionDirectory: "",
+      question: { question: "q?", header: "h", options: [] },
+    });
+    expect(out).not.toContain("📂");
+  });
+
+  test("long directory is truncated with ellipsis", () => {
+    const longDir = "/very/long/" + "a".repeat(120) + "/path";
+    const out = formatOtherSessionNotification({
+      kind: "completion",
+      sessionLabel: "x",
+      sessionDirectory: longDir,
+    });
+    // MAX_DIR_LEN is 80 → 79 chars + "…"
+    expect(out).toContain("📂");
+    expect(out).toContain("…");
+    // The output should still be compact (well under 4000)
+    expect(out.length).toBeLessThan(500);
+  });
+
+  test("directory with newlines is collapsed to single line", () => {
+    const out = formatOtherSessionNotification({
+      kind: "completion",
+      sessionLabel: "x",
+      sessionDirectory: "F:\\a\nF:\\b\rF:\\c",
+    });
+    // The 📂 line must not contain a literal newline
+    const dirLines = out.split("\n").filter((l) => l.includes("📂"));
+    expect(dirLines.length).toBe(1);
+  });
+
+  // ─── Hint / label edge cases ───
 
   test("long label is truncated with ellipsis", () => {
     const longLabel = "a".repeat(100);
@@ -193,10 +256,101 @@ describe("formatOtherSessionNotification", () => {
     const out = formatOtherSessionNotification({
       kind: "question",
       sessionLabel: "x",
+      sessionDirectory: "/p",
       question: { question: longQ, header: "h", options: [] },
     });
     // MAX_BODY_LEN is 120 → 119 chars + "…"
     expect(out).toContain("…");
+  });
+
+  test("switch hint does not include `/session switch` (would fail the command)", () => {
+    // Regression: the old hint used `/session switch "X"` which the
+    // command rejected. The new hint should point the user at
+    // `/session list` so they can discover the index.
+    const out = formatOtherSessionNotification({
+      kind: "question",
+      sessionLabel: "some-session",
+      sessionDirectory: "/p",
+      question: { question: "q", header: "h", options: [] },
+    });
+    expect(out).not.toContain("/session switch");
+    expect(out).toContain("/session list");
+  });
+});
+
+// ─── Sub-agent marker ───
+
+describe("formatOtherSessionNotification — sub-agent marker", () => {
+  test("root session (no parentID) gets NO 🤖 marker", () => {
+    const out = formatOtherSessionNotification({
+      kind: "question",
+      sessionLabel: "fix-auth-bug",
+      sessionDirectory: "/repo",
+      question: { question: "q?", header: "h", options: [] },
+    });
+    expect(out).not.toContain("🤖");
+    // Title line stays clean — just the label in quotes
+    expect(out.split("\n")[0]).toBe('📨 Session "fix-auth-bug"');
+  });
+
+  test("sub-agent with parentID + agent name gets ' · 🤖 <agent>' marker", () => {
+    const out = formatOtherSessionNotification({
+      kind: "question",
+      sessionLabel: "Build game UI components",
+      sessionDirectory: "F:\\opencodeproject\\doudizhu",
+      sessionParentID: "ses_root",
+      sessionAgent: "designer",
+      question: { question: "q?", header: "h", options: [] },
+    });
+    expect(out).toContain('"Build game UI components"');
+    expect(out).toContain("· 🤖 designer");
+    expect(out).toContain("F:\\opencodeproject\\doudizhu");
+  });
+
+  test("sub-agent with parentID but no agent name falls back to 'sub-agent'", () => {
+    const out = formatOtherSessionNotification({
+      kind: "completion",
+      sessionLabel: "Anonymous sub",
+      sessionParentID: "ses_root",
+    });
+    expect(out).toContain("🤖 sub-agent");
+    expect(out).not.toContain("· 🤖 designer");
+  });
+
+  test("sub-agent marker is applied to ALL 4 notification kinds", () => {
+    const baseSubAgent = {
+      sessionLabel: "x",
+      sessionDirectory: "/p",
+      sessionParentID: "ses_root",
+      sessionAgent: "designer",
+    };
+    const kinds = [
+      { kind: "question", question: { question: "q", header: "h", options: [] } },
+      {
+        kind: "permission",
+        permission: { id: "p", sessionID: "s", permission: "bash", patterns: ["x"], metadata: {}, always: [] },
+      },
+      { kind: "error", errorMessage: "oops" },
+      { kind: "completion" },
+    ];
+    for (const k of kinds) {
+      const out = formatOtherSessionNotification({ ...baseSubAgent, ...k });
+      expect(out).toContain("🤖 designer");
+    }
+  });
+
+  test("long agent name is truncated (not allowed to blow up the title line)", () => {
+    const longAgent = "a".repeat(100);
+    const out = formatOtherSessionNotification({
+      kind: "completion",
+      sessionLabel: "x",
+      sessionParentID: "ses_root",
+      sessionAgent: longAgent,
+    });
+    expect(out).toContain("…");
+    // Title line is still compact
+    const titleLine = out.split("\n")[0];
+    expect(titleLine.length).toBeLessThan(150);
   });
 });
 

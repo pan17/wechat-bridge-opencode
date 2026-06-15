@@ -52,19 +52,31 @@ import {
  * matches what `OpenCodeServerClient.getSession()` returns for V1
  * sessions — only the fields we actually use are declared here so
  * the notifier can be unit-tested with partial mock objects.
+ *
+ * `directory` is the session's working directory (workspace path).
+ * `parentID` is set for sub-agent / child sessions spawned by the
+ * `task` tool. `agent` is the agent name (e.g. "build", "designer").
+ * All three are optional because older opencode server versions may
+ * not return them, and mocks in unit tests may omit them. When
+ * absent, the notifier passes `undefined` to the formatter, which
+ * then omits the corresponding line / marker from the rendered
+ * notification.
  */
 export interface SessionLabelInfo {
   readonly id: string;
   readonly title?: string;
+  readonly directory?: string;
+  readonly parentID?: string;
+  readonly agent?: string;
 }
 
 /**
- * Minimal client surface the notifier needs to look up session titles.
+ * Minimal client surface the notifier needs to look up session info.
  *
  * `getSession` may throw (the real `OpenCodeServerClient.getSession`
  * throws on 404 / network error). The notifier catches + logs errors
- * inside `fetchLabel` and falls back to a short id prefix — so a
- * broken lookup never propagates to the SSE pipeline.
+ * inside `resolveSessionInfo` and falls back to a short id prefix for
+ * the title — so a broken lookup never propagates to the SSE pipeline.
  */
 export interface NotifierClient {
   getSession(id: string): Promise<SessionLabelInfo>;
@@ -99,6 +111,12 @@ const LABEL_TTL_MS = 5 * 60_000;
 /** Per-id cache entry for session labels. */
 interface LabelCacheEntry {
   title: string;
+  /** Working directory (workspace path). Absent when unknown. */
+  directory?: string;
+  /** Parent session id (set for sub-agent / child sessions spawned by a `task` tool). */
+  parentID?: string;
+  /** Agent name (e.g. "build", "designer", "Sisyphus - ultraworker"). */
+  agent?: string;
   expiresAt: number;
 }
 
@@ -107,14 +125,39 @@ interface DedupeEntry {
   at: number;
 }
 
+/**
+ * A "needs attention" payload stashed per session. When a non-current
+ * session receives a `question.asked` or `permission.asked` event, the
+ * notifier stores the payload here so that a subsequent
+ * `/session switch <n>` to that session can re-render the question /
+ * permission card (the user explicitly wants to interact with the
+ * session they switched to). Cleared on `*.replied` / `*.rejected`
+ * echoes and on session idle (completion).
+ */
+interface StoredPending {
+  kind: "question" | "permission";
+  requestID: string;
+  question?: QuestionPrompt;
+  permission?: PermissionRequest;
+  receivedAt: number;
+}
+
 export class SessionNotifier {
   private settings: NotifySettings = { ...DEFAULT_NOTIFY_SETTINGS, types: { ...DEFAULT_NOTIFY_SETTINGS.types } };
   private currentSessionId: string | null = null;
   private readonly labelCache: Map<string, LabelCacheEntry> = new Map();
-  private readonly pendingLabelLookups: Set<string> = new Set();
+  /**
+   * In-flight label fetches keyed by session id. Multiple concurrent
+   * cache misses for the same sid share a single `getSession` call
+   * by joining on the same Promise (the Promise resolves when the
+   * fetch settles and the entry is auto-removed).
+   */
+  private readonly inflightLabelLookups: Map<string, Promise<void>> = new Map();
   private readonly dedupe: Map<string, DedupeEntry> = new Map();
   /** Track sessions that were recently busy so we only fire `completion` on real busy→idle transitions. */
   private readonly recentlyBusy: Set<string> = new Set();
+  /** Latest un-answered question / permission payload per session, for switch-time re-render. */
+  private readonly pendingBySession: Map<string, StoredPending> = new Map();
   private readonly client: NotifierClient;
   private readonly send: NotifySender;
   private readonly log: NotifyLog;
@@ -170,6 +213,16 @@ export class SessionNotifier {
    *      if we never see a session go busy, we won't fire a
    *      "completion" notification when it goes idle (avoids
    *      noise for sessions that were already idle at startup).
+   *
+   * Note: we do NOT proactively clear `pendingBySession` for the
+   * now-current session. The bridge's `maybeReSurfacePending` reads
+   * that entry RIGHT AFTER calling this method, so deleting it here
+   * would prevent the switch-time re-render. Entries are cleared
+   * by:
+   *   - `consumePendingForSession` (explicit consume on switch)
+   *   - `question.replied` / `question.rejected` / `permission.replied`
+   *     SSE echoes (server confirmed answered)
+   *   - `session.status` going `idle` (turn abandoned)
    */
   setCurrentSessionId(sessionId: string | null): void {
     this.currentSessionId = sessionId;
@@ -178,6 +231,26 @@ export class SessionNotifier {
     if (sessionId !== null) {
       this.recentlyBusy.delete(sessionId);
     }
+  }
+
+  /**
+   * Pop the latest un-answered question / permission payload for a
+   * session, so the caller (the bridge's `/session switch` handler)
+   * can re-render the card and let the SessionManager's existing
+   * answer flow take over. Returns `null` when there's nothing
+   * pending or the stored entry has already been answered.
+   *
+   * Consume semantics: the entry is removed even if the caller
+   * decides not to render — that prevents a stale card from
+   * re-surfacing on a later switch back. The server-side state is
+   * unchanged; the caller decides whether to actually adopt the
+   * pending request locally.
+   */
+  consumePendingForSession(sid: string): StoredPending | null {
+    const entry = this.pendingBySession.get(sid);
+    if (!entry) return null;
+    this.pendingBySession.delete(sid);
+    return entry;
   }
 
   // ─── Event dispatch (called by SessionManager for non-current events) ───
@@ -213,15 +286,58 @@ export class SessionNotifier {
         if (status.type === "busy") this.recentlyBusy.add(sid);
       }
 
+      // Clear any stored pending for this session on reply / reject
+      // echoes so a later switch back doesn't re-show a stale card.
+      // We do this BEFORE classify so completion-driven clear (session
+      // went idle) and reply-driven clear (user answered) both work.
+      if (event.type === "question.replied" || event.type === "question.rejected") {
+        this.pendingBySession.delete(sid);
+      } else if (event.type === "permission.replied") {
+        this.pendingBySession.delete(sid);
+      } else if (event.type === "session.status") {
+        const status = (event.properties as { status: { type: string } }).status;
+        // Session is now idle — any pending question / permission is
+        // no longer actionable (either answered on a different client,
+        // timed out on the server, or the turn was abandoned).
+        if (status.type === "idle") this.pendingBySession.delete(sid);
+      }
+
       const classified = this.classify(event, sid);
       if (!classified) return;
+
+      // Stash the latest question / permission payload so a subsequent
+      // /session switch to this sid can re-render the card. We store
+      // even when settings disable the kind (master off or per-type
+      // off) — the user might still want to see the question when
+      // they explicitly switch to that session.
+      if (classified.kind === "question" && classified.requestID) {
+        this.pendingBySession.set(sid, {
+          kind: "question",
+          requestID: classified.requestID,
+          question: classified.payload.question,
+          receivedAt: Date.now(),
+        });
+      } else if (classified.kind === "permission" && classified.requestID) {
+        this.pendingBySession.set(sid, {
+          kind: "permission",
+          requestID: classified.requestID,
+          permission: classified.payload.permission,
+          receivedAt: Date.now(),
+        });
+      }
 
       if (!this.settings.enabled) return;
       if (!this.settings.types[classified.kind]) return;
       if (this.isDuplicate(sid, classified.kind)) return;
 
-      const label = await this.resolveLabel(sid);
-      const notice: OtherSessionNotice = { ...classified.payload, sessionLabel: label } as OtherSessionNotice;
+      const info = await this.resolveSessionInfo(sid);
+      const notice: OtherSessionNotice = {
+        ...classified.payload,
+        sessionLabel: info.title,
+        sessionDirectory: info.directory,
+        sessionAgent: info.agent,
+        sessionParentID: info.parentID,
+      } as OtherSessionNotice;
       const text = formatOtherSessionNotification(notice);
       this.markSent(sid, classified.kind);
       // Fire-and-forget — the bridge's outbound queue handles
@@ -259,14 +375,16 @@ export class SessionNotifier {
    * `OtherSessionNotice` variant minus the `sessionLabel` field
    * (added by the caller after label resolution). The `Omit<>` built-
    * in doesn't preserve the union's per-variant shape, so we declare
-   * the type explicitly.
+   * the type explicitly. `requestID` is included for question /
+   * permission so the caller can stash it in `pendingBySession` for
+   * the switch-time re-render path.
    */
   private classify(
     event: OpenCodeEvent,
     sid: string,
   ):
-    | { kind: "question"; payload: { kind: "question"; question: QuestionPrompt } }
-    | { kind: "permission"; payload: { kind: "permission"; permission: PermissionRequest } }
+    | { kind: "question"; requestID: string; payload: { kind: "question"; question: QuestionPrompt } }
+    | { kind: "permission"; requestID: string; payload: { kind: "permission"; permission: PermissionRequest } }
     | { kind: "error"; payload: { kind: "error"; errorMessage: string } }
     | { kind: "completion"; payload: { kind: "completion" } }
     | null {
@@ -275,12 +393,20 @@ export class SessionNotifier {
         const questions = event.properties.questions as ReadonlyArray<QuestionPrompt>;
         const firstQ = questions[0];
         if (!firstQ) return null; // empty questions array — ignore
-        return { kind: "question", payload: { kind: "question", question: firstQ } };
+        return {
+          kind: "question",
+          requestID: event.properties.id,
+          payload: { kind: "question", question: firstQ },
+        };
       }
       case "permission.asked": {
         const req = event.properties as PermissionRequest;
         if (!req || !req.permission) return null;
-        return { kind: "permission", payload: { kind: "permission", permission: req } };
+        return {
+          kind: "permission",
+          requestID: req.id,
+          payload: { kind: "permission", permission: req },
+        };
       }
       case "session.error": {
         // session.error properties.sessionID is OPTIONAL per the
@@ -310,48 +436,87 @@ export class SessionNotifier {
   }
 
   /**
-   * Look up a session's display label (title preferred, cwd fallback,
-   * id prefix as last resort). Cache hits are O(1); misses trigger a
-   * single async fetch (deduplicated so concurrent misses for the
-   * same id share one network call).
+   * Look up a session's display info (title + working directory +
+   * parent / agent for sub-agent distinction).
+   *
+   * Cache hit: O(1) synchronous return.
+   * Cache miss: actually AWAIT the `getSession` HTTP call so the
+   * returned info is the real one (title, directory, parentID,
+   * agent). Concurrent misses for the same sid share a single fetch
+   * via `inflightLabelLookups`. If the fetch fails, falls back to
+   * the short-id prefix for the title and omits the other fields.
+   *
+   * The old behavior returned the fallback synchronously and let the
+   * fetch resolve in the background, so the FIRST notification for a
+   * new session was always rendered with `ses_abc12345…` + no
+   * `📂` line + no `🤖` marker. Subsequent events looked fine because
+   * the cache was warm. The user-visible bug was: "the first
+   * notification for a new session is missing the path and shows a
+   * short id". Awaiting the fetch here fixes that.
    */
-  private async resolveLabel(sid: string): Promise<string> {
+  private async resolveSessionInfo(sid: string): Promise<{
+    title: string;
+    directory?: string;
+    parentID?: string;
+    agent?: string;
+  }> {
     const cached = this.labelCache.get(sid);
     if (cached && cached.expiresAt > Date.now()) {
-      return cached.title;
+      return {
+        title: cached.title,
+        directory: cached.directory,
+        parentID: cached.parentID,
+        agent: cached.agent,
+      };
     }
 
-    if (!this.pendingLabelLookups.has(sid)) {
-      this.pendingLabelLookups.add(sid);
-      this.fetchLabel(sid).catch((err) => {
-        this.log(`[notify] label fetch failed for ${sid.slice(0, 12)}…: ${String(err)}`);
-      }).finally(() => {
-        this.pendingLabelLookups.delete(sid);
+    // Cache miss — kick off (or join) the fetch and await it so the
+    // returned info reflects the real server-side data. Concurrent
+    // misses for the same sid share the in-flight promise.
+    let inflight = this.inflightLabelLookups.get(sid);
+    if (!inflight) {
+      inflight = (async () => {
+        try {
+          const info = await this.client.getSession(sid);
+          const title = (info && info.title) || this.shortIdFallback(sid);
+          this.labelCache.set(sid, {
+            title,
+            directory: info?.directory,
+            parentID: info?.parentID,
+            agent: info?.agent,
+            expiresAt: Date.now() + LABEL_TTL_MS,
+          });
+        } catch (err) {
+          this.log(`[notify] session info fetch for ${sid.slice(0, 12)}… failed: ${String(err)}`);
+        }
+      })();
+      this.inflightLabelLookups.set(sid, inflight);
+      // Always clean up the inflight map so a subsequent hit misses
+      // the cache (TTL hasn't been written) and can retry the fetch.
+      inflight.finally(() => {
+        this.inflightLabelLookups.delete(sid);
       });
     }
+    await inflight;
 
-    // Synchronous fallback: return a short id prefix so the user
-    // still sees something meaningful while the title fetch is in
-    // flight. The next event for this session will get the real
-    // title from the cache.
-    return this.shortIdFallback(sid);
-  }
-
-  private async fetchLabel(sid: string): Promise<void> {
-    let info: SessionLabelInfo | undefined;
-    try {
-      info = await this.client.getSession(sid);
-    } catch (err) {
-      // 404 (session deleted) or network blip — leave the cache alone
-      // so the fallback shortId keeps being used. A subsequent event
-      // for the same sid will retry the lookup. Logged at the
-      // call-site (`resolveLabel`) too, so we keep the log line here
-      // terse to avoid double-logging.
-      this.log(`[notify] label fetch for ${sid.slice(0, 12)}… failed: ${String(err)}`);
-      return;
+    // After the fetch, re-check the cache. A successful fetch writes
+    // to the cache; a failed fetch leaves it untouched and we fall
+    // back to the short id + undefined fields.
+    const updated = this.labelCache.get(sid);
+    if (updated) {
+      return {
+        title: updated.title,
+        directory: updated.directory,
+        parentID: updated.parentID,
+        agent: updated.agent,
+      };
     }
-    const title = (info && info.title) || this.shortIdFallback(sid);
-    this.labelCache.set(sid, { title, expiresAt: Date.now() + LABEL_TTL_MS });
+    return {
+      title: this.shortIdFallback(sid),
+      directory: undefined,
+      parentID: undefined,
+      agent: undefined,
+    };
   }
 
   private shortIdFallback(sid: string): string {
@@ -400,7 +565,7 @@ export class SessionNotifier {
   /** Exposed for tests only. Clears all caches. */
   __resetForTests(): void {
     this.labelCache.clear();
-    this.pendingLabelLookups.clear();
+    this.inflightLabelLookups.clear();
     this.dedupe.clear();
     this.recentlyBusy.clear();
   }

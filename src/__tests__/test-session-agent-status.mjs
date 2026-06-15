@@ -203,3 +203,124 @@ describe("SessionManager.getAgentStatus", () => {
     expect(m.getAgentStatus()).toEqual({ type: "idle" });
   });
 });
+
+// ─── Status reset on session / workspace switch ───
+//
+// Regression: after `dispatch a task on session A` (which makes A
+// `busy` via a `session.status: busy` SSE event), the user does
+// `/s switch 1` to a different session B. Without the fix, A's
+// `lastAgentStatus` (and `isSessionBusy`) leaked into B's display —
+// `/status` would show "🟢 Agent: Running" for B even though B has no
+// activity. The fix: `discardInFlightTurn` (called by both
+// `switchSession` and `switchWorkspace`) now resets both fields to
+// the default in BOTH the with-turn and no-turn branches, so the
+// new session starts with a clean status. The next
+// `session.status` SSE event for the new session populates them
+// again.
+
+describe("SessionManager — status reset on switch", () => {
+  test("switchSession resets lastAgentStatus and isSessionBusy to defaults", async () => {
+    // Mock getSession to return a valid session so switchSession proceeds
+    clientMock.getSession = vi.fn().mockResolvedValue({
+      id: "ses_b",
+      slug: "b",
+      title: "B",
+      directory: "/b",
+      projectID: "p",
+      version: "1",
+    });
+    const m = makeManager("ses_a");
+    // Simulate: session A was busy (SSE event arrived)
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: "ses_a", status: { type: "busy" } },
+    });
+    expect(m.getAgentStatus()).toEqual({ type: "busy" });
+    expect(m.isAgentBusy()).toBe(true);
+
+    // User switches to session B
+    await m.switchSession("ses_b", "/b");
+    // Status display for the NEW session should be the safe default
+    // until its first SSE event arrives — NOT the stale "busy" from A.
+    expect(m.getAgentStatus()).toEqual({ type: "idle" });
+    expect(m.isAgentBusy()).toBe(false);
+  });
+
+  test("switchSession resets even when there was NO active turn (defensive)", async () => {
+    // The `discardInFlightTurn` early-return path (no currentTurn)
+    // must also reset status, otherwise sessions that went busy
+    // via an out-of-band SSE event (no bridge-initiated turn) would
+    // leak their busy state into the next session.
+    clientMock.getSession = vi.fn().mockResolvedValue({
+      id: "ses_b",
+      slug: "b",
+      title: "B",
+      directory: "/b",
+      projectID: "p",
+      version: "1",
+    });
+    const m = makeManager("ses_a");
+    // Simulate a session.status: busy event with NO local turn
+    // (e.g. a sub-agent's busy event was forwarded to the notifier
+    // but somehow set isSessionBusy — or some race condition we
+    // haven't seen but want to be defensive against).
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: "ses_a", status: { type: "retry", attempt: 1 } },
+    });
+    expect(m.isAgentBusy()).toBe(false); // retry path already sets isSessionBusy=false
+    // But lastAgentStatus is still "retry" — must be cleared on switch
+    expect(m.getAgentStatus().type).toBe("retry");
+
+    await m.switchSession("ses_b", "/b");
+    expect(m.getAgentStatus()).toEqual({ type: "idle" });
+  });
+
+  test("switchWorkspace also resets status to defaults", async () => {
+    clientMock.getSession = vi.fn().mockResolvedValue({
+      id: "ses_b",
+      slug: "b",
+      title: "B",
+      directory: "/b",
+      projectID: "p",
+      version: "1",
+    });
+    clientMock.listServerSessions = vi.fn().mockResolvedValue([]);
+    const m = makeManager("ses_a");
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: "ses_a", status: { type: "busy" } },
+    });
+    expect(m.getAgentStatus()).toEqual({ type: "busy" });
+
+    // Existing-session-id path: skip the findRecentSessionInCwd lookup
+    await m.switchWorkspace("/b", "ses_b");
+    expect(m.getAgentStatus()).toEqual({ type: "idle" });
+    expect(m.isAgentBusy()).toBe(false);
+  });
+
+  test("after switch, a fresh session.status event for the new session populates the display", async () => {
+    clientMock.getSession = vi.fn().mockResolvedValue({
+      id: "ses_b",
+      slug: "b",
+      title: "B",
+      directory: "/b",
+      projectID: "p",
+      version: "1",
+    });
+    const m = makeManager("ses_a");
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: "ses_a", status: { type: "busy" } },
+    });
+    await m.switchSession("ses_b", "/b");
+    // Reset to defaults
+    expect(m.getAgentStatus()).toEqual({ type: "idle" });
+    // New session emits its first status event — populated
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: "ses_b", status: { type: "retry", attempt: 2 } },
+    });
+    expect(m.getAgentStatus()).toEqual({ type: "retry", attempt: 2 });
+  });
+});

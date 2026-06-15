@@ -85,6 +85,23 @@ export interface ServerSessionInfo {
     created: number;
     updated: number;
   };
+  /**
+   * Parent session id. Present when this session was spawned by an
+   * agent's `task` tool (sub-agent / child session). The bridge uses
+   * this to disambiguate root sessions from sub-agents in cross-session
+   * notifications. Optional because older opencode server versions may
+   * not return it, and V1 / V2 endpoints have slightly different
+   * field coverage — both V1 and V2 are confirmed to return it for
+   * sub-agents.
+   */
+  parentID?: string;
+  /**
+   * Agent name (e.g. `"build"`, `"designer"`, `"Sisyphus - ultraworker"`).
+   * Optional for the same reason as `parentID`. Surfaces the agent role
+   * in notifications so the user can tell *which* agent is asking
+   * without having to switch to the session first.
+   */
+  agent?: string;
 }
 
 /** Available agent mode. */

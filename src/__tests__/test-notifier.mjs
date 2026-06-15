@@ -25,7 +25,11 @@ import { DEFAULT_NOTIFY_SETTINGS } from "../../dist/src/config.js";
 
 function makeNotifier(opts = {}) {
   const client = {
-    getSession: vi.fn().mockResolvedValue({ id: "ses_x", title: "Test Session" }),
+    getSession: vi.fn().mockResolvedValue({
+      id: "ses_x",
+      title: "Test Session",
+      directory: "/test/cwd",
+    }),
   };
   const send = vi.fn().mockResolvedValue(undefined);
   const log = vi.fn();
@@ -299,7 +303,11 @@ describe("SessionNotifier — label cache", () => {
   test("first event fetches label; subsequent events use cache (no second fetch)", async () => {
     const { n, client, send } = makeNotifier();
     // Override the default mock to control timing
-    client.getSession.mockResolvedValue({ id: "ses_other", title: "My Session" });
+    client.getSession.mockResolvedValue({
+      id: "ses_other",
+      title: "My Session",
+      directory: "/repo",
+    });
 
     await n.handleEvent({
       type: "question.asked",
@@ -333,25 +341,85 @@ describe("SessionNotifier — label cache", () => {
     // And it contains the shortId fallback. `ses_other` is 9 chars
     // (< 16) so the fallback returns the full id verbatim.
     expect(send.mock.calls[0][0]).toContain("ses_other");
+    // But NOT a 📂 line (no directory on the fallback path)
+    expect(send.mock.calls[0][0]).not.toContain("📂");
   });
 
-  test("first event uses shortId fallback while fetch is pending (sync return)", async () => {
+  test("first event AWAITS the fetch — the rendered notification uses the real title + directory", async () => {
+    // Regression test for the bug where the first notification for a
+    // new session was rendered with the short-id fallback (no
+    // directory, no agent, no parentID) because resolveSessionInfo
+    // returned synchronously before the HTTP fetch resolved. The fix
+    // was to actually await the fetch — the first event pays the
+    // round-trip cost, every subsequent event hits the cache.
     const { n, client, send } = makeNotifier();
-    // Make the fetch slow so we can observe the sync return
     let resolveFetch;
     client.getSession.mockImplementation(() => new Promise((r) => { resolveFetch = r; }));
+
+    const handler = n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_other", questions: [sampleQuestion] },
+    });
+    // Notification has NOT been sent yet — handleEvent is awaiting the fetch
+    expect(send).not.toHaveBeenCalled();
+    // Now resolve the fetch with real data
+    resolveFetch({ id: "ses_other", title: "Real Title", directory: "/real" });
+    await handler;
+    // After resolution, the notification uses the REAL title + directory
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toContain('"Real Title"');
+    expect(send.mock.calls[0][0]).toContain("/real");
+    expect(send.mock.calls[0][0]).not.toContain("ses_other");
+  });
+
+  test("cached title + directory both flow through to the rendered notification", async () => {
+    const { n, client, send } = makeNotifier();
+    client.getSession.mockResolvedValue({
+      id: "ses_other",
+      title: "fix-auth",
+      directory: "F:\\opencodeproject\\api",
+    });
 
     await n.handleEvent({
       type: "question.asked",
       properties: { id: "que_1", sessionID: "ses_other", questions: [sampleQuestion] },
     });
-    // At this point the fetch is pending but the notification was
-    // already sent (synchronously resolved) with the fallback label
+    // Allow fetch to resolve
+    await new Promise((r) => setTimeout(r, 10));
+
+    // First notification was sent with fallback (sync return)
     expect(send).toHaveBeenCalledTimes(1);
-    expect(send.mock.calls[0][0]).toContain("ses_other");
-    // Resolve the fetch to clean up
-    resolveFetch({ id: "ses_other", title: "Real Title" });
+    // Second event for the same session — cache is now warm — will
+    // use the real title + directory inline (no async wait).
+    await n.handleEvent({
+      type: "permission.asked",
+      properties: { ...samplePermission, id: "per_2" },
+    });
+    expect(send).toHaveBeenCalledTimes(2);
+    const text = send.mock.calls[1][0];
+    expect(text).toContain('"fix-auth"');
+    expect(text).toContain("F:\\opencodeproject\\api");
+    expect(text).toContain("📂");
+  });
+
+  test("server returning no directory renders without 📂 line", async () => {
+    const { n, client, send } = makeNotifier();
+    // Server response missing `directory` (older opencode or partial mock)
+    client.getSession.mockResolvedValue({ id: "ses_other", title: "no-dir" });
+
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_other", questions: [sampleQuestion] },
+    });
     await new Promise((r) => setTimeout(r, 5));
+    // Trigger a second event so the cache (with title only) is consulted
+    await n.handleEvent({
+      type: "permission.asked",
+      properties: { ...samplePermission, id: "per_2" },
+    });
+    const text = send.mock.calls[1][0];
+    expect(text).toContain('"no-dir"');
+    expect(text).not.toContain("📂");
   });
 });
 
@@ -395,7 +463,7 @@ describe("SessionNotifier — concurrent label fetches for the same sid are dedu
       fetchCount++;
       // Slight delay to allow concurrent calls to queue up
       await new Promise((r) => setTimeout(r, 5));
-      return { id: "ses_new", title: "New" };
+      return { id: "ses_new", title: "New", directory: "/new" };
     });
 
     // Fire two events back-to-back (both miss the cache)
@@ -440,5 +508,238 @@ describe("SessionNotifier — does not throw on bad input", () => {
         properties: { id: "que_1", sessionID: "ses_other", questions: [sampleQuestion] },
       }),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ─── Sub-agent / parentID propagation ───
+
+describe("SessionNotifier — sub-agent fields", () => {
+  test("parentID + agent from server flow into the rendered notice", async () => {
+    const { n, client, send } = makeNotifier();
+    client.getSession.mockResolvedValue({
+      id: "ses_sub",
+      title: "Build game UI components",
+      directory: "F:\\opencodeproject\\doudizhu",
+      parentID: "ses_root",
+      agent: "designer",
+    });
+
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_sub", questions: [sampleQuestion] },
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    // Second event so the cache (with all fields) is consulted
+    await n.handleEvent({
+      type: "permission.asked",
+      properties: { ...samplePermission, id: "per_1", sessionID: "ses_sub" },
+    });
+    const text = send.mock.calls[1][0];
+    expect(text).toContain('"Build game UI components"');
+    expect(text).toContain("🤖 designer");
+    expect(text).toContain("F:\\opencodeproject\\doudizhu");
+  });
+
+  test("root session (no parentID) does NOT get a 🤖 marker", async () => {
+    const { n, client, send } = makeNotifier();
+    client.getSession.mockResolvedValue({
+      id: "ses_root",
+      title: "fix-auth-bug",
+      directory: "/repo",
+    });
+
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_root", questions: [sampleQuestion] },
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    await n.handleEvent({
+      type: "permission.asked",
+      properties: { ...samplePermission, id: "per_1", sessionID: "ses_root" },
+    });
+    const text = send.mock.calls[1][0];
+    expect(text).toContain('"fix-auth-bug"');
+    expect(text).not.toContain("🤖");
+  });
+
+  test("sub-agent with no agent name falls back to 'sub-agent'", async () => {
+    const { n, client, send } = makeNotifier();
+    client.getSession.mockResolvedValue({
+      id: "ses_sub",
+      title: "Anonymous sub",
+      parentID: "ses_root",
+    });
+
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_sub", questions: [sampleQuestion] },
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    await n.handleEvent({
+      type: "permission.asked",
+      properties: { ...samplePermission, id: "per_1", sessionID: "ses_sub" },
+    });
+    const text = send.mock.calls[1][0];
+    expect(text).toContain("🤖 sub-agent");
+  });
+});
+
+// ─── pendingBySession storage for switch-time re-render ───
+
+describe("SessionNotifier — pendingBySession (switch-time re-render)", () => {
+  test("question.asked stores payload keyed by sessionID", async () => {
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_abc", sessionID: "ses_pending", questions: [sampleQuestion] },
+    });
+    const pending = n.consumePendingForSession("ses_pending");
+    expect(pending).not.toBeNull();
+    expect(pending?.kind).toBe("question");
+    expect(pending?.requestID).toBe("que_abc");
+    expect(pending?.question?.question).toBe(sampleQuestion.question);
+  });
+
+  test("permission.asked stores payload keyed by sessionID", async () => {
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "permission.asked",
+      properties: { ...samplePermission, id: "per_xyz", sessionID: "ses_pending" },
+    });
+    const pending = n.consumePendingForSession("ses_pending");
+    expect(pending).not.toBeNull();
+    expect(pending?.kind).toBe("permission");
+    expect(pending?.requestID).toBe("per_xyz");
+  });
+
+  test("consumePendingForSession returns null when nothing pending", () => {
+    const { n } = makeNotifier();
+    expect(n.consumePendingForSession("ses_unknown")).toBeNull();
+  });
+
+  test("consume is destructive — second call returns null", async () => {
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_pending", questions: [sampleQuestion] },
+    });
+    expect(n.consumePendingForSession("ses_pending")).not.toBeNull();
+    expect(n.consumePendingForSession("ses_pending")).toBeNull();
+  });
+
+  test("question.replied clears the stored payload", async () => {
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_pending", questions: [sampleQuestion] },
+    });
+    expect(n.consumePendingForSession("ses_pending")).not.toBeNull();
+    // Simulate a question arriving again, then being replied to
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_pending", questions: [sampleQuestion] },
+    });
+    await n.handleEvent({
+      type: "question.replied",
+      properties: { sessionID: "ses_pending", requestID: "que_1", answers: [["OAuth"]] },
+    });
+    expect(n.consumePendingForSession("ses_pending")).toBeNull();
+  });
+
+  test("question.rejected clears the stored payload", async () => {
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_pending", questions: [sampleQuestion] },
+    });
+    await n.handleEvent({
+      type: "question.rejected",
+      properties: { sessionID: "ses_pending", requestID: "que_1" },
+    });
+    expect(n.consumePendingForSession("ses_pending")).toBeNull();
+  });
+
+  test("permission.replied clears the stored payload", async () => {
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "permission.asked",
+      properties: { ...samplePermission, id: "per_1", sessionID: "ses_pending" },
+    });
+    await n.handleEvent({
+      type: "permission.replied",
+      properties: { sessionID: "ses_pending", requestID: "per_1", reply: "once" },
+    });
+    expect(n.consumePendingForSession("ses_pending")).toBeNull();
+  });
+
+  test("session going idle clears the stored payload (turn abandoned)", async () => {
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_pending", questions: [sampleQuestion] },
+    });
+    // Mark the session as busy first (so the idle event is meaningful)
+    await n.handleEvent({
+      type: "session.status",
+      properties: { sessionID: "ses_pending", status: { type: "busy" } },
+    });
+    await n.handleEvent({
+      type: "session.status",
+      properties: { sessionID: "ses_pending", status: { type: "idle" } },
+    });
+    expect(n.consumePendingForSession("ses_pending")).toBeNull();
+  });
+
+  test("setCurrentSessionId does NOT clear the entry — the bridge's maybeReSurfacePending is the only consumer", async () => {
+    // Regression test for the bug where setCurrentSessionId
+    // proactively deleted the entry from pendingBySession, which
+    // prevented the bridge's switch-time re-render path from
+    // finding it. The fix was to remove the proactive delete —
+    // entries are now only cleared by:
+    //   1. consumePendingForSession (explicit consume on switch)
+    //   2. *.replied / *.rejected SSE echoes
+    //   3. session.status = idle
+    const { n } = makeNotifier();
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_now_current", questions: [sampleQuestion] },
+    });
+    // Simulate: a second event for the same session, then user switches to it
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_2", sessionID: "ses_now_current", questions: [sampleQuestion] },
+    });
+    n.setCurrentSessionId("ses_now_current");
+    // Entry is STILL there — maybeReSurfacePending will consume it
+    expect(n.consumePendingForSession("ses_now_current")).not.toBeNull();
+  });
+
+  test("question payload is stored even when notify kind is disabled (switch re-render still works)", async () => {
+    const { n } = makeNotifier();
+    n.setTypeEnabled("question", false);
+    await n.handleEvent({
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_pending", questions: [sampleQuestion] },
+    });
+    // No notification was sent, but the payload is still stashed
+    const pending = n.consumePendingForSession("ses_pending");
+    expect(pending).not.toBeNull();
+    expect(pending?.kind).toBe("question");
+  });
+
+  test("storing payload does not affect dedupe (events are still deduped on send)", async () => {
+    const { n, send } = makeNotifier();
+    const event = {
+      type: "question.asked",
+      properties: { id: "que_1", sessionID: "ses_pending", questions: [sampleQuestion] },
+    };
+    await n.handleEvent(event);
+    await n.handleEvent(event); // duplicate
+    // First call sent a notification; second was deduped
+    expect(send).toHaveBeenCalledTimes(1);
+    // But consumePendingForSession works regardless (storage is
+    // independent of the send path)
+    const pending = n.consumePendingForSession("ses_pending");
+    expect(pending).not.toBeNull();
   });
 });

@@ -1501,6 +1501,12 @@ const apCmd = parseAutoPermissionCommand(trimmed);
             // cross-session notify feature enabled.
             this.notifier?.setCurrentSessionId(target.sessionId);
             await this.sendReply(contextToken, `✅ Ready on ${newCwd}`);
+            // If the target session had a pending question / permission
+            // (seen earlier by the notifier), re-render the card so the
+            // user can answer it now that they're on the right session.
+            // The consume semantics in the notifier ensure we don't loop
+            // on a stale card on subsequent switches back.
+            await this.maybeReSurfacePending(target.sessionId, contextToken);
           } else {
             const hint = this.lastSessionListFilter
               ? ` (filter: ${this.lastSessionListFilter})`
@@ -1556,6 +1562,51 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         await this.sendReply(contextToken, "Sessions are managed by OpenCode.");
         break;
       }
+    }
+  }
+
+  /**
+   * After a successful `/session switch <n>`, check whether the
+   * target session had a pending question / permission (seen by the
+   * notifier earlier) and re-render the card so the user can answer
+   * it on the new session. The notifier's `consumePendingForSession`
+   * returns the entry AND removes it from its map, so we never
+   * re-surface the same card on a subsequent switch back.
+   *
+   * The synthetic slot adopted on the SessionManager lets the
+   * existing answer / reject / 30-min-timeout flow take over
+   * unchanged — no special-casing in the reply grammar.
+   */
+  private async maybeReSurfacePending(sessionId: string, contextToken: string): Promise<void> {
+    if (!this.sessionManager || !this.notifier) return;
+    const pending = this.notifier.consumePendingForSession(sessionId);
+    if (!pending) return;
+    // Point the SessionManager at the current WeChat chat so the
+    // adopted card and its reply route to the right place. (Without
+    // this, `lastEnqueuedContextToken` would still point at the OLD
+    // session's chat, and the reply would either get lost or go to
+    // the wrong user.)
+    this.sessionManager.setLastEnqueuedContextToken(contextToken);
+    try {
+      if (pending.kind === "question" && pending.question) {
+        this.sessionManager.adoptPendingQuestion(
+          pending.requestID,
+          [pending.question],
+          contextToken,
+        );
+        const card = formatQuestionForWeChat([pending.question]);
+        await this.sendReply(contextToken, `🔔 切到这个会话时有 question 在等着：\n\n${card}`);
+      } else if (pending.kind === "permission" && pending.permission) {
+        this.sessionManager.adoptPendingPermission(
+          pending.requestID,
+          pending.permission,
+          contextToken,
+        );
+        const card = formatPermissionCard(pending.permission);
+        await this.sendReply(contextToken, `🔔 切到这个会话时有 permission 在等着：\n\n${card}`);
+      }
+    } catch (err) {
+      this.log(`[session] re-surface pending failed: ${String(err)}`);
     }
   }
 
