@@ -1908,10 +1908,13 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         // Server doesn't expose /mcp, or call failed — just skip the section.
       }
 
-      // Current session's agent status (SSE-driven, synchronous). Defaults
-      // to { type: "idle" } before the first SSE event has arrived, which
-      // is the safe "we don't know yet" reading.
-      const agentStatus = sessionManager.getAgentStatus();
+      // Current session's agent status (REST-driven, async). Pulls a fresh
+      // snapshot from `GET /session/status` so `/status` shows the server's
+      // truth — not the SSE event cache, which is stale when switching
+      // into a session that was already running before the bridge
+      // observed it. Falls back to the SSE cache on network error; see
+      // `SessionManager.getAgentStatus()` for details.
+      const agentStatus = await sessionManager.getAgentStatus();
 
       // Count of OTHER busy root sessions on the OpenCode Server. Failure
       // here must NOT break /status — wrap in its own try/catch so a

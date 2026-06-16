@@ -306,10 +306,23 @@ export class SessionManager {
   private isSessionBusy = false;
   /**
    * Latest `SessionStatus` payload observed on the SSE `session.status`
-   * event stream for the current session. Mirrors `isSessionBusy` but
-   * preserves the full payload (type + attempt/message/next) so `/status`
-   * can render `🟡 Retrying (attempt 2)` etc. — the boolean alone can't
-   * distinguish `idle` from `retry` and would lose the attempt counter.
+   * event stream for the current session. Two consumers:
+   *
+   *   1. `isSessionBusy` boolean (derived from `type === "busy"`) gates
+   *      the `armFinalizeDebounce` 500ms timer — this MUST stay reactive
+   *      to SSE, not REST, because the bridge needs to know the moment
+   *      the agent becomes idle so the turn can be sent to WeChat with
+   *      zero latency. See `handleSessionStatus`.
+   *   2. `getAgentStatus()` uses it as a FALLBACK when the `/session/status`
+   *      REST call fails — the live `session.status` payload is preferred
+   *      for display because the server's snapshot is more accurate than
+   *      the bridge's event history (see `getAgentStatus` JSDoc).
+   *
+   * Preserves the full payload (type + attempt/message/next) so the
+   * fallback path can still render `🟡 Retrying (attempt 2)` etc. The
+   * boolean alone can't distinguish `idle` from `retry` and would lose
+   * the attempt counter.
+   *
    * Defaults to `{ type: "idle" }` until the first SSE event arrives.
    */
   private lastAgentStatus: SessionStatus = { type: "idle" };
@@ -444,17 +457,41 @@ export class SessionManager {
   }
 
   /**
-   * Return the most recent `SessionStatus` payload observed on the SSE
-   * `session.status` stream for the current session. Used by `/status`
-   * to render the 🟢/⚪/🟡 agent state line.
+   * Fetch the current session's agent status from the OpenCode Server's
+   * `GET /session/status` endpoint and return it. Used by `/status` to
+   * render the 🟢/⚪/🟡 agent state line.
    *
-   * Defaults to `{ type: "idle" }` until the first `session.status` event
-   * has arrived — this is the safe default (no `busy`/`retry` claim is
-   * made before the server has actually reported status). Returns a
-   * deep-readonly view; callers must not mutate it.
+   * Why a REST call instead of the cached SSE `session.status` payload:
+   * SSE is an event stream, not a snapshot — the bridge only learns the
+   * state when the server EMITS a transition. If you `/session switch` to
+   * a session that was already running (or the bridge itself just
+   * started), no `session.status` event has arrived yet for that
+   * session, so the SSE cache would return the default `{ type: "idle" }`
+   * and the user would see "Idle" even though the agent is mid-turn.
+   * The REST endpoint returns the server's current truth regardless of
+   * the bridge's event history.
+   *
+   * When no `sessionId` is set yet (bridge has not created/resumed a
+   * session), returns `null` so the caller can render `(unknown)`.
+   *
+   * Fallback: if the REST call fails (network blip, server restart in
+   * progress, older server without `/session/status`), returns the SSE
+   * cache `lastAgentStatus` as a best-effort estimate. This is still
+   * better than failing the entire `/status` command — the user sees
+   * "Idle" at worst, not an error.
    */
-  getAgentStatus(): Readonly<SessionStatus> {
-    return this.lastAgentStatus;
+  async getAgentStatus(): Promise<Readonly<SessionStatus> | null> {
+    if (!this.sessionId) return null;
+    try {
+      const all = await this.client.getAllSessionStatuses();
+      const found = all[this.sessionId];
+      const summary = `keys=[${Object.keys(all).join(",")}] lookup=${this.sessionId.slice(0, 12)}…→${found ? "FOUND" : "MISS"}`;
+      this.log(`[status] /session/status: ${summary}`);
+      return found ?? { type: "idle" };
+    } catch (err) {
+      this.log(`[status] /session/status fetch failed; falling back to SSE cache: ${String(err)}`);
+      return this.lastAgentStatus;
+    }
   }
 
   /**
