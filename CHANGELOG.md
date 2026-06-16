@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-06-16
+
+### Added
+- **`/history` command** (alias `/hist`): show the most recent N messages from the current session as a chat log. Default N=5, range 1-20; invalid N rejected without silent clamp. Read-only — works while the agent is busy. Fetches via `GET /session/:id/message?limit=N` and renders chronological order (oldest at top, newest at bottom). Header shows session title and cwd. Over-fetches by 3× and skips tool-only turns so the rendered count matches the user's request.
+
+### Changed
+- **`/status` agent state now reads from REST instead of the SSE cache.** Replaces the in-memory `lastAgentStatus` snapshot with a live `GET /session/status` lookup, so a freshly switched-to session reports its real `busy` / `idle` / `retry` state immediately instead of waiting for the first SSE event. Falls back to the SSE cache only on network failure.
+
+### Fixed
+- **`/history` displayed `(model unknown)` for every assistant turn.** The OpenCode Server's `Assistant` schema (packages/core/src/v1/session.ts:455-487) returns FLAT `info.modelID` + `info.providerID`, not the nested `info.model` shape the bridge's older `MessageInfo` type declared. The formatter now reads both shapes and prefers flat, so `/history` correctly shows `e.g. opencode-go/deepseek-v4-flash`.
+- **`/history` header count mismatched the request** when tool-only turns were interleaved. `/history 5` on a session with 2 tool-only turns used to render `📜 最近 3 条消息` (filtered count). Now over-fetches 3× (capped at 60), picks the LAST N text-bearing messages, and the header always reads `📜 最近 5 条消息` — appending `(实际显示 X 条)` only when the over-fetched window genuinely doesn't have N text turns.
+- **`/history` order was newest-first despite claiming chronological.** The server's `MessageV2.page()` already calls `items.reverse()` server-side (message-v2.ts:471), so the bridge's `.reverse()` was double-flipping. Removed; display is now genuinely oldest-first.
+- **`/tool-display` re-emitted the same `⏳ tool …` / `✅ tool …` line every turn for long-running tools.** The session-level `toolLastSentStatus: Map<callID, lastStatus>` now survives turn finalization, so a tool like `bash ping -n 120 127.0.0.1` only fires one `⏳` then one `✅` across multiple SSE-driven flushes, not one per flush.
+
 ## [1.3.5] - 2026-06-15
 
 ### Added
