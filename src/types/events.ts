@@ -418,30 +418,13 @@ export interface AccumulatedTurn {
    * for the operator.
    */
   reasoningPartTimestamps: Map<string, { startMs: number; endMs: number }>;
-  /**
-   * Set of tool `callID`s that have already been included in a
-   * `🔧 Tools: …` summary emitted to WeChat during this turn.
-   *
-   * Used to support the "consecutive tools get combined, separate
-   * tools get individual summaries" rule (user-stated): when
-   * `maybeFlushToolSummary` runs, it emits a summary line containing
-   * ONLY the tools whose `callID` is NOT in this set. The set is
-   * updated to include those `callID`s after the summary is sent.
-   *
-   * Trace for `R, T1, Text, R, T2, Text`:
-   *   - T1 tracked (set empty)
-   *   - Text1 → flush: new tools = {T1}, summary = "T1", set += {T1}
-   *   - T2 tracked (set = {T1})
-   *   - Text2 → flush: new tools = {T2}, summary = "T2", set += {T1,T2}
-   *   - Output: R1, "🔧 Tools: T1", Text1, R2, "🔧 Tools: T2", Text2
-   *
-   * Trace for `R, T1, T2, T3, R, Text` (consecutive):
-   *   - T1, T2, T3 tracked (set empty)
-   *   - R → flush: new tools = {T1,T2,T3}, summary combined, set += all
-   *   - Text → flush: new tools = {} (all in set), no-op
-   *   - Output: R1, "🔧 Tools: T1,T2,T3", R2, Text
-   */
-  toolCallIdsInLastSummary: Set<string>;
+  // (Removed: per-turn `toolCallIdsInLastSummary` Set was replaced by a
+  // session-level `toolLastSentStatus` Map on SessionManager. The Map
+  // survives premature turn finalizations that create an implicit turn
+  // via `ensureTurnForEvent`, so long-running tools (e.g. `bash ping
+  // -n 120`) no longer re-emit the same `⏳ bash …` summary multiple
+  // times when the SSE-driven turn finalizes mid-execution. See
+  // `SessionManager.toolLastSentStatus` and `maybeFlushToolSummary`.)
   // ─── Type-change-based flushing state ────────────────────────────────
   // The "current part" is the one being accumulated RIGHT NOW. When a
   // new part of a DIFFERENT type arrives (R / TOOL / TEXT), the current

@@ -109,7 +109,6 @@ function makeManagerWithInflightTurn() {
     reasoningEndMs: null,
     sentReasoningPartIds: new Set(),
     reasoningPartTimestamps: new Map(),
-    toolCallIdsInLastSummary: new Set(),
     // The smoking gun: a text part is being accumulated but not yet sent
     // (waiting for the next type change or turn end).
     currentPartType: "text",

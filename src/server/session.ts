@@ -331,6 +331,31 @@ export class SessionManager {
   /** Hard timeout timer in case events stop arriving entirely. */
   private stuckTimer: ReturnType<typeof setTimeout> | null = null;
   /**
+   * Session-level dedup map for the tool summary: `callID` → last status
+   * that was emitted to WeChat for that tool. Survives turn finalization
+   * (intentionally NOT per-turn) so long-running tools that span multiple
+   * SSE-driven turn finalizations (e.g. `bash ping -n 120 127.0.0.1`)
+   * don't re-emit the same `⏳ bash …` line every time `ensureTurnForEvent`
+   * starts a fresh implicit turn.
+   *
+   * A tool is included in the next flush only if its current `status`
+   * DIFFERS from the last status we sent for it. So:
+   *   - first observation of a tool with `status="running"` → emit
+   *     `⏳ bash …`, record lastSent["callID"] = "running"
+   *   - same tool, second `message.part.updated` with `status="running"`
+   *     → SKIP (no change)
+   *   - same tool, later `status="completed"` → DIFFERENT → emit
+   *     `✅ bash …`, record lastSent["callID"] = "completed"
+   *   - subsequent updates with `status="completed"` → SKIP
+   *
+   * Cleared in `discardInFlightTurn` on session switch so the next
+   * session starts fresh (callIDs from a different session must NOT be
+   * shared). Not persisted across bridge restarts — a tool that was
+   * already `⏳`-displayed before a bridge restart will show `✅` once
+   * after restart (cosmetic only; rare event).
+   */
+  private toolLastSentStatus: Map<string, TrackedTool["status"]> = new Map();
+  /**
    * Most recent contextToken from an enqueue() call. Used as the fallback
    * contextToken for "implicit" turns created by ensureTurnForEvent — i.e.
    * additional assistant responses that arrive via SSE after a turn has
@@ -613,6 +638,13 @@ export class SessionManager {
       // session's `/status` display until the next SSE event arrives.
       this.isSessionBusy = false;
       this.lastAgentStatus = { type: "idle" };
+      // Clear the session-level tool-summary dedup map: the new
+      // session's callIDs must NOT inherit "already-sent" state from
+      // the old session. The Map is session-scoped, not bridge-scoped.
+      if (this.toolLastSentStatus.size > 0) {
+        this.log(`[switch] clearing ${this.toolLastSentStatus.size} tool-summary dedup entries for new session`);
+        this.toolLastSentStatus.clear();
+      }
       return;
     }
     this.log(
@@ -630,6 +662,13 @@ export class SessionManager {
     // "busy" badge to leak through. The next `session.status` SSE event
     // for the new session will update both fields.
     this.lastAgentStatus = { type: "idle" };
+    // Clear the session-level tool-summary dedup map: the new session's
+    // callIDs must NOT inherit "already-sent" state from the old
+    // session. The Map is session-scoped, not bridge-scoped.
+    if (this.toolLastSentStatus.size > 0) {
+      this.log(`[switch] clearing ${this.toolLastSentStatus.size} tool-summary dedup entries for new session`);
+      this.toolLastSentStatus.clear();
+    }
     if (oldCtx) {
       this.cancelTyping?.(oldCtx).catch(() => {});
     }
@@ -1698,12 +1737,8 @@ export class SessionManager {
       currentReasoningEndMs: null,
       currentText: "",
       currentToolKey: null,
-      // Tool summary state. `toolCallIdsInLastSummary` is the set of
-      // tool `callID`s already included in a previously-emitted
-      // summary. Fresh per turn so a new turn never inherits
-      // stale callIDs. See `maybeFlushToolSummary` for the
-      // consecutive-vs-separate logic.
-      toolCallIdsInLastSummary: new Set<string>(),
+      // Tool summary dedup is session-level (`toolLastSentStatus` on
+      // SessionManager), NOT per-turn — see the field's JSDoc for why.
       // Per-reasoning-part streaming timestamps. Populated by
       // `accumulateReasoningDelta`, read by `handleReasoningPart`.
       reasoningPartTimestamps: new Map(),
@@ -2991,30 +3026,44 @@ export class SessionManager {
    * Pass-through semantics: this is a NO-OP unless ALL of the
    * following are true: tools have been called (`toolCalls.size > 0`),
    * the summary flag is on (`showToolsSnapshot`), and at least one
-   * tool hasn't been included in a previous summary this turn
-   * (otherwise the non-tool boundary was a no-op). Tools are tracked
+   * tool's CURRENT `status` DIFFERS from the last status we sent for
+   * it (otherwise the boundary was a no-op). Tools are tracked
    * silently; the summary is a single WeChat message emitted at the
-   * boundary, covering only the tools that arrived since the last
-   * flush.
+   * boundary, covering only the tools whose state changed since the
+   * last flush.
+   *
+   * Dedup is **session-level** via `this.toolLastSentStatus` (a Map of
+   * `callID → lastSentStatus`), NOT per-turn. This is the fix for the
+   * long-running-tool duplicate-emission bug: when a tool runs for
+   * longer than the 500ms finalize debounce, the turn finalizes mid-
+   * execution, and any subsequent `message.part.updated` for the same
+   * tool creates a new implicit turn via `ensureTurnForEvent`. A
+   * per-turn Set would be reset on that implicit turn and re-send the
+   * same `⏳ bash …` summary. The session-level Map survives the
+   * turn boundary and dedupes correctly. See `toolLastSentStatus`
+   * JSDoc for full rationale.
    */
   private maybeFlushToolSummary(turn: AccumulatedTurn): void {
     if (turn.toolCalls.size === 0) return;
     if (!turn.showToolsSnapshot) return;
     if (!turn.contextToken) return;
-    // Find tools that haven't been summarized yet.
+    // Find tools whose CURRENT status differs from the last status we
+    // sent to WeChat. A brand-new callID (not in the map) is always
+    // included regardless of status. Same-status repeats are skipped.
     const newTools = new Map<string, TrackedTool>();
     for (const [callID, tracked] of turn.toolCalls) {
-      if (!turn.toolCallIdsInLastSummary.has(callID)) {
+      const lastSent = this.toolLastSentStatus.get(callID);
+      if (lastSent !== tracked.status) {
         newTools.set(callID, tracked);
       }
     }
     if (newTools.size === 0) return;
     const toolSummary = this.buildToolSummaryFromMap(newTools);
     if (!toolSummary) return;
-    for (const callID of newTools.keys()) {
-      turn.toolCallIdsInLastSummary.add(callID);
+    for (const [callID, tracked] of newTools) {
+      this.toolLastSentStatus.set(callID, tracked.status);
     }
-    this.log(`[tool-summary] flushing ${newTools.size} new tool(s) at non-tool boundary (total tracked: ${turn.toolCalls.size})`);
+    this.log(`[tool-summary] flushing ${newTools.size} tool(s) with new status at non-tool boundary (total tracked: ${turn.toolCalls.size})`);
     this.onReply(turn.contextToken, toolSummary).catch((err) => {
       this.log(`onReply error for tool summary: ${String(err)}`);
     });

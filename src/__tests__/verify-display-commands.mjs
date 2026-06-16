@@ -354,7 +354,6 @@ function makeTurnForReasoningTest(overrides) {
     reasoningStartMs: Date.now() - 2000,
     reasoningEndMs: Date.now() - 100,
     sentReasoningPartIds: new Set(),
-    toolCallIdsInLastSummary: new Set(),
     reasoningPartTimestamps: new Map(),
     ...overrides,
   };
@@ -547,11 +546,13 @@ test("maybeSendTextPart flushes tool summary BEFORE the first text part (showToo
   expect(replyCalls[0].includes("bash") && replyCalls[0].includes("lsp_status")).toBeTruthy();
   expect(replyCalls[1]).toBe(textPart.text);
 
-  // After flushing, all tracked callIDs must be in the "summarized" set
-  // so a subsequent flush for the same tools is a no-op.
-  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
-  expect(turn.toolCallIdsInLastSummary.has("call-1")).toBeTruthy();
-  expect(turn.toolCallIdsInLastSummary.has("call-2")).toBeTruthy();
+  // After flushing, all tracked callIDs must be in the session-level
+  // dedup Map so a subsequent flush for the same tools (same status) is
+  // a no-op. The Map records the LAST-SENT status per callID, not just
+  // a Set membership, so status-change flushes still work.
+  expect(sm["toolLastSentStatus"].size).toBe(2);
+  expect(sm["toolLastSentStatus"].get("call-1")).toBe("completed");
+  expect(sm["toolLastSentStatus"].get("call-2")).toBe("error");
 });
 
 test("maybeSendTextPart does NOT re-emit tool summary on subsequent text parts", async () => {
@@ -608,7 +609,7 @@ test("maybeSendTextPart does NOT emit tool summary when showTools=off (snapshot)
   // Only the text should be sent — the snapshot was off at turn start.
   expect(replyCalls.length).toBe(1);
   expect(replyCalls[0]).toBe("Just the text.");
-  expect(turn.toolCallIdsInLastSummary.size).toBe(0);
+  expect(sm["toolLastSentStatus"].size).toBe(0);
 });
 
 test("maybeFlushToolSummary is a no-op when there are no tools to summarize", async () => {
@@ -630,7 +631,7 @@ test("maybeFlushToolSummary is a no-op when there are no tools to summarize", as
   await Promise.resolve();
 
   expect(replyCalls.length).toBe(0);
-  expect(turn.toolCallIdsInLastSummary.size).toBe(0);
+  expect(sm["toolLastSentStatus"].size).toBe(0);
 });
 
 test("handleReasoningPart flushes tool summary BEFORE the reasoning line (post-tool reasoning)", async () => {
@@ -664,7 +665,7 @@ test("handleReasoningPart flushes tool summary BEFORE the reasoning line (post-t
   expect(replyCalls.length).toBe(2);
   expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
   expect(replyCalls[1].startsWith("🧠 Thought ·")).toBeTruthy();
-  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
+  expect(sm["toolLastSentStatus"].size).toBe(2);
 });
 
 test("finalizeTurn flushes tool summary as fallback when there are tools but NO non-tool event followed", async () => {
@@ -692,7 +693,7 @@ test("finalizeTurn flushes tool summary as fallback when there are tools but NO 
 
   expect(replyCalls.length).toBe(1);
   expect(replyCalls[0].startsWith("🔧 Tools:")).toBeTruthy();
-  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
+  expect(sm["toolLastSentStatus"].size).toBe(2);
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -861,9 +862,9 @@ test("user scenario C: R → T → Text → R → T → Text produces [R, T, Tex
   expect(replyCalls[4].includes("bash")).toBeFalsy();
   expect(replyCalls[5]).toBe("TEXT-2");
 
-  // Both tool callIDs must be in the "summarized" set so a re-flush
-  // is a no-op.
-  expect(turn.toolCallIdsInLastSummary.size).toBe(2);
+  // Both tool callIDs must be in the session-level dedup Map so a
+  // re-flush with the same status is a no-op.
+  expect(sm["toolLastSentStatus"].size).toBe(2);
 });
 
 test("reasoning duration is per-part (NOT cumulative across tools between parts)", async () => {
@@ -1900,7 +1901,7 @@ test("buffered text part does NOT flush tools tracked after the buffer (preserve
   // (it stays in toolCalls, waiting for the next non-tool boundary).
   expect(replyCalls.length).toBe(1);
   expect(replyCalls[0]).toBe("OK");
-  expect(turn.toolCallIdsInLastSummary.size).toBe(0);
+  expect(sm["toolLastSentStatus"].size).toBe(0);
   // The tool is still tracked, awaiting flush at the next non-tool boundary.
   expect(turn.toolCalls.size).toBe(1);
   expect(turn.toolCalls.has("w1")).toBeTruthy();
