@@ -24,6 +24,7 @@ import {
   parseThoughtDisplayCommand,
   parseToolDisplayCommand,
   parseCompactCommand,
+  parseHistoryCommand,
   formatStatus,
 } from "../../dist/src/adapter/workspace-cmd.js";
 
@@ -58,6 +59,31 @@ const compactCases = [
   { input: "compact this",    expected: null,               label: "non-slash rejected" },
 ];
 
+// 11 cases for parseHistoryCommand:
+//   - bare /history → default count 5
+//   - case-insensitive /HIST
+//   - /history 10 → explicit count
+//   - /hist 3 → short alias
+//   - /hist 20 → boundary (max)
+//   - rejections: 0, abc, -1, 999, 21, /historys
+// The parser enforces a strict N (1-20) — no silent clamp — so a typo
+// like "9999" rejects rather than returning 20 silently. The bridge
+// handler treats `count` as already-validated; this unit test locks in
+// the contract.
+const historyCases = [
+  { input: "/history",     expected: { kind: "history", count: 5 },  label: "bare /history → default 5" },
+  { input: "/HIST",        expected: { kind: "history", count: 5 },  label: "case-insensitive /HIST" },
+  { input: "/history 10",  expected: { kind: "history", count: 10 }, label: "explicit count 10" },
+  { input: "/hist 3",      expected: { kind: "history", count: 3 },  label: "short alias + count" },
+  { input: "/hist 20",     expected: { kind: "history", count: 20 }, label: "max boundary 20" },
+  { input: "/history 0",   expected: null,                             label: "zero rejected" },
+  { input: "/history abc", expected: null,                             label: "non-numeric rejected" },
+  { input: "/history -1",  expected: null,                             label: "negative rejected" },
+  { input: "/history 999", expected: null,                             label: "out-of-range 999 rejected (no silent clamp)" },
+  { input: "/history 21",  expected: null,                             label: "out-of-range 21 rejected" },
+  { input: "/historys",    expected: null,                             label: "different word /historys rejected" },
+];
+
 describe("parseThoughtDisplayCommand", () => {
   for (const c of thoughtCases) {
     test(`${c.label}: ${JSON.stringify(c.input)} → ${JSON.stringify(c.expected)}`, () => {
@@ -78,6 +104,14 @@ describe("parseCompactCommand", () => {
   for (const c of compactCases) {
     test(`${c.label}: ${JSON.stringify(c.input)} → ${JSON.stringify(c.expected)}`, () => {
       expect(parseCompactCommand(c.input)).toEqual(c.expected);
+    });
+  }
+});
+
+describe("parseHistoryCommand", () => {
+  for (const c of historyCases) {
+    test(`${c.label}: ${JSON.stringify(c.input)} → ${JSON.stringify(c.expected)}`, () => {
+      expect(parseHistoryCommand(c.input)).toEqual(c.expected);
     });
   }
 });

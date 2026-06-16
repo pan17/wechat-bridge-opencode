@@ -4,7 +4,16 @@
  * Replaces ACP-specific types with OpenCode Server message format.
  */
 
-/** A single part of a message sent to/received from the agent. */
+import type { MessageInfo, Part } from "./types/events.js";
+
+/**
+ * A single part of an OUTBOUND message — what the bridge sends TO the
+ * OpenCode Server via `POST /session/:id/message`. The server accepts a
+ * flat text-only payload for prompts; the richer `Part` union from
+ * `./types/events.js` is the shape the server RETURNS in
+ * `GET /session/:id/message`, which is modeled separately as
+ * `MessageResponse.parts` below.
+ */
 export type MessagePart = TextPart;
 
 export interface TextPart {
@@ -32,30 +41,22 @@ export interface MediaContent {
   fileName?: string;
 }
 
-/** Response from POST /session/:id/message. */
+/**
+ * Response from `GET /session/:id/message` (and the per-message entries
+ * in the array returned by that endpoint). Mirrors the real OpenCode
+ * Server payload shape:
+ *   { info: MessageInfo, parts: Part[] }
+ *
+ * `MessageInfo` carries message-level metadata (id, role, parentID,
+ * created/completed timestamps, agent, model, variant, tokens, cost,
+ * error). `Part` is the discriminated union of all part types
+ * (text | tool | file | reasoning | step-start | step-finish | snapshot)
+ * from `./types/events.js`. The server returns these newest-first; the
+ * bridge reverses them for chronological display.
+ */
 export interface MessageResponse {
-  info?: {
-    tokens?: {
-      input?: number;
-      output?: number;
-      total?: number;
-    };
-  };
-  parts: MessageResponsePart[];
-}
-
-export type MessageResponsePart = TextPart | ToolUsePart | ToolResultPart;
-
-export interface ToolUsePart {
-  type: "tool_use";
-  name: string;
-  input: unknown;
-}
-
-export interface ToolResultPart {
-  type: "tool_result";
-  name: string;
-  result: string;
+  info: MessageInfo;
+  parts: Part[];
 }
 
 /** Project info from the server. */

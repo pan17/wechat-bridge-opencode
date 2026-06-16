@@ -17,7 +17,8 @@
  */
 
 import type { McpServerStatus } from "../types.js";
-import type { SessionStatus } from "../types/events.js";
+import type { MessageResponse } from "../types.js";
+import type { SessionStatus, TextPart as EventTextPart } from "../types/events.js";
 import type { NotifySettings } from "../config.js";
 
 export interface WorkspaceCommand {
@@ -142,6 +143,25 @@ export interface NotifyCommand {
   kind: "notify";
   mode: "on" | "off" | "status";
   type?: "question" | "permission" | "error" | "completion";
+}
+
+/**
+ * `/history` (alias `/hist`) — show the most recent N messages from the
+ * current session, in chronological order. The bridge has no native
+ * chat history view in WeChat (a turn's text streams in via SSE and is
+ * never re-summarized on disk), so this command gives the user a
+ * one-shot "what did we just talk about" view, useful after switching
+ * sessions or returning to the bot after a long absence.
+ *
+ * Optional trailing positive integer N: default 5, clamped 1-20 at
+ * render time. The parser itself rejects 0, negatives, and >20 as
+ * ambiguous — the user explicitly asked for "exactly N", and a typo
+ * ("9999") would otherwise silently clamp to 20 and look like a bug.
+ */
+export interface HistoryCommand {
+  kind: "history";
+  /** Always defined after parsing; default 5, range 1-20. */
+  count: number;
 }
 
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
@@ -516,6 +536,39 @@ export function parseNotifyCommand(text: string): NotifyCommand | null {
   return null;
 }
 
+/** Inclusive lower bound for `/history N` count. */
+const HISTORY_COUNT_MIN = 1;
+/** Inclusive upper bound for `/history N` count. */
+const HISTORY_COUNT_MAX = 20;
+/** Default count when `/history` is invoked without a number. */
+const HISTORY_COUNT_DEFAULT = 5;
+
+/**
+ * Parse `/history` (or short alias `/hist`) to fetch the most recent N
+ * messages from the current session. Accepts a single optional trailing
+ * positive integer; anything else (non-numeric, zero, negative, >20,
+ * extra trailing args) is rejected so the dispatcher can fall through
+ * to the "unknown slash command" hint or forward the input to the agent
+ * — we don't want `/history 9999` to silently clamp to 20, or
+ * `/history abc` to match the bare default. Case-insensitive.
+ */
+export function parseHistoryCommand(text: string): HistoryCommand | null {
+  const trimmed = text.trim();
+  // Bare `/history` (or `/hist`) → default count.
+  if (/^\/(?:history|hist)\s*$/i.test(trimmed)) {
+    return { kind: "history", count: HISTORY_COUNT_DEFAULT };
+  }
+  // `/history N` (or `/hist N`) — N must be an integer in [1, 20].
+  const m = trimmed.match(/^\/(?:history|hist)\s+(\d+)\s*$/i);
+  if (!m) return null;
+  const n = Number.parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n < HISTORY_COUNT_MIN || n > HISTORY_COUNT_MAX) {
+    // 0, negative, or >20 — reject explicitly per the strict-N contract.
+    return null;
+  }
+  return { kind: "history", count: n };
+}
+
 export function formatWorkspaceList(
   workspaces: Array<{ cwd: string }>,
   activeCwd: string | null,
@@ -760,6 +813,120 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 1) + "…";
 }
 
+/**
+ * Format the `/history` reply for WeChat. The input is the LAST N
+ * messages returned by `GET /session/:id/message?limit=N` (newest
+ * first) — the caller is expected to REVERSE them to chronological
+ * order before passing in. Only text parts are surfaced; tool,
+ * reasoning, file, step-* and snapshot parts are skipped per the
+ * "history = chat log" contract.
+ *
+ * Output shape:
+ *
+ *   📜 最近 {count} 条消息:
+ *
+ *   👤 [10:23:15] 你:
+ *   {first 500 chars of concatenated text parts}
+ *
+ *   ───
+ *   🤖 [10:23:42] build / claude-sonnet-4-5:
+ *   {first 500 chars}
+ *   ───
+ *   ...
+ *
+ * Edge cases:
+ *   - `sessionId` is null → returns a "no active session" warning.
+ *   - `messages` is empty → returns "no messages yet".
+ *   - Each message's text parts are concatenated (a single assistant
+ *     turn can have multiple text parts when a tool interrupts);
+ *     truncation per-message keeps the total reply under the 4000-char
+ *     WeChat budget.
+ */
+export function formatHistoryForWeChat(opts: {
+  sessionId: string | null;
+  messages: Array<{
+    info: {
+      role: "user" | "assistant";
+      time?: { created?: number; completed?: number };
+      agent?: string;
+      model?: { providerID: string; modelID: string };
+    };
+    parts: Array<{ type: "text"; text: string }>;
+  }>;
+  /** Current workspace cwd — surfaced in the header so the user knows which session this is. */
+  cwd: string;
+  /** The count the user actually asked for (default 5, 1-20). */
+  maxCount: number;
+}): string {
+  if (opts.sessionId === null) {
+    return "⚠️ 当前没有活动会话";
+  }
+  if (opts.messages.length === 0) {
+    return "📜 当前会话暂无消息。";
+  }
+
+  // Show the actual number returned in case the server returned fewer
+  // than `maxCount` (e.g. brand-new session with 2 messages and N=5).
+  const actual = opts.messages.length;
+  const lines: string[] = [];
+  lines.push(`📜 最近 ${actual} 条消息 (工作区: ${opts.cwd}):`);
+  lines.push("");
+
+  for (let i = 0; i < opts.messages.length; i++) {
+    const m = opts.messages[i];
+    // Concatenate text parts only — non-text parts (tool, reasoning, file,
+    // step-*, snapshot) are intentionally skipped per the "chat log"
+    // contract for `/history`.
+    const text = m.parts
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("");
+    const truncated = text.length > 500 ? text.slice(0, 499) + "…" : text;
+
+    if (m.info.role === "assistant") {
+      // Assistant line carries the agent + model so the user can tell
+      // which model produced each reply (a single session can switch
+      // models via /model switch mid-conversation).
+      const header = "🤖";
+      const meta = formatAssistantMeta(m.info.agent, m.info.model);
+      lines.push(`${header} [${formatTime(m.info.time?.completed ?? m.info.time?.created)}] ${meta}:`);
+    } else {
+      lines.push(`👤 [${formatTime(m.info.time?.created)}] 你:`);
+    }
+    // Preserve user-typed line breaks (we split on \n). Indent each
+    // body line by 2 spaces for visual nesting under the header.
+    if (truncated.length === 0) {
+      lines.push("  (空消息)");
+    } else {
+      for (const bodyLine of truncated.split("\n")) {
+        lines.push(`  ${bodyLine}`);
+      }
+    }
+    if (i < opts.messages.length - 1) {
+      lines.push("");
+      lines.push("───");
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatTime(epochMs: number | undefined): string {
+  if (typeof epochMs !== "number" || !Number.isFinite(epochMs)) return "--:--:--";
+  const d = new Date(epochMs);
+  if (Number.isNaN(d.getTime())) return "--:--:--";
+  // Local-time HH:MM:SS — matches the format the user sees in their
+  // WeChat client and the session UI.
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function formatAssistantMeta(agent: string | undefined, model: { providerID: string; modelID: string } | undefined): string {
+  const agentName = agent ?? "assistant";
+  const modelName = model ? `${model.providerID}/${model.modelID}` : "(model unknown)";
+  return `${agentName} / ${modelName}`;
+}
+
 function formatProgressBar(pct: number): string {
   const total = 20;
   const filled = Math.round((pct / 100) * total);
@@ -833,6 +1000,11 @@ export function formatHelp(): string {
     "── Context ──",
     "  /compact                 压缩当前会话的上下文（用当前 model 调用 server summarize）",
     "  （简写: /summarize）",
+    "",
+    "── 历史 ──",
+    "  /history                 显示当前会话最近 5 条消息（user/assistant，仅文本）",
+    "  /history <N>             显示最近 N 条消息（N: 1-20）",
+    "  （简写: /hist ...）",
     "",
     "── 系统 ──",
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
@@ -924,6 +1096,11 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "  /compact                 压缩当前会话的上下文（用当前 model 调用 server summarize）",
     "  （简写: /summarize）",
     "",
+    "── 历史 ──",
+    "  /history                 显示当前会话最近 5 条消息（user/assistant，仅文本）",
+    "  /history <N>             显示最近 N 条消息（N: 1-20）",
+    "  （简写: /hist ...）",
+    "",
     "── 系统 ──",
     "  /version                 查询 Bridge、OpenCode Server 与 npm 上最新版本",
     "",
@@ -976,4 +1153,53 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Fetch the most recent N messages for the current session and format
+ * them for WeChat. Centralizes the `/history` orchestration so the
+ * bridge handler stays a thin wrapper and the function is unit-testable
+ * with a stubbed client (no need to instantiate the full WeChatOpencodeBridge).
+ *
+ * Behavior:
+ *   - `sessionId === null`          → returns the "no active session" warning.
+ *   - `fetch` returns an empty list → returns "no messages yet".
+ *   - `fetch` throws                → propagates the error; the bridge
+ *                                     wraps this in its own try/catch and
+ *                                     converts to a user-facing ⚠️ message.
+ *   - `fetch` returns N messages    → reversed to chronological order,
+ *                                     filtered to text parts only, and
+ *                                     formatted via `formatHistoryForWeChat`.
+ *
+ * The `fetch` callback is the only seam tests need: a `(id, count) => Promise<MessageResponse[]>`
+ * signature that maps directly to `OpenCodeServerClient.getSessionMessages`.
+ */
+export async function fetchAndFormatHistory(opts: {
+  sessionId: string | null;
+  count: number;
+  cwd: string;
+  fetch: (sessionId: string, count: number) => Promise<MessageResponse[]>;
+}): Promise<string> {
+  if (opts.sessionId === null) {
+    return formatHistoryForWeChat({
+      sessionId: null,
+      messages: [],
+      cwd: opts.cwd,
+      maxCount: opts.count,
+    });
+  }
+  const raw = await opts.fetch(opts.sessionId, opts.count);
+  // Server returns newest-first; reverse to chronological order for display.
+  const messages = raw.slice().reverse();
+  return formatHistoryForWeChat({
+    sessionId: opts.sessionId,
+    messages: messages.map((m) => ({
+      info: m.info,
+      parts: m.parts
+        .filter((p): p is EventTextPart => p.type === "text")
+        .map((p) => ({ type: "text" as const, text: p.text })),
+    })),
+    cwd: opts.cwd,
+    maxCount: opts.count,
+  });
 }

@@ -45,9 +45,11 @@ import {
   parseNotifyCommand,
   parseVersionCommand,
   parseHelpCommand,
+  parseHistoryCommand,
   formatHelpWithNativeCommands,
   formatStatus,
   formatWorkspaceList,
+  fetchAndFormatHistory,
 } from "./adapter/workspace-cmd.js";
 import type { WeChatOpencodeConfig } from "./config.js";
 import type { NotifySettings } from "./config.js";
@@ -968,6 +970,14 @@ export class WeChatOpencodeBridge {
       if (restartCmd) {
         this.handleRestartCommand(contextToken, restartCmd).catch((err) => {
           this.log(`Restart command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const historyCmd = parseHistoryCommand(textContent);
+      if (historyCmd) {
+        this.handleHistoryCommand(contextToken, historyCmd).catch((err) => {
+          this.log(`History command error: ${String(err)}`);
         });
         return;
       }
@@ -2134,6 +2144,57 @@ const apCmd = parseAutoPermissionCommand(trimmed);
     }
   }
 
+  // ─── History command (/history, /hist) ───
+
+  /**
+   * Handle the `/history` (alias `/hist`) command — show the most recent
+   * N messages from the CURRENT session in chronological order. The
+   * bridge never persisted a chat log, so this is a live read of the
+   * OpenCode Server's session history via `GET /session/:id/message?limit=N`.
+   *
+   * Unlike `/compact` this command does NOT block on `isAgentBusy()` —
+   * it's a pure read of past messages, safe to run mid-turn. The
+   * server returns messages newest-first; we reverse to chronological
+   * order for display.
+   *
+   * Only text parts are surfaced; tool/reasoning/file/step-* parts are
+   * intentionally skipped (the user wants a chat log, not a transcript).
+   */
+  private async handleHistoryCommand(
+    contextToken: string,
+    cmd: ReturnType<typeof parseHistoryCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) {
+      await this.sendReply(contextToken, "⚠️ Session manager not ready");
+      return;
+    }
+    if (!cmd) {
+      // Defensive — dispatcher guards this, but the type allows null.
+      await this.sendReply(contextToken, "⚠️ /history 参数无效");
+      return;
+    }
+
+    // Send a quick typing hint so the user knows the bot received the
+    // command. The HTTP fetch is usually <100ms but the iLink typing
+    // indicator renders within a second, masking the round trip.
+    await this.sendTypingIndicator(contextToken);
+
+    const sessionId = this.sessionManager.getSessionId();
+    const client = this.sessionManager.getOpenCodeClient();
+    try {
+      const text = await fetchAndFormatHistory({
+        sessionId,
+        count: cmd.count,
+        cwd: this.userState?.cwd ?? this.config.agent.cwd,
+        fetch: (sid, count) => client.getSessionMessages(sid, count),
+      });
+      await this.sendReply(contextToken, text);
+    } catch (err) {
+      this.log(`History error: ${String(err)}`);
+      await this.sendReply(contextToken, `⚠️ 拉取历史失败: ${String(err)}`);
+    }
+  }
+
   // ─── Notify command (/notify) ───
 
   /**
@@ -2424,6 +2485,10 @@ const apCmd = parseAutoPermissionCommand(trimmed);
       "thought-display",
       "tool-display",
       "stop", "compact", "summarize", "restart", "next", "version",
+      // History (chat-log) command. Listed here so a typo like
+      // `/historys` still surfaces the unknown-command hint, but the
+      // valid `/history` / `/hist` are always routed to the bridge.
+      "history", "hist",
       // Permission commands (parsed by parseAutoPermissionCommand /
       // parseRejectPermissionCommand, never forwarded to agent when
       // pending; otherwise safe to list as bridge commands so the

@@ -930,9 +930,14 @@ export class SessionManager {
       for (const part of response.parts) {
         if (part.type === "text") {
           replyText += part.text;
-        } else if (part.type === "tool_use") {
-          this.log(`[tool] ${part.name}`);
         }
+        // Note: tool/reasoning/file parts are intentionally not extracted
+        // here. The sync send path is used only for non-streaming callers
+        // (currently none in the bridge); the SSE-driven streaming path in
+        // the SessionManager is what handles real assistant replies.
+        // The legacy `type === "tool_use"` branch was dead code — the
+        // OpenCode Server returns `type: "tool"` (the Part union in
+        // src/types/events.ts), never `tool_use`.
       }
       if (item.hint && replyText.trim()) {
         replyText += `\n\n${item.hint}`;

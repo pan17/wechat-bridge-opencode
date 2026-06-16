@@ -14,7 +14,7 @@
 
 - **发送** — 文本、图片、文件、音视频从微信发送给 OpenCode agent；媒体自动下载到 `~/.wechat-bridge-opencode/tempfile/`，本地路径作为附件发给 agent
 - **接收** — OpenCode agent 回复文本到微信，或通过 `send-wechat` 工具主动推送文字、文件、图片到微信
-- **微信 slash 命令** — `/help`、`/workspace`、`/session`、`/agent`、`/model`、`/stop`、`/compact` 等 17+ 条命令由 bridge 直接处理，不进入 agent
+- **微信 slash 命令** — `/help`、`/workspace`、`/session`、`/agent`、`/model`、`/stop`、`/compact`、`/history` 等 17+ 条命令由 bridge 直接处理，不进入 agent
 - **OpenCode slash 命令** — bridge 不识别的 `/xxx` 自动作为文本转发给 agent，触发 OpenCode 内置 slash 命令（如 `/init`、`/review`）；发送 `/help` 可查看所有可触发指令
 - **LLM 问答支持** — 转发 OpenCode `question` 工具的提问到微信，支持选项 / 多选 / 自定义答案；30 分钟软超时自动 reject
 - **工具权限审批** — WeChat 弹权限卡片，支持 `once` / `always` / `reject` 三选一；`/auto-permission` 可切换自动接收模式；30 分钟软超时自动 reject
@@ -148,6 +148,12 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 | 命令 | 说明 |
 |------|------|
 | `/compact`（`/summarize`） | 压缩当前会话的上下文：用当前 model 调用 OpenCode Server 的 `POST /session/:id/summarize`，由 server 端 LLM 总结历史消息后用滚动摘要替换活动 context，全量历史在 server 端完整保留。Agent 正在运行时会被拒绝（请先 `/stop`），但 Question/Permission pending 期间仍可使用。设计细节见 `.omo/plans/compact-command-design.md` |
+
+### 历史（`/history`）
+
+| 命令 | 说明 |
+|------|------|
+| `/history`（`/hist`） | 显示当前会话最近 N 条消息，按时间正序排列。可选尾部正整数 N（默认 5，范围 1-20；0 / 负数 / >20 直接拒绝，不会被静默截断到 20）。**只读**——Agent 正在运行时也能用，不会打断 turn。展示规则：仅显示文本 part（tool / reasoning / file / step-* 一律跳过）；user 消息以 👤 + 时间戳开头，assistant 消息以 🤖 + 时间戳 + agent/model 开头；每条消息文本最多 500 字符。底层走 `GET /session/:id/message?limit=N`，server 默认按时间倒序返回，bridge 在内存里反转为正序。 |
 
 ### 思考显示（`/thought-display`）
 

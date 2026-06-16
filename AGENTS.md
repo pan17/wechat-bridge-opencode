@@ -210,6 +210,11 @@ src/weixin/
 |---------|-------------|
 | `/compact` (`/summarize`) | Force-trigger OpenCode Server's context compaction for the current session via `POST /session/:id/summarize`. Uses the session's current model. Rejected while the agent is mid-turn (`/stop` first); allowed while a question or permission is pending. See `.omo/plans/compact-command-design.md` for rationale. |
 
+### History (/history)
+| Command | Description |
+|---------|-------------|
+| `/history` (`/hist`) | Show the most recent N messages from the current session in chronological order. Optional trailing positive integer N (default 5, range 1-20; 0/negative/>20 are rejected with no silent clamp). Read-only — works while the agent is busy. Display: text parts only (tool/reasoning/file/step-* parts are skipped); user messages marked 👤 + timestamp, assistant messages marked 🤖 + timestamp + agent/model; each text body truncated to 500 chars. Fetches via `GET /session/:id/message?limit=N` and reverses newest-first → chronological. |
+
 ### Thought Display (/thought-display)
 | Command | Description |
 |---------|-------------|
