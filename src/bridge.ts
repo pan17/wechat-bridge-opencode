@@ -2190,6 +2190,15 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         count: cmd.count,
         cwd: this.userState?.cwd ?? this.config.agent.cwd,
         fetch: (sid, count) => client.getSessionMessages(sid, count),
+        // Title is best-effort: a missing session (404) or a network blip
+        // just omits the 会话「…」 header piece instead of failing the
+        // whole `/history` command. fetchAndFormatHistory swallows the
+        // error from this closure on its own; we still wrap the outer
+        // call in the try/catch below for the messages-fetch path.
+        getSessionTitle: async (sid) => {
+          const info = await client.getSession(sid);
+          return info.title;
+        },
       });
       await this.sendReply(contextToken, text);
     } catch (err) {

@@ -815,28 +815,43 @@ function truncate(s: string, max: number): string {
 
 /**
  * Format the `/history` reply for WeChat. The input is the LAST N
- * messages returned by `GET /session/:id/message?limit=N` (newest
- * first) — the caller is expected to REVERSE them to chronological
- * order before passing in. Only text parts are surfaced; tool,
- * reasoning, file, step-* and snapshot parts are skipped per the
- * "history = chat log" contract.
+ * messages returned by `GET /session/:id/message?limit=N`, which the
+ * OpenCode Server returns OLDEST-FIRST (see
+ * `packages/opencode/src/session/message-v2.ts:471` — the server does
+ * its own `items.reverse()` after the `desc(time_created)` SQL query).
+ * We display them in the same order (oldest at top, newest at bottom),
+ * which is what people expect when reading a chat log.
  *
- * Output shape:
+ * "history = chat log" contract:
+ *   - Only text parts are surfaced; tool, reasoning, file, step-* and
+ *     snapshot parts are skipped.
+ *   - Messages with ZERO text parts (e.g. an assistant turn that was
+ *     100% tool calls / reasoning — common with the Sisyphus
+ *     ultraworker style) are FILTERED OUT ENTIRELY. We no longer
+ *     render `(空消息)` placeholders, since the chat-log view doesn't
+ *     need to know those turns existed (the user can always peek at
+ *     the full transcript via `/compact` or the OpenCode TUI).
+ *   - The header count reflects the FILTERED count, so the user sees
+ *     exactly how many chat messages are in the rendered output.
  *
- *   📜 最近 {count} 条消息:
+ * Output shape (chronological: oldest at top, newest at bottom):
+ *
+ *   📜 最近 3 条消息 (会话「xxx」· 工作区: F:\foo):
  *
  *   👤 [10:23:15] 你:
  *   {first 500 chars of concatenated text parts}
  *
  *   ───
- *   🤖 [10:23:42] build / claude-sonnet-4-5:
+ *   🤖 [10:23:42] build / anthropic/claude-sonnet-4-5:
  *   {first 500 chars}
  *   ───
  *   ...
  *
  * Edge cases:
  *   - `sessionId` is null → returns a "no active session" warning.
- *   - `messages` is empty → returns "no messages yet".
+ *   - `messages` is empty (no messages at all) → returns "no messages yet".
+ *   - All messages are empty (every turn was tool-only) → returns a
+ *     "no text-bearing messages" notice instead of an empty header.
  *   - Each message's text parts are concatenated (a single assistant
  *     turn can have multiple text parts when a tool interrupts);
  *     truncation per-message keeps the total reply under the 4000-char
@@ -849,12 +864,18 @@ export function formatHistoryForWeChat(opts: {
       role: "user" | "assistant";
       time?: { created?: number; completed?: number };
       agent?: string;
+      /** Legacy nested shape — accepted but flat fields take precedence. */
       model?: { providerID: string; modelID: string };
+      /** Actual OpenCode Server shape (Assistant schema, packages/core/src/v1/session.ts:464-465). */
+      modelID?: string;
+      providerID?: string;
     };
     parts: Array<{ type: "text"; text: string }>;
   }>;
   /** Current workspace cwd — surfaced in the header so the user knows which session this is. */
   cwd: string;
+  /** Optional session title — surfaced in the header. Omitted when empty. */
+  title?: string;
   /** The count the user actually asked for (default 5, 1-20). */
   maxCount: number;
 }): string {
@@ -865,44 +886,70 @@ export function formatHistoryForWeChat(opts: {
     return "📜 当前会话暂无消息。";
   }
 
-  // Show the actual number returned in case the server returned fewer
-  // than `maxCount` (e.g. brand-new session with 2 messages and N=5).
-  const actual = opts.messages.length;
-  const lines: string[] = [];
-  lines.push(`📜 最近 ${actual} 条消息 (工作区: ${opts.cwd}):`);
-  lines.push("");
-
-  for (let i = 0; i < opts.messages.length; i++) {
-    const m = opts.messages[i];
-    // Concatenate text parts only — non-text parts (tool, reasoning, file,
-    // step-*, snapshot) are intentionally skipped per the "chat log"
-    // contract for `/history`.
+  // Filter to messages that actually carry visible text. We deliberately
+  // skip the header + divider for a fully-empty turn — see the "history =
+  // chat log" contract above. The 500-char truncation is per-message so
+  // a single huge message can't blow the WeChat 4000-char budget.
+  const rendered: Array<{ meta: string; body: string }> = [];
+  for (const m of opts.messages) {
     const text = m.parts
       .filter((p) => p.type === "text")
       .map((p) => p.text)
       .join("");
+    if (text.length === 0) continue;
     const truncated = text.length > 500 ? text.slice(0, 499) + "…" : text;
-
     if (m.info.role === "assistant") {
       // Assistant line carries the agent + model so the user can tell
       // which model produced each reply (a single session can switch
       // models via /model switch mid-conversation).
-      const header = "🤖";
-      const meta = formatAssistantMeta(m.info.agent, m.info.model);
-      lines.push(`${header} [${formatTime(m.info.time?.completed ?? m.info.time?.created)}] ${meta}:`);
+      const meta = formatAssistantMeta(
+        m.info.agent,
+        m.info.model,
+        m.info.modelID,
+        m.info.providerID,
+      );
+      const time = formatTime(m.info.time?.completed ?? m.info.time?.created);
+      rendered.push({ meta: `🤖 [${time}] ${meta}:`, body: truncated });
     } else {
-      lines.push(`👤 [${formatTime(m.info.time?.created)}] 你:`);
+      const time = formatTime(m.info.time?.created);
+      rendered.push({ meta: `👤 [${time}] 你:`, body: truncated });
     }
+  }
+
+  if (rendered.length === 0) {
+    // Defense-in-depth — fetchAndFormatHistory normally intercepts
+    // the all-empty case before reaching here. If we DO get here, it's
+    // because someone called formatHistoryForWeChat directly with a
+    // pre-filtered empty list.
+    return `📜 最近 ${opts.maxCount} 条消息 (工作区: ${opts.cwd}):\n\n(本次范围内全部是工具/推理轮，没有文本回复)`;
+  }
+
+  // Header — single-line, with session title (truncated) and cwd so the
+  // user can tell at a glance which conversation they're reading. The
+  // count is always the REQUESTED count (matches what the user typed
+  // like `/history 5`) so the number lines up with the slash command.
+  // When we couldn't satisfy the full request (e.g. over-fetched 30 raw
+  // messages but only found 3 with text), append a parenthetical hint so
+  // the user isn't confused by the shorter rendered list.
+  const titlePart = opts.title && opts.title.trim().length > 0
+    ? `会话「${truncate(opts.title.trim(), 40)}」· `
+    : "";
+  const countLabel = rendered.length < opts.maxCount
+    ? `${opts.maxCount} 条消息 (实际显示 ${rendered.length} 条)`
+    : `${opts.maxCount} 条消息`;
+  const lines: string[] = [];
+  lines.push(`📜 最近 ${countLabel} (${titlePart}工作区: ${opts.cwd}):`);
+  lines.push("");
+
+  for (let i = 0; i < rendered.length; i++) {
+    const r = rendered[i];
+    lines.push(r.meta);
     // Preserve user-typed line breaks (we split on \n). Indent each
     // body line by 2 spaces for visual nesting under the header.
-    if (truncated.length === 0) {
-      lines.push("  (空消息)");
-    } else {
-      for (const bodyLine of truncated.split("\n")) {
-        lines.push(`  ${bodyLine}`);
-      }
+    for (const bodyLine of r.body.split("\n")) {
+      lines.push(`  ${bodyLine}`);
     }
-    if (i < opts.messages.length - 1) {
+    if (i < rendered.length - 1) {
       lines.push("");
       lines.push("───");
       lines.push("");
@@ -921,9 +968,27 @@ function formatTime(epochMs: number | undefined): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function formatAssistantMeta(agent: string | undefined, model: { providerID: string; modelID: string } | undefined): string {
+/**
+ * Format the assistant meta line (`agent / provider/model`).
+ *
+ * Reads the model from FLAT fields (`info.modelID` + `info.providerID`) — the
+ * actual shape returned by the OpenCode Server per the Assistant schema at
+ * `packages/core/src/v1/session.ts:455-487`. The older nested
+ * `info.model = { providerID, modelID }` shape is accepted as a fallback
+ * for any caller that still hands us a session-manager-style object.
+ */
+function formatAssistantMeta(
+  agent: string | undefined,
+  infoModel: { providerID: string; modelID: string } | undefined,
+  flatModelID: string | undefined,
+  flatProviderID: string | undefined,
+): string {
   const agentName = agent ?? "assistant";
-  const modelName = model ? `${model.providerID}/${model.modelID}` : "(model unknown)";
+  const providerID = flatProviderID ?? infoModel?.providerID;
+  const modelID = flatModelID ?? infoModel?.modelID;
+  const modelName = providerID && modelID
+    ? `${providerID}/${modelID}`
+    : "(model unknown)";
   return `${agentName} / ${modelName}`;
 }
 
@@ -1156,10 +1221,26 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
 }
 
 /**
- * Fetch the most recent N messages for the current session and format
- * them for WeChat. Centralizes the `/history` orchestration so the
- * bridge handler stays a thin wrapper and the function is unit-testable
- * with a stubbed client (no need to instantiate the full WeChatOpencodeBridge).
+ /**
+ * Over-fetch multiplier: ask the server for `count × FETCH_MULTIPLIER`
+ * raw messages so that, after dropping tool-only turns, we usually end
+ * up with the `count` text-bearing messages the user actually wanted to
+ * see. Without this, a chatty ultraworker whose tool-only turns
+ * outnumber text turns would surface e.g. `最近 5 条消息` in the header
+ * but only render 2 lines — confusing for the user.
+ *
+ * Capped by FETCH_MAX so we don't pull arbitrarily large payloads when
+ * the user asks for `/history 20` on a session full of tool turns.
+ */
+const FETCH_MULTIPLIER = 3;
+const FETCH_MAX = 60;
+
+/**
+ * Fetch the most recent N text-bearing messages for the current session
+ * and format them for WeChat. Centralizes the `/history` orchestration
+ * so the bridge handler stays a thin wrapper and the function is
+ * unit-testable with a stubbed client (no need to instantiate the full
+ * WeChatOpencodeBridge).
  *
  * Behavior:
  *   - `sessionId === null`          → returns the "no active session" warning.
@@ -1167,18 +1248,46 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
  *   - `fetch` throws                → propagates the error; the bridge
  *                                     wraps this in its own try/catch and
  *                                     converts to a user-facing ⚠️ message.
- *   - `fetch` returns N messages    → reversed to chronological order,
- *                                     filtered to text parts only, and
- *                                     formatted via `formatHistoryForWeChat`.
+ *   - `fetch` returns M messages    → we OVER-FETCH by FETCH_MULTIPLIER,
+ *                                     then walk the array in reverse to
+ *                                     pick the LAST `count` messages that
+ *                                     carry at least one text part
+ *                                     (tool-only turns are skipped, the
+ *                                     same way `/history` always has). The
+ *                                     resulting slice is reversed back to
+ *                                     chronological order (oldest at top,
+ *                                     newest at bottom) and passed to the
+ *                                     formatter. Server returns OLDEST-FIRST
+ *                                     (see
+ *                                     `packages/opencode/src/session/message-v2.ts:471`
+ *                                     for the server-side reverse), so
+ *                                     the LAST items in the raw array are
+ *                                     the most recent.
+ *   - `getSessionTitle` (optional)  → returned title is surfaced in the
+ *                                     header. When the call fails or returns
+ *                                     an empty string, the title is omitted
+ *                                     (the header still includes the cwd).
+ *   - Edge case: even with over-fetch, no text-bearing messages exist in
+ *     the returned window → returns a "本次范围内全部是工具/推理轮" notice
+ *     instead of an empty header.
  *
- * The `fetch` callback is the only seam tests need: a `(id, count) => Promise<MessageResponse[]>`
- * signature that maps directly to `OpenCodeServerClient.getSessionMessages`.
+ * The `fetch` and `getSessionTitle` callbacks are the only seams tests
+ * need: both map directly to `OpenCodeServerClient.getSessionMessages` /
+ * `OpenCodeServerClient.getSession`.
  */
 export async function fetchAndFormatHistory(opts: {
   sessionId: string | null;
   count: number;
   cwd: string;
   fetch: (sessionId: string, count: number) => Promise<MessageResponse[]>;
+  /**
+   * Optional session-title resolver. When omitted (tests), the formatted
+   * output skips the 会话「…」 part of the header. When provided, the
+   * returned string is rendered in the header (truncated to 40 chars).
+   * Errors are swallowed by the caller (the bridge passes a guarded
+   * closure) so a missing session on the server doesn't kill `/history`.
+   */
+  getSessionTitle?: (sessionId: string) => Promise<string | undefined>;
 }): Promise<string> {
   if (opts.sessionId === null) {
     return formatHistoryForWeChat({
@@ -1188,12 +1297,44 @@ export async function fetchAndFormatHistory(opts: {
       maxCount: opts.count,
     });
   }
-  const raw = await opts.fetch(opts.sessionId, opts.count);
-  // Server returns newest-first; reverse to chronological order for display.
-  const messages = raw.slice().reverse();
+  const fetchLimit = Math.min(opts.count * FETCH_MULTIPLIER, FETCH_MAX);
+  const [raw, title] = await Promise.all([
+    opts.fetch(opts.sessionId, fetchLimit),
+    opts.getSessionTitle ? opts.getSessionTitle(opts.sessionId).catch(() => undefined) : Promise.resolve(undefined),
+  ]);
+  // Truly-empty session (server has no messages at all) — distinct from
+  // "session has messages but they're all tool-only". Two different
+  // notices, since the first one usually means a fresh session and the
+  // second one means a tool-heavy agent run.
+  if (raw.length === 0) {
+    return "📜 当前会话暂无消息。";
+  }
+  // Walk OLDEST-FIRST array in reverse, picking the LAST `opts.count`
+  // text-bearing messages (i.e. the most recent N that actually contain
+  // text). A message "carries text" if any of its parts is a non-empty
+  // text part — tool-only / reasoning-only / file-only turns are
+  // skipped, matching the "history = chat log" contract.
+  const picked: MessageResponse[] = [];
+  for (let i = raw.length - 1; i >= 0 && picked.length < opts.count; i--) {
+    const m = raw[i];
+    const hasText = m.parts.some(
+      (p) => p.type === "text" && typeof p.text === "string" && p.text.length > 0,
+    );
+    if (hasText) picked.push(m);
+  }
+  if (picked.length === 0) {
+    // Edge case: server returned N raw messages but every one of them
+    // was tool-only / reasoning-only. Surface this honestly instead of
+    // an empty header.
+    return `📜 最近 ${opts.count} 条消息 (工作区: ${opts.cwd}):\n\n(本次范围内全部是工具/推理轮，没有文本回复)`;
+  }
+  // Reverse back to chronological (oldest at top, newest at bottom) for
+  // the formatter.
+  picked.reverse();
   return formatHistoryForWeChat({
     sessionId: opts.sessionId,
-    messages: messages.map((m) => ({
+    title,
+    messages: picked.map((m) => ({
       info: m.info,
       parts: m.parts
         .filter((p): p is EventTextPart => p.type === "text")
