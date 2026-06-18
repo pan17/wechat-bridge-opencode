@@ -3451,8 +3451,21 @@ export class SessionManager {
     if (!currentModel) return [];
     if (currentModel.reasoning === false) return [];
 
-    const variants = currentModel.variants ?? {};
-    const levels = Object.keys(variants).filter((k) => variants[k]?.reasoningEffort);
+    const variants = (currentModel.variants ?? {}) as Record<
+      string,
+      { reasoningEffort?: string; thinking?: unknown }
+    >;
+    // Accept BOTH variant shapes the server can return:
+    //   - OpenAI-style:    { reasoningEffort: "low"|"medium"|"high" }
+    //   - Anthropic-style: { thinking: { type: "enabled"|"adaptive"|"disabled" } }
+    // Anthropic-style variants (e.g. minimax-cn-coding-plan/MiniMax-M3,
+    // opencode-go/minimax-m3) would otherwise silently disappear from
+    // `/reasoning list`, leaving the user with no way to see or switch
+    // the levels the server actually exposes.
+    const levels = Object.keys(variants).filter((k) => {
+      const v = variants[k];
+      return v.reasoningEffort !== undefined || v.thinking !== undefined;
+    });
 
     return levels.map((v) => ({
       value: v,
