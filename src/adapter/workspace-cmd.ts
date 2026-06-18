@@ -16,7 +16,7 @@
  *   status                        — Show current session info
  */
 
-import type { McpServerStatus } from "../types.js";
+import type { McpServerStatus, VcsInfo } from "../types.js";
 import type { MessageResponse } from "../types.js";
 import type { SessionStatus, TextPart as EventTextPart } from "../types/events.js";
 import type { NotifySettings } from "../config.js";
@@ -679,6 +679,20 @@ export function formatStatus(opts: {
    * `src/notifier.ts` for the feature.
    */
   notifySettings?: NotifySettings | null;
+  /**
+   * VCS (git) info for the current workspace, fetched via
+   * `GET /vcs?directory=<workspace>` on the OpenCode Server. Rendered
+   * as a single `🌿 Branch: <branch> (default: <defaultBranch>)` line
+   * right after the workspace line. Render rules:
+   *   - `undefined` → omit the line (network/parse failure)
+   *   - `{ branch: null, defaultBranch: null }` → render
+   *     `🌿 Branch: (not a git repo)` (server returned 200 with nulls)
+   *   - `{ branch: "<b>", defaultBranch: "<d>" }` →
+   *     `🌿 Branch: <b> (default: <d>)` — omit the `(default: …)`
+   *     suffix when `defaultBranch` is null OR equal to `branch`
+   *     (no useful info in the redundancy).
+   */
+  vcs?: VcsInfo | null;
 }): string {
   const lines: string[] = ["📊 Status:"];
 
@@ -692,6 +706,30 @@ export function formatStatus(opts: {
 
   // Workspace
   lines.push(`  📂 Workspace: ${opts.workspace}`);
+
+  // Branch (git). Placed right after Workspace so the operator sees the
+  // workspace path + branch together — they're conceptually the same
+  // "where am I working?" unit. Three-state contract:
+  //   - `undefined` → omit the line entirely (network failure / not
+  //     fetched; we can't say anything meaningful).
+  //   - `null`      → server returned 200 with nulls (non-git dir) →
+  //     render `🌿 Branch: (not a git repo)` so the user knows we asked.
+  //   - object      → render branch (and default, when it differs).
+  // Equal branch/default is collapsed so we don't print redundant info
+  // like "Branch: main (default: main)".
+  if (opts.vcs !== undefined) {
+    if (opts.vcs === null || opts.vcs.branch === null) {
+      lines.push("  🌿 Branch: (not a git repo)");
+    } else {
+      const b = opts.vcs.branch;
+      const d = opts.vcs.defaultBranch;
+      if (d && d !== b) {
+        lines.push(`  🌿 Branch: ${b} (default: ${d})`);
+      } else {
+        lines.push(`  🌿 Branch: ${b}`);
+      }
+    }
+  }
 
   // Agent
   lines.push(`  🤖 Agent: ${opts.agent}`);

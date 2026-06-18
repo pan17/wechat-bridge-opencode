@@ -138,6 +138,12 @@ src/weixin/
 
 1. **New message type**: Update `MessageType` enum in `src/weixin/types.ts`, add handling in `src/adapter/inbound.ts`
 2. **New Server API call**: Add method to `src/server/client.ts`, use in `src/server/session.ts` or `src/bridge.ts`
+   - **Authoritative reference**: [OpenCode Server API docs (zh-cn)](https://opencode.ai/docs/zh-cn/server/) — this is the source of truth for endpoint shape, query params, and response types. The bridge's local `OpenCodeServerClient` only wraps a subset; when in doubt, defer to the doc, not the existing client methods.
+   - **Test the endpoint BEFORE coding**: the SDK-generated `types.gen.ts` and the actual server response can drift (e.g. `/vcs` returns `default_branch` but the SDK type only declares `branch`). Before writing the bridge code:
+     1. Confirm the opencode server is reachable (it usually is — `Get-Process -Name opencode` on Windows, or just hit `/global/health`).
+     2. `curl` the endpoint with the target `?directory=` to capture the real response shape.
+     3. Note any extra fields, null-handling, and HTTP status (some endpoints return 200 with `null` rather than 404).
+     4. Only then write the client method, types, formatter, handler, and test — grounded in observed data, not assumptions.
 3. **New CLI option**: Add to `parseArgs()` in `bin/wechat-opencode.ts`, update `usage()`, pass through to config
 4. **New question tool support**: Add event type to `src/types/events.ts` + handler in `src/server/session.ts` switch; mirror in `src/types/events.ts`; add HTTP methods to `src/server/client.ts`; format/parse in `src/adapter/question-format.ts`; wire bridge callbacks in `src/bridge.ts`. See `.omo/plans/question-tool-design.md` for the canonical pattern.
 5. **New permission tool support**: Mirror the question pattern with the following differences — (a) the agent's `permission.asked` payload lives in `src/types/permission.ts` (mirrors OpenCode V1 schema); (b) HTTP method is `POST /permission/:id/reply` with `reply: "once"|"always"|"reject"`; (c) format/parse uses positional 1/2/3 + bare keywords + `P{n}=…` grammar; (d) bridge must auto-reject when `lastEnqueuedContextToken` is null (so the agent doesn't block); (e) add the `/auto-permission [off|once|always|status]` command (alias `/ap`) and `/reject-permission` (alias `/rp`); (f) auto-mode toggles must persist to `~/.wechat-bridge-opencode/.wechat-bridge-state.json`. See `.omo/plans/permission-tool-design.md` for the canonical pattern.
@@ -158,7 +164,7 @@ src/weixin/
 ### Status (/status)
 | Command | Description |
 |---------|-------------|
-| `/status` | Show current session (with title), workspace, agent, model, reasoning, context usage, **agent status** (busy/idle/retry driven by the SSE `session.status` event), **count of other running root sessions** on the OpenCode Server (server-wide, excludes current session and sub-agent sessions), and **MCP server status** (with failure reasons). Agent/Model/Reasoning/MCP are fetched from the OpenCode Server via HTTP API (scoped to the current workspace via the `?directory=` query param; auto-refreshed on workspace switch). For an empty session, Model falls back to the workspace's `model:` field from the server config |
+| `/status` | Show current session (with title), workspace, **branch** (current git branch + default branch, via OpenCode Server `GET /vcs?directory=...`; renders `(not a git repo)` when the workspace isn't git-backed), agent, model, reasoning, context usage, **agent status** (busy/idle/retry driven by the SSE `session.status` event), **count of other running root sessions** on the OpenCode Server (server-wide, excludes current session and sub-agent sessions), and **MCP server status** (with failure reasons). Agent/Model/Reasoning/MCP/Branch are fetched from the OpenCode Server via HTTP API (scoped to the current workspace via the `?directory=` query param; auto-refreshed on workspace switch). For an empty session, Model falls back to the workspace's `model:` field from the server config |
 
 ### Workspace (/workspace or /ws)
 | Command | Description |

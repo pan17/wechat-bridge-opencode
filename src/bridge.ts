@@ -24,6 +24,7 @@ import { formatPermissionCard, parsePermissionReply, formatPermissionSummary } f
 import { formatNotifyStatus } from "./adapter/notify-format.js";
 import { SessionNotifier } from "./notifier.js";
 import type { MediaContent } from "./types.js";
+import type { VcsInfo } from "./types.js";
 import type { QuestionPrompt } from "./types/question.js";
 import type { AutoPermissionMode } from "./types/permission.js";
 import { DEFAULT_AUTO_PERMISSION_MODE } from "./types/permission.js";
@@ -1926,6 +1927,22 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         otherBusySessions = null;
       }
 
+      // VCS (git branch) info for the current workspace, fetched from the
+      // OpenCode Server via `GET /vcs?directory=<cwd>`. Failure (network
+      // or non-2xx) is swallowed and the Branch line is omitted from the
+      // output. `null` vcs (server returned 200 with null fields for a
+      // non-git directory) renders as `(not a git repo)` — see
+      // `formatStatus` for the contract. Scoped to `cwd` (the latest
+      // workspace, post-`/workspace switch`) so a workspace change is
+      // reflected immediately, matching the rest of /status.
+      let vcs: VcsInfo | null | undefined;
+      try {
+        vcs = await sessionManager.getOpenCodeClient().getVcsInfo(cwd);
+      } catch (err) {
+        this.log(`[status] /vcs fetch failed (ignored): ${String(err)}`);
+        vcs = undefined;
+      }
+
       let statusText = formatStatus({
         session: sessionInfo,
         workspace: cwd,
@@ -1937,6 +1954,7 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         agentStatus,
         otherBusySessions,
         notifySettings: this.notifier?.getSettings() ?? null,
+        vcs,
       });
 
       // Append a "⏳ Question pending" line if a question is waiting. We

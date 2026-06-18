@@ -5,7 +5,7 @@
  * See https://opencode.ai/docs/server/ for API reference.
  */
 
-import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef, McpStatusMap } from "../types.js";
+import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo, ModelRef, McpStatusMap, VcsInfo } from "../types.js";
 import type { QuestionRequest } from "../types/question.js";
 import type { PermissionReply, PermissionRequest } from "../types/permission.js";
 import type { SessionStatus } from "../types/events.js";
@@ -235,6 +235,36 @@ export class OpenCodeServerClient {
       return res.json() as Promise<ServerProjectInfo[]>;
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * Fetch VCS (git) info for the project rooted at `directory`.
+   *
+   * Calls `GET /vcs?directory=<directory>`. The server returns
+   * `{ branch: string | null, default_branch: string | null }` —
+   * `null` for both fields when the directory is not a git repo (the
+   * server does NOT 404 in that case; it returns HTTP 200 with nulls).
+   *
+   * Field name on the wire is `default_branch` (snake_case, per OpenCode
+   * SDK's `VcsInfo` type). We map it to `defaultBranch` (camelCase) on
+   * the bridge side to match the rest of the bridge's naming.
+   *
+   * Returns `null` only on network failure or non-2xx response — a valid
+   * `200 { branch: null, default_branch: null }` payload (non-git dir)
+   * is returned as `{ branch: null, defaultBranch: null }`.
+   */
+  async getVcsInfo(directory?: string): Promise<VcsInfo | null> {
+    try {
+      const res = await this.fetch(this.withDirectory("/vcs", directory), { method: "GET" });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { branch?: unknown; default_branch?: unknown };
+      return {
+        branch: typeof data.branch === "string" ? data.branch : null,
+        defaultBranch: typeof data.default_branch === "string" ? data.default_branch : null,
+      };
+    } catch {
+      return null;
     }
   }
 

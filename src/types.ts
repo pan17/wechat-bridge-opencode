@@ -145,3 +145,20 @@ export type McpServerStatus =
 
 /** Response from `GET /mcp`: a name → status map. */
 export type McpStatusMap = Record<string, McpServerStatus>;
+
+/**
+ * VCS info returned by OpenCode Server's `GET /vcs?directory=<workspace>`
+ * endpoint. Both fields are null when the workspace is not a git repo
+ * (the server returns HTTP 200 with `branch: null, default_branch: null`
+ * in that case — it does NOT 404).
+ *
+ * The bridge uses this to surface the active branch in `/status`. Field
+ * names are camelCased on the bridge side; the wire format uses
+ * `default_branch` (snake_case) and is mapped in `OpenCodeServerClient.getVcsInfo`.
+ */
+export interface VcsInfo {
+  /** Active git branch, or null if the workspace is not under git. */
+  branch: string | null;
+  /** Project's default branch (e.g. "main" / "master"), or null. */
+  defaultBranch: string | null;
+}
