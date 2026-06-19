@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.7] - 2026-06-20
+
+### Added
+- **`/silent` command** (alias `/sl`): immersive mode that hides the agent's incremental working output (reasoning, tool summaries, incremental text parts) during a turn; only the FINAL text part is delivered at turn completion. Questions and permission requests are unaffected (they have their own event handlers). Settings persist to `~/.wechat-bridge-opencode/.wechat-bridge-state.json`. A `🤫 静默模式: On/Off` line is added to `/status` output.
+- **`/status` shows the current git branch.** Fetches `branch` + `default_branch` from the OpenCode Server's `GET /vcs?directory=…` endpoint; renders `(not a git repo)` when the workspace isn't git-backed. Display uses the `branch` field, falling back to the SDK's `default_branch` typo for older server responses.
+
+### Changed
+- **`/status` routes to the current workspace and counts server-wide busy sessions via SSE.** The `Other running sessions` count is now driven by the server-wide `session.status` SSE stream (the `/global/event` connection), so the count is accurate across all workspaces on the same OpenCode Server instance, not just the current one. The REST fallback remains for the per-workspace `lastAgentStatus` display.
+- **`/reasoning` switches accept Anthropic-style `thinking` variants** (e.g. `thinking-max`, `thinking-low`) in addition to the existing OpenAI-style `reasoningEffort` levels. The `/reasoning list` command now reports the union of both variant shapes, deduplicated, so users can pick a level the model actually supports.
+
+### Fixed
+- **`/model switch` was being silently clobbered by the next prompt.** `SessionManager.ensureSession()` fired `syncStateFromServer()` fire-and-forget on every `enqueue()`, which read the session's last assistant message and overwrote `currentModelId` with the model that PRECEDED the user's switch. The race was timing-dependent: a fast HTTP fetch meant the wrong model went out immediately, a slow one meant the first message was correct but every message after used the old model. `ensureSession` no longer fires that sync; `switchWorkspace` / `switchSession` still call it explicitly when they actually need the cross-session restore.
+
 ## [1.3.6] - 2026-06-16
 
 ### Added
