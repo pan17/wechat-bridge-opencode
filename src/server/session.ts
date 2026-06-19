@@ -690,8 +690,13 @@ export class SessionManager {
    */
   async ensureSession(cwd?: string): Promise<string> {
     if (this.sessionId) {
-      // Session exists (e.g. restored from saved state) — sync agent/model from server
-      this.syncStateFromServer(this.sessionId).catch(() => {});
+      // Session exists (restored from saved state or already created).
+      // NOTE: Do NOT fire syncStateFromServer() here. It used to run
+      // fire-and-forget on every enqueue and clobbered the user's recent
+      // /model switch by overwriting currentModelId from the session's last
+      // assistant message (which still used the previous model). Session
+      // switches (switchWorkspace, switchSession) call syncStateFromServer
+      // explicitly when they actually need the sync.
       return this.sessionId;
     }
     const dir = cwd ?? this.cwd;
