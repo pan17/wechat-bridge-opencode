@@ -14,9 +14,11 @@ Bridge WeChat direct messages to OpenCode, with full bidirectional support for t
 
 - **Send** — Text, images, files, audio/video sent from WeChat to the OpenCode agent; media is auto-downloaded to `~/.wechat-bridge-opencode/tempfile/` and forwarded as a file-path attachment
 - **Receive** — Agent replies are forwarded to WeChat; the `send-wechat` tool lets the agent proactively push text, files, and images to WeChat
-- **WeChat slash commands** — `/help`, `/workspace`, `/session`, `/agent`, `/model`, `/stop`, `/compact` and 15+ more commands are consumed by the bridge, never forwarded to the agent
+- **WeChat slash commands** — `/help`, `/workspace`, `/session`, `/agent`, `/model`, `/stop`, `/compact`, `/silent`, `/history` and 18+ more commands are consumed by the bridge, never forwarded to the agent
 - **OpenCode slash commands** — Any `/xxx` the bridge doesn't recognize is forwarded to the agent as plain text, triggering OpenCode's built-in slash commands (e.g. `/init`, `/review`). Send `/help` to see all available commands
+- **LLM Q&A** — Forward OpenCode `question` tool prompts to WeChat, supporting options / multi-select / custom answers; 30-min soft timeout auto-rejects unanswered questions
 - **Permission cards** — Surface OpenCode's `permission.asked` events to WeChat as `once` / `always` / `reject` cards; `/auto-permission` toggles auto-accept mode; 30-min soft timeout
+- **Silent mode** — When `/silent` (alias `/sl`) is on, the bridge suppresses reasoning, tool summaries, and incremental text during a turn; only the final text reply is delivered at turn completion. Questions and permission requests are unaffected. Settings persist across bridge restarts
 - **Cross-session notifications** — Forward other sessions' question/permission/error/completion events to WeChat; auto-render cards when switching to a pending session
 - **QR Login** — Terminal QR code rendering for WeChat login
 - **OpenCode Server** — HTTP API based, no ACP subprocess required
@@ -148,6 +150,12 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 |---------|-------------|
 | `/compact` (`/summarize`) | Force-trigger OpenCode Server's context compaction via `POST /session/:id/summarize`. Uses the session's current model for the summarization LLM call; the server replaces the active context with a rolling summary while keeping the full transcript durable. Rejected while the agent is mid-turn (`/stop` first); allowed while a question or permission is pending. See `.omo/plans/compact-command-design.md` for rationale |
 
+### History (`/history`)
+
+| Command | Description |
+|---------|-------------|
+| `/history` (`/hist`) | Show the most recent N text-bearing messages from the current session in chronological order (oldest at top, newest at bottom). Optional trailing positive integer N (default 5, range 1-20; 0/negative/>20 are rejected with no silent clamp). Read-only — works while the agent is busy. Display: text parts only — turns with zero text parts (pure tool-call / reasoning / file turns, common with the Sisyphus ultraworker style) are filtered out entirely so the chat log stays a chat log; user messages marked 👤 + timestamp, assistant messages marked 🤖 + timestamp + agent/model; each text body truncated to 500 chars. Header carries the session title (when available, fetched best-effort via `GET /session/:id`) and cwd; appends `(实际显示 X 条)` when the over-fetched window doesn't have N text turns. Over-fetches by 3× (capped at 60) and picks the LAST N text-bearing messages so the header count always matches the request. Fetches via `GET /session/:id/message?limit=N`; the server returns OLDEST-FIRST (its `MessageV2.page` does its own `items.reverse()`), so the bridge does NOT reverse again. |
+
 ### Thought Display (`/thought-display`)
 
 | Command | Description |
@@ -165,6 +173,17 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 | `/tool-display on` (default) | Show tool summary at end of turn (emoji + tool name + opencode-generated title, e.g. `✅ webfetch https://httpbin.org/get`, `✅ bash exit 0`) |
 | `/tool-display off` | Hide tool summary |
 | `/tool-display status` | Show current tool display state |
+
+Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
+
+### Silent Mode (`/silent`)
+
+| Command | Description |
+|---------|-------------|
+| `/silent on` (default off) | Enable silent mode (immersive mode) — hide reasoning, tool summaries, and incremental text parts during a turn; only send the final text reply at turn completion. Questions and permission requests are unaffected. |
+| `/silent off` | Disable silent mode — resume real-time display of reasoning / tool / incremental text |
+| `/silent status` | Show current silent mode state |
+| `/sl` (alias) | Short alias for `/silent` |
 
 Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
 
@@ -190,6 +209,18 @@ Forwards other sessions' question, permission, error, and completion events to W
 | Command | Description |
 |---------|-------------|
 | `/next` | WeChat limits bots to 10 consecutive messages; user reply required to continue. Send `/next` to reset the counter without forwarding to the agent |
+
+### LLM Q&A (`/reject-question`)
+
+| Command | Description |
+|---------|-------------|
+| `/reject-question` (`/rq`) | Dismiss a pending LLM `question` request. The agent receives `QuestionRejectedError` and proceeds without an answer. No-op if no question is pending. |
+
+When the OpenCode agent calls the `question` tool, the bridge forwards the question verbatim to the WeChat DM; the user's reply is sent back to the server.
+
+**WeChat input format**: `Q{n}={value}` to pick, `Q{n}-{text}` to force a custom answer, or positional `1 --- 2 --- 3` for single-question ordered answers. Multi-question, multi-select, and custom text via the dash marker are all supported; mobile whitespace around `=` is tolerated.
+
+**Soft timeout**: 30 minutes of no reply auto-rejects and sends `⏱ Question timed out` to WeChat.
 
 ### Permission (`/reject-permission`, `/auto-permission`)
 

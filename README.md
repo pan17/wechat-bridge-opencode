@@ -14,10 +14,11 @@
 
 - **发送** — 文本、图片、文件、音视频从微信发送给 OpenCode agent；媒体自动下载到 `~/.wechat-bridge-opencode/tempfile/`，本地路径作为附件发给 agent
 - **接收** — OpenCode agent 回复文本到微信，或通过 `send-wechat` 工具主动推送文字、文件、图片到微信
-- **微信 slash 命令** — `/help`、`/workspace`、`/session`、`/agent`、`/model`、`/stop`、`/compact`、`/history` 等 17+ 条命令由 bridge 直接处理，不进入 agent
+- **微信 slash 命令** — `/help`、`/workspace`、`/session`、`/agent`、`/model`、`/stop`、`/compact`、`/history`、`/silent` 等 18+ 条命令由 bridge 直接处理，不进入 agent
 - **OpenCode slash 命令** — bridge 不识别的 `/xxx` 自动作为文本转发给 agent，触发 OpenCode 内置 slash 命令（如 `/init`、`/review`）；发送 `/help` 可查看所有可触发指令
 - **LLM 问答支持** — 转发 OpenCode `question` 工具的提问到微信，支持选项 / 多选 / 自定义答案；30 分钟软超时自动 reject
 - **工具权限审批** — WeChat 弹权限卡片，支持 `once` / `always` / `reject` 三选一；`/auto-permission` 可切换自动接收模式；30 分钟软超时自动 reject
+- **静默模式** — 启用 `/silent`（别名 `/sl`）后，一轮 turn 中只发送最终文本回复；推理、工具摘要、增量文本在 turn 结束前隐藏。Question / Permission 请求不受影响；设置独立且跨重启持久化
 - **跨会话通知** — 其他 session 的 question/permission/error/completion 事件推送到微信；切换到有 pending 的会话自动弹出卡片
 - **二维码登录** — 终端渲染二维码，扫码登录微信
 - **OpenCode Server** — 基于 HTTP API，不再需要 ACP 子进程
@@ -169,11 +170,22 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | 命令 | 说明 |
 |------|------|
-| `/tool-display on`（默认） | 在每轮结束时显示工具摘要（emoji + 工具名 + opencode 生成的标题；如 `✅ webfetch https://httpbin.org/get`、`✅ bash exit 0`） |
+| `/tool-display on`（默认） | 在每轮结束时显示工具摘要（emoji + 工具名 + opencode 生成的标题；如 `✅ webfetch https://httpbin.org/get`, `✅ bash exit 0`） |
 | `/tool-display off` | 隐藏工具摘要 |
 | `/tool-display status` | 查看当前工具显示状态 |
 
 设置独立且跨重启持久化(~/.wechat-bridge-opencode/.wechat-bridge-state.json)
+
+### 静默模式（`/silent`）
+
+| 命令 | 说明 |
+|------|------|
+| `/silent on`（默认 off） | 启用静默模式（沉浸模式）—— 在一轮 turn 中隐藏推理、工具摘要、增量文本 part；只在 turn 结束时发送最终文本回复。Question / Permission 请求不受影响 |
+| `/silent off` | 关闭静默模式 —— 恢复实时显示推理 / 工具 / 增量文本 |
+| `/silent status` | 查看当前静默模式状态 |
+| `/sl`（别名） | `/silent` 的短别名 |
+
+设置独立且跨重启持久化（~/.wechat-bridge-opencode/.wechat-bridge-state.json）
 
 ### 跨会话通知（`/notify`）
 
