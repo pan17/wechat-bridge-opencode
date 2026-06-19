@@ -233,6 +233,55 @@ interface QueueItem {
 
 // ─── SessionManager ───
 
+/**
+ * Shape of a single variant entry on a model's `variants` table.
+ *
+ * OpenCode Server returns variants in one of two shapes (verified against
+ * `packages/opencode/src/provider/transform.ts`):
+ *
+ *   - **OpenAI-style** — `{ reasoningEffort: "low"|"medium"|"high" }`.
+ *     The inner `reasoningEffort` is the meaningful display name; the
+ *     outer variant key is sometimes opaque ("1", "2", "3") and just
+ *     identifies the slot.
+ *
+ *   - **Anthropic-style** — `{ thinking: { type: "enabled"|"adaptive"|"disabled", budget?: number } }`.
+ *     No `reasoningEffort` field. Real-world example:
+ *     `minimax-cn-coding-plan/MiniMax-M3` exposes
+ *     `{ none: { thinking: { type: "disabled" } }, thinking: { thinking: { type: "adaptive" } } }`.
+ *
+ * A variant is considered a "reasoning level" if it carries EITHER a
+ * `reasoningEffort` OR a `thinking` field. This dual-shape contract MUST
+ * be honoured in lockstep by `getReasoningLevels` (list) AND `setReasoning`
+ * (switch) — the original bug was that only `getReasoningLevels` was
+ * updated, so `/reasoning list` showed levels that `/reasoning switch`
+ * then rejected as "Unknown".
+ */
+interface VariantPayload {
+  reasoningEffort?: string;
+  thinking?: { type?: string; budget?: number };
+}
+
+/** Convenience: a model entry with the variant shape we care about. */
+type ModelWithVariants = {
+  modelId: string;
+  name: string;
+  description?: string;
+  reasoning?: boolean;
+  variants?: Record<string, VariantPayload>;
+  contextSize?: number;
+};
+
+/**
+ * Is the given variant key a "reasoning level"? True when the variant
+ * payload carries either an OpenAI-style `reasoningEffort` or an
+ * Anthropic-style `thinking` object. Centralised so `getReasoningLevels`
+ * (list) and `setReasoning` (switch) agree on what counts.
+ */
+function isReasoningVariant(v: VariantPayload | undefined): boolean {
+  if (!v) return false;
+  return v.reasoningEffort !== undefined || v.thinking !== undefined;
+}
+
 export class SessionManager {
   private client: OpenCodeServerClient;
   private cwd: string;
@@ -273,7 +322,7 @@ export class SessionManager {
 
   // Available modes/models (cached for /agent list, /model list)
   private availableModes: SessionMode[] = [];
-  private availableModels: Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> = [];
+  private availableModels: ModelWithVariants[] = [];
 
   // MCP status (TTL-cached for /status; invalidated by `force: true`, TTL
   // expiry, or workspace switch — the `cwd` key makes the latter implicit).
@@ -3380,7 +3429,7 @@ export class SessionManager {
       // Scope to the current workspace so project-level provider config
       // (e.g. custom endpoints in the workspace's opencode.json) is honored.
       const providers = await this.client.listProviders(this.cwd);
-      const models: Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> = [];
+      const models: ModelWithVariants[] = [];
       for (const p of providers) {
         for (const m of p.models ?? []) {
           // Some model IDs already include provider prefix (e.g. "opencode-go/minimax-m3")
@@ -3419,7 +3468,7 @@ export class SessionManager {
     return this.currentModelId;
   }
 
-  getAvailableModels(): Array<{ modelId: string; name: string; description?: string; reasoning?: boolean; variants?: Record<string, { reasoningEffort?: string }>; contextSize?: number }> {
+  getAvailableModels(): ModelWithVariants[] {
     return this.availableModels;
   }
 
@@ -3470,12 +3519,18 @@ export class SessionManager {
    * often opaque — e.g. a provider may expose reasoning levels as "1", "2",
    * "3" while the inner `reasoningEffort` field is the meaningful name
    * ("low"/"medium"/"high"). Prefer `reasoningEffort` when present, and fall
-   * back to a capitalized variant key otherwise.
+   * back to a capitalized variant key otherwise. The variant key matches
+   * what the user has to type to switch to that level (e.g. "thinking"),
+   * so the display name round-trips: list says "Thinking", user types
+   * "thinking", the level flips. This also keeps existing display
+   * behaviour stable for Anthropic-style models (e.g. M3 shows
+   * "None" / "Thinking" rather than "Disabled" / "Adaptive", which would
+   * be a UX change for a bug-fix commit).
    */
   private resolveReasoningName(
     value: string,
     currentModel:
-      | { variants?: Record<string, { reasoningEffort?: string }> }
+      | { variants?: Record<string, VariantPayload> }
       | null
       | undefined,
   ): string {
@@ -3492,7 +3547,7 @@ export class SessionManager {
   private getCurrentReasoningModel():
     | {
         reasoning?: boolean;
-        variants?: Record<string, { reasoningEffort?: string }>;
+        variants?: Record<string, VariantPayload>;
       }
     | undefined {
     if (!this.currentModelId) return undefined;
@@ -3519,21 +3574,17 @@ export class SessionManager {
     if (!currentModel) return [];
     if (currentModel.reasoning === false) return [];
 
-    const variants = (currentModel.variants ?? {}) as Record<
-      string,
-      { reasoningEffort?: string; thinking?: unknown }
-    >;
+    const variants = currentModel.variants ?? {};
     // Accept BOTH variant shapes the server can return:
     //   - OpenAI-style:    { reasoningEffort: "low"|"medium"|"high" }
     //   - Anthropic-style: { thinking: { type: "enabled"|"adaptive"|"disabled" } }
     // Anthropic-style variants (e.g. minimax-cn-coding-plan/MiniMax-M3,
     // opencode-go/minimax-m3) would otherwise silently disappear from
     // `/reasoning list`, leaving the user with no way to see or switch
-    // the levels the server actually exposes.
-    const levels = Object.keys(variants).filter((k) => {
-      const v = variants[k];
-      return v.reasoningEffort !== undefined || v.thinking !== undefined;
-    });
+    // the levels the server actually exposes. The dual-shape contract is
+    // shared with `setReasoning` via `isReasoningVariant` above so list
+    // and switch can never disagree.
+    const levels = Object.keys(variants).filter((k) => isReasoningVariant(variants[k]));
 
     return levels.map((v) => ({
       value: v,
@@ -3559,25 +3610,49 @@ export class SessionManager {
     }
 
     // Validate against the current model's known variants. Accept either the
-    // raw variant key or a matching reasoningEffort name (case-insensitive)
-    // so users can type "low" / "high" instead of an opaque "1" / "2".
+    // raw variant key, a matching `reasoningEffort` name, or a matching
+    // Anthropic-style `thinking.type` — so users can type the human-friendly
+    // name (e.g. "low", "enabled", "adaptive") instead of an opaque variant
+    // key. Case-insensitive. CRITICAL: the "known" set MUST be derived with
+    // the same dual-shape filter as `getReasoningLevels`, otherwise
+    // Anthropic-only models see their levels listed by `/reasoning list`
+    // but rejected here as "Unknown". See the `VariantPayload` type
+    // definition for the full dual-shape contract.
     const currentModel = this.getCurrentReasoningModel();
     const variants = currentModel?.variants;
     if (variants) {
-      const known = Object.keys(variants).filter((k) => variants[k]?.reasoningEffort);
+      const known = Object.keys(variants).filter((k) => isReasoningVariant(variants[k]));
       const matchedByValue = known.find((k) => k.toLowerCase() === normalized);
-      const matchedByEffort = known.find(
-        (k) => variants[k]?.reasoningEffort?.toLowerCase() === normalized,
-      );
-      if (!matchedByValue && !matchedByEffort) {
+      const matchedByDisplay = known.find((k) => {
+        const v = variants[k];
+        if (v?.reasoningEffort?.toLowerCase() === normalized) return true;
+        if (v?.thinking?.type?.toLowerCase() === normalized) return true;
+        return false;
+      });
+      if (!matchedByValue && !matchedByDisplay) {
+        // Render available levels with whatever display label we have for
+        // each — `reasoningEffort` first, `thinking.type` second, raw
+        // variant key as the final fallback — so the error message
+        // always tells the user something useful.
         const available = known
-          .map((k) => `${k} (${variants[k]?.reasoningEffort ?? ""})`)
+          .map((k) => {
+            const v = variants[k];
+            const label = v?.reasoningEffort ?? v?.thinking?.type ?? k;
+            return `${k} (${label})`;
+          })
           .join(", ");
         throw new Error(
           `Unknown reasoning level "${level}" for ${this.currentModelId ?? "current model"}. Available: ${available}`,
         );
       }
-      this.currentReasoning = matchedByValue ?? level;
+      // CRITICAL: store the MATCHED variant key, not the user's literal
+      // input. The server only knows about variant keys (the
+      // `variant` field on a prompt request), not the human-friendly
+      // display names. If the user typed "MEDIUM" or "adaptive" and the
+      // matching key is "two" or "thinking", we MUST normalise to the
+      // key before sending the next prompt — otherwise the server will
+      // reject the request as an unknown variant.
+      this.currentReasoning = matchedByValue ?? matchedByDisplay ?? level;
     } else {
       // No variants cached yet (e.g. before refreshProviders). Store verbatim
       // and let the next sync re-validate.
