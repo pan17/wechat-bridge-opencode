@@ -326,6 +326,45 @@ export class SessionManager {
    * Defaults to `{ type: "idle" }` until the first SSE event arrives.
    */
   private lastAgentStatus: SessionStatus = { type: "idle" };
+  /**
+   * Server-wide map of `sessionID → latest observed SessionStatus`,
+   * accumulated from `session.status` SSE events. Unlike `lastAgentStatus`
+   * (which tracks only the current session for `/status` display), this
+   * map covers EVERY session the bridge observes on the opencode server
+   * instance, regardless of workspace. It powers
+   * `getOtherRunningSessionCount`, which surfaces cross-workspace busy
+   * sessions in the `/status` UI line `📈 Other running sessions: N`.
+   *
+   * Why SSE (not REST): the OpenCode Server's `GET /session/status`
+   * endpoint is workspace-scoped (`WorkspaceRoutingMiddleware` routes by
+   * `?directory=`), so it can only report the current workspace's
+   * status. But `getOtherRunningSessionCount` wants server-wide — i.e.
+   * "how many parallel agent runs are in flight on this server
+   * instance?". SSE `session.status` events ARE server-wide (the
+   * `/global/event` stream carries all workspaces), so we accumulate
+   * them here as the bridge observes state transitions.
+   *
+   * Limitations (documented so callers don't over-promise):
+   *   1. Sessions that were busy BEFORE the bridge connected are NOT
+   *      visible — SSE doesn't replay history, so the bridge has to
+   *      observe a transition to know a session exists. A bridge that
+   *      starts after 5 sessions are already running will report 0
+   *      until one of them transitions (e.g. goes idle). The count
+   *      converges to truth once the bridge has been running for a
+   *      while.
+   *   2. Idle sessions stay in the map forever (no eviction policy).
+   *      This is fine — only `type === "busy"` entries count toward
+   *      `getOtherRunningSessionCount`, and idle entries are filtered
+   *      out by the join with `listSessionsV2(roots=true)` which only
+   *      contains currently-existing sessions. Memory growth is bounded
+   *      by the number of distinct session IDs ever observed, which is
+   *      small for a single operator's setup.
+   *
+   * Not reset on `switchSession`/`switchWorkspace` — those operations
+   * change which session is "current", not which sessions exist on the
+   * server.
+   */
+  private allSessionStatuses: Map<string, SessionStatus> = new Map();
   /** Timer for the post-delta debounce before finalizing a turn. */
   private finalizeTimer: ReturnType<typeof setTimeout> | null = null;
   /** Hard timeout timer in case events stop arriving entirely. */
@@ -508,11 +547,19 @@ export class SessionManager {
   async getAgentStatus(): Promise<Readonly<SessionStatus> | null> {
     if (!this.sessionId) return null;
     try {
-      const all = await this.client.getAllSessionStatuses();
+      const all = await this.client.getAllSessionStatuses(this.cwd);
       const found = all[this.sessionId];
       const summary = `keys=[${Object.keys(all).join(",")}] lookup=${this.sessionId.slice(0, 12)}…→${found ? "FOUND" : "MISS"}`;
       this.log(`[status] /session/status: ${summary}`);
-      return found ?? { type: "idle" };
+      if (found) return found;
+      // Current session is missing from the REST map. The server is
+      // expected to omit `idle` sessions from the response (entry
+      // deleted on transition to idle, per OpenCode SessionStatus.set),
+      // so MISS is the normal idle signal — but the SSE cache may carry
+      // a fresher status when the bridge just observed a `busy` event
+      // and REST hasn't resynced yet. Prefer the cache in that case;
+      // otherwise the default `{ type: "idle" }` is the safe render.
+      return this.lastAgentStatus;
     } catch (err) {
       this.log(`[status] /session/status fetch failed; falling back to SSE cache: ${String(err)}`);
       return this.lastAgentStatus;
@@ -521,15 +568,26 @@ export class SessionManager {
 
   /**
    * Count the number of OTHER root sessions (excluding the current
-   * session and excluding sub-agent / child sessions) that the OpenCode
-   * Server currently reports as `busy`. Surfaced by `/status` as the
-   * `📈 Other running sessions: N` line so the operator can see how many
-   * parallel agent runs are in flight on the same server instance.
+   * session and excluding sub-agent / child sessions) that are
+   * currently `busy` on the OpenCode Server instance. Surfaced by
+   * `/status` as the `📈 Other running sessions: N` line so the
+   * operator can see how many parallel agent runs are in flight on
+   * the same server, ACROSS ALL WORKSPACES — not just the current one.
+   *
+   * Two data sources, joined here:
+   *   - `listSessionsV2()` returns the **server-wide** set of root
+   *     sessions (the v2 `/api/session?roots=true` endpoint returns
+   *     every existing root session, not scoped to a workspace).
+   *     This gives us the set of session IDs that "exist right now".
+   *     Pagination is handled inside `listSessionsV2` (50 pages × 200
+   *     per page), so any size of session inventory is covered.
+   *   - `this.allSessionStatuses` is the **server-wide** status map
+   *     accumulated from `session.status` SSE events (see field
+   *     JSDoc). It carries statuses for sessions across all
+   *     workspaces — including ones the bridge isn't actively
+   *     processing itself.
    *
    * Filtering:
-   *   - `listSessionsV2()` returns root sessions only (the server filters
-   *     with `roots=true` and paginates up to 50 pages / 200 per page,
-   *     so any size of session inventory is covered).
    *   - `parentID` is the server's marker for sub-agent / child
    *     sessions spawned by the agent's `task` tool; excluding
    *     non-root entries keeps the count user-meaningful.
@@ -537,22 +595,24 @@ export class SessionManager {
    *     "OTHER" running sessions — the current session's own busy
    *     state is already shown by `getAgentStatus()`.
    *
-   * Failure mode: both sub-calls are wrapped in a single `try` so a
-   * network blip on either `/session/status` or `/api/session` just
-   * returns `0` instead of throwing — `0` is the safe default for
-   * `/status` ("we couldn't tell, assume none"). The caller is
-   * expected to render `(unknown)` for `null`, so we do NOT use
-   * `null` here; the bridge promotes `0` to `null` only if it wants
-   * to distinguish "server said zero" from "couldn't reach server".
-   * (Currently the bridge treats both as `0` and renders `0`.)
+   * Known limitation: sessions that were busy BEFORE the bridge
+   * connected don't appear in `allSessionStatuses` (SSE doesn't replay
+   * history). The count converges to truth once the bridge has been
+   * running long enough to observe transitions. See the
+   * `allSessionStatuses` field JSDoc for details.
+   *
+   * Failure mode: the whole body is wrapped in a `try` so a network
+   * blip on `/api/session` just returns `0` instead of throwing — `0`
+   * is the safe default for `/status` ("we couldn't tell, assume
+   * none"). The caller renders `(unknown)` for `null`, so we do NOT
+   * use `null` here.
    */
   async getOtherRunningSessionCount(): Promise<number> {
     try {
       const rootSessions = await this.client.listSessionsV2();
       const rootIds = new Set(rootSessions.map((s) => s.id));
-      const allStatuses = await this.client.getAllSessionStatuses();
       let count = 0;
-      for (const [id, status] of Object.entries(allStatuses)) {
+      for (const [id, status] of this.allSessionStatuses) {
         if (id !== this.sessionId && rootIds.has(id) && status.type === "busy") {
           count++;
         }
@@ -2578,7 +2638,15 @@ export class SessionManager {
   }
 
   private handleSessionStatus(event: SessionStatusEvent): void {
-    this.log(`[event] session.status sessionID=${event.properties.sessionID.slice(0, 8)}… status=${event.properties.status.type}`);
+    const sid = event.properties.sessionID;
+    this.log(`[event] session.status sessionID=${sid.slice(0, 8)}… status=${event.properties.status.type}`);
+    // Server-wide accumulation: every session's status, regardless of
+    // workspace. Feeds `getOtherRunningSessionCount`.
+    this.allSessionStatuses.set(sid, event.properties.status);
+    // Per-session state for /status display + turn-finalization gating.
+    // `handleEvent` already filters by sessionID upstream (lines 1621-1646),
+    // so every event reaching this method belongs to the current session
+    // when this.sessionId is set.
     this.lastAgentStatus = event.properties.status;
     if (event.properties.status.type === "busy") {
       this.isSessionBusy = true;

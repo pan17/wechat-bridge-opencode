@@ -81,6 +81,17 @@ function root(id) {
 // ─── Tests ───
 
 describe("SessionManager.getOtherRunningSessionCount", () => {
+  /**
+   * Drive the SSE event handler to populate `allSessionStatuses`.
+   * Mirrors how a real bridge observes transitions on `/global/event`.
+   */
+  function pushStatus(m, sid, status) {
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: sid, status },
+    });
+  }
+
   test("counts only busy OTHER root sessions (excludes current + idle)", async () => {
     const m = makeManager("ses_current");
 
@@ -96,16 +107,11 @@ describe("SessionManager.getOtherRunningSessionCount", () => {
       root("ses_idle"),
     ]);
 
-    clientMock.getAllSessionStatuses.mockResolvedValue({
-      // Current session is busy — must NOT be counted (we report "other").
-      ses_current: { type: "busy" },
-      // Two other busy root sessions — should be counted.
-      ses_a: { type: "busy" },
-      ses_b: { type: "busy" },
-      // Idle root session — present in roots, but status.type=idle so
-      // it does NOT count.
-      ses_idle: { type: "idle" },
-    });
+    // SSE-driven accumulation (no REST status call any more).
+    pushStatus(m, "ses_current", { type: "busy" }); // current — filtered
+    pushStatus(m, "ses_a", { type: "busy" });        // counted
+    pushStatus(m, "ses_b", { type: "busy" });        // counted
+    pushStatus(m, "ses_idle", { type: "idle" });     // idle — filtered
 
     const count = await m.getOtherRunningSessionCount();
     // Expected: ses_a + ses_b = 2. ses_current is filtered (it's us),
@@ -116,19 +122,17 @@ describe("SessionManager.getOtherRunningSessionCount", () => {
   test("returns 0 when no other sessions are running", async () => {
     const m = makeManager("ses_current");
     clientMock.listSessionsV2.mockResolvedValue([root("ses_current")]);
-    clientMock.getAllSessionStatuses.mockResolvedValue({
-      ses_current: { type: "busy" },
-    });
+    pushStatus(m, "ses_current", { type: "busy" });
 
     const count = await m.getOtherRunningSessionCount();
     expect(count).toBe(0);
   });
 
-  test("returns 0 when status map is empty", async () => {
+  test("returns 0 when allSessionStatuses is empty", async () => {
     const m = makeManager("ses_current");
     clientMock.listSessionsV2.mockResolvedValue([root("ses_a")]);
-    clientMock.getAllSessionStatuses.mockResolvedValue({});
-
+    // No SSE events have arrived yet — the bridge doesn't know about
+    // ses_a even though it exists in the server-wide list.
     const count = await m.getOtherRunningSessionCount();
     expect(count).toBe(0);
   });
@@ -136,15 +140,7 @@ describe("SessionManager.getOtherRunningSessionCount", () => {
   test("returns 0 on network failure (no throw)", async () => {
     const m = makeManager("ses_current");
     clientMock.listSessionsV2.mockRejectedValue(new Error("ECONNREFUSED"));
-
-    const count = await m.getOtherRunningSessionCount();
-    expect(count).toBe(0);
-  });
-
-  test("returns 0 when getAllSessionStatuses throws (no throw)", async () => {
-    const m = makeManager("ses_current");
-    clientMock.listSessionsV2.mockResolvedValue([root("ses_a")]);
-    clientMock.getAllSessionStatuses.mockRejectedValue(new Error("500"));
+    pushStatus(m, "ses_a", { type: "busy" });
 
     const count = await m.getOtherRunningSessionCount();
     expect(count).toBe(0);
@@ -153,9 +149,7 @@ describe("SessionManager.getOtherRunningSessionCount", () => {
   test("current session is excluded even when busy and even if no other roots exist", async () => {
     const m = makeManager("ses_current");
     clientMock.listSessionsV2.mockResolvedValue([root("ses_current")]);
-    clientMock.getAllSessionStatuses.mockResolvedValue({
-      ses_current: { type: "busy" },
-    });
+    pushStatus(m, "ses_current", { type: "busy" });
 
     const count = await m.getOtherRunningSessionCount();
     expect(count).toBe(0);
@@ -164,12 +158,60 @@ describe("SessionManager.getOtherRunningSessionCount", () => {
   test("retry status on a root session is NOT counted (only busy)", async () => {
     const m = makeManager("ses_current");
     clientMock.listSessionsV2.mockResolvedValue([root("ses_retry")]);
-    clientMock.getAllSessionStatuses.mockResolvedValue({
-      ses_retry: { type: "retry", attempt: 2 },
-    });
+    pushStatus(m, "ses_retry", { type: "retry", attempt: 2 });
 
     const count = await m.getOtherRunningSessionCount();
     expect(count).toBe(0);
+  });
+
+  test("counts busy sessions from OTHER workspaces (the whole point of the redesign)", async () => {
+    // The /status line 📈 Other running sessions: N is meant to surface
+    // cross-workspace busy runs on the same opencode server instance.
+    // listSessionsV2 returns server-wide (no ?directory=), and
+    // allSessionStatuses accumulates across all workspaces via SSE.
+    // Together they must include a busy root session in a workspace
+    // the bridge has never set as cwd.
+    const m = makeManager("ses_current");
+    clientMock.listSessionsV2.mockResolvedValue([
+      root("ses_current"),
+      { ...root("ses_other_workspace"), directory: "/some/other/workspace" },
+    ]);
+    pushStatus(m, "ses_current", { type: "busy" });
+    pushStatus(m, "ses_other_workspace", { type: "busy" });
+
+    const count = await m.getOtherRunningSessionCount();
+    expect(count).toBe(1);
+    // Sanity: confirms the server-wide `listSessionsV2` was used
+    // without directory forwarding — `clientMock.getAllSessionStatuses`
+    // is no longer called by this function.
+    expect(clientMock.getAllSessionStatuses).not.toHaveBeenCalled();
+  });
+
+  test("after switchSession, accumulated statuses from other sessions are preserved", async () => {
+    // allSessionStatuses is server-wide; switching the bridge's
+    // current session must not evict other sessions' statuses. We
+    // assert on the map size directly rather than the count, because
+    // the "current" filter changes meaning after the switch (ses_b
+    // is now current and was never observed, so count math shifts).
+    clientMock.getSession = vi.fn().mockResolvedValue({
+      id: "ses_b",
+      slug: "b",
+      title: "B",
+      directory: "/b",
+      projectID: "p",
+      version: "1",
+    });
+    const m = makeManager("ses_a");
+    pushStatus(m, "ses_a", { type: "busy" });
+    pushStatus(m, "ses_other", { type: "busy" });
+    expect(m["allSessionStatuses"].size).toBe(2);
+
+    await m.switchSession("ses_b", "/b");
+    // The server-wide cache survived the switch — both entries are
+    // still here. (This is the property under test; compare with
+    // `lastAgentStatus` which is reset to default on switch.)
+    expect(m["allSessionStatuses"].size).toBe(2);
+    expect(m["allSessionStatuses"].get("ses_other")).toEqual({ type: "busy" });
   });
 });
 
@@ -181,6 +223,18 @@ describe("SessionManager.getAgentStatus", () => {
       ses_other: { type: "busy" }, // must be ignored
     });
     await expect(m.getAgentStatus()).resolves.toEqual({ type: "busy" });
+  });
+
+  test("forwards this.cwd as the directory query arg to /session/status", async () => {
+    // Regression: the OpenCode Server's WorkspaceRoutingMiddleware
+    // routes /session/status to the workspace instance matching
+    // ?directory=... Without it, the server returns an empty map and
+    // the bridge treats every session as idle — even when it's busy.
+    // The fix forwards `this.cwd` (set at SessionManager construction).
+    const m = makeManager("ses_current");
+    clientMock.getAllSessionStatuses.mockResolvedValue({});
+    await m.getAgentStatus();
+    expect(clientMock.getAllSessionStatuses).toHaveBeenCalledWith("/test/cwd");
   });
 
   test("returns the full retry payload (attempt / message / next) from the API", async () => {
@@ -210,6 +264,55 @@ describe("SessionManager.getAgentStatus", () => {
     clientMock.getAllSessionStatuses.mockResolvedValue({
       ses_other: { type: "busy" }, // different session — must be ignored
     });
+    await expect(m.getAgentStatus()).resolves.toEqual({ type: "idle" });
+  });
+
+  test("falls back to SSE cache when REST map omits the current session AND cache has busy", async () => {
+    // Regression: bridge just observed `session.status = busy` for the
+    // current session (cache populated), but the REST snapshot hasn't
+    // resynced yet (or the server omits the entry). Prefer the cache
+    // over the default `{ type: "idle" }` so /status doesn't flicker
+    // to Idle in the narrow window between SSE event arrival and REST
+    // snapshot propagation.
+    const m = makeManager("ses_current");
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: "ses_current", status: { type: "busy" } },
+    });
+    clientMock.getAllSessionStatuses.mockResolvedValue({
+      ses_other: { type: "idle" }, // current session missing entirely
+    });
+    await expect(m.getAgentStatus()).resolves.toEqual({ type: "busy" });
+  });
+
+  test("falls back to SSE cache retry payload (attempt) when REST map omits the current session", async () => {
+    // Same regression as above but for retry — the bridge must preserve
+    // the full payload (attempt counter) so /status can render
+    // `🟡 Agent: Retrying (attempt N)`, not just the bare `{ type }`.
+    const m = makeManager("ses_current");
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: {
+        sessionID: "ses_current",
+        status: { type: "retry", attempt: 3, message: "rate-limited" },
+      },
+    });
+    clientMock.getAllSessionStatuses.mockResolvedValue({});
+    await expect(m.getAgentStatus()).resolves.toEqual({
+      type: "retry",
+      attempt: 3,
+      message: "rate-limited",
+    });
+  });
+
+  test("defaults to { type: 'idle' } when REST map omits the current session AND no SSE event has arrived", async () => {
+    // Bridge just started; no SSE events yet; server's map doesn't
+    // include the current session (server omitted it). SSE cache is
+    // still at the default `{ type: 'idle' }`, so the fallback also
+    // returns that — same render as the pre-existing test above, but
+    // now exercising the SSE-cache fallback path explicitly.
+    const m = makeManager("ses_current");
+    clientMock.getAllSessionStatuses.mockResolvedValue({});
     await expect(m.getAgentStatus()).resolves.toEqual({ type: "idle" });
   });
 

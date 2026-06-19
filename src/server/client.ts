@@ -138,20 +138,22 @@ export class OpenCodeServerClient {
    * or an empty object if the server doesn't expose the endpoint or the
    * request fails.
    *
-   * Network / parse errors are swallowed: an empty object is the safe
-   * default — the caller treats `{}` as "we couldn't tell" and renders an
-   * `(unknown)` placeholder in the user-facing output. There is no
-   * `directory` filter: the endpoint is server-wide by design (used by
-   * `/status` to surface OTHER sessions running against the same opencode
-   * serve instance, regardless of workspace).
+* Network / parse errors are swallowed: an empty object is the safe
+    * default — the caller treats `{}` as "we couldn't tell" and renders an
+    * `(unknown)` placeholder in the user-facing output. Pass `directory`
+    * to scope the query to a workspace via `?directory=...`; without it,
+    * the server's `WorkspaceRoutingMiddleware` returns an empty map
+    * (route resolves to a different / no workspace instance), so the
+    * caller would treat every session as idle — see `getAgentStatus` in
+    * `src/server/session.ts` for the bug this guards.
    *
    * Typical use case: counting busy sessions across the server so the
    * operator knows how many parallel agent runs are currently in flight
    * (see SessionManager.getOtherRunningSessionCount).
    */
-  async getAllSessionStatuses(): Promise<Record<string, SessionStatus>> {
+  async getAllSessionStatuses(directory?: string): Promise<Record<string, SessionStatus>> {
     try {
-      const res = await this.fetch("/session/status", { method: "GET" });
+      const res = await this.fetch(this.withDirectory("/session/status", directory), { method: "GET" });
       if (!res.ok) return {};
       return res.json() as Promise<Record<string, SessionStatus>>;
     } catch {
