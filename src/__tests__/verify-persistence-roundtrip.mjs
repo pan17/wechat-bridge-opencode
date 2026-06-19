@@ -26,6 +26,13 @@ afterAll(() => {
 
 // Replicate bridge's load/save JSON shape so we can assert exact field
 // behavior without spinning up the full bridge (which needs auth + network).
+//
+// The bridge writes the multi-user shape (top-level `users: [...]` plus
+// top-level `showThoughts` / `showTools` / `autoPermissionMode` /
+// `immersiveMode`) on save, but accepts BOTH the multi-user shape AND
+// the legacy single-user shape (`sessionId` + `cwd` at top level) on
+// load. We mirror that here so the tests can exercise both code paths
+// without spinning up the full bridge.
 function loadUserState(file) {
   const raw = fs.readFileSync(file, "utf-8");
   const state = JSON.parse(raw);
@@ -38,6 +45,21 @@ function loadUserState(file) {
       showThoughts: state.showThoughts,
       showTools: state.showTools,
       autoPermissionMode: state.autoPermissionMode,
+      immersiveMode: state.immersiveMode,
+    };
+  }
+  // Legacy single-user shape: { sessionId, cwd, ...topLevelFlags }.
+  // The bridge's loadUserState falls through to this branch when the
+  // `users` array is missing or empty (see bridge.ts:621-632).
+  if ("sessionId" in state || "cwd" in state) {
+    return {
+      userId: "",
+      sessionId: state.sessionId ?? "",
+      cwd: state.cwd,
+      showThoughts: state.showThoughts,
+      showTools: state.showTools,
+      autoPermissionMode: state.autoPermissionMode,
+      immersiveMode: state.immersiveMode,
     };
   }
   return null;
@@ -57,6 +79,7 @@ function saveUserState(file, userState) {
   if (userState.showThoughts !== undefined) payload.showThoughts = userState.showThoughts;
   if (userState.showTools !== undefined)    payload.showTools    = userState.showTools;
   if (userState.autoPermissionMode !== undefined) payload.autoPermissionMode = userState.autoPermissionMode;
+  if (userState.immersiveMode !== undefined) payload.immersiveMode = userState.immersiveMode;
   fs.writeFileSync(file, JSON.stringify(payload, null, 2), "utf-8");
 }
 
@@ -181,6 +204,148 @@ describe("persistence round-trip — autoPermissionMode", () => {
     loaded.autoPermissionMode = "off";
     saveUserState(stateFile, loaded);
     expect(JSON.parse(fs.readFileSync(stateFile, "utf-8")).autoPermissionMode).toBe("off");
+  });
+});
+
+// ─── immersiveMode persistence ───
+//
+// Mirrors the autoPermissionMode regression block above. We verify the
+// bridge's loadUserState / saveUserState round-trip preserves the
+// immersive (silent) mode flag in BOTH the multi-user shape (top-level
+// `immersiveMode` field, which is the bridge's save format) AND the
+// legacy single-user shape (`{ sessionId, cwd, immersiveMode }` at top
+// level, which is what older state files used and what bridge.ts:621-632
+// still accepts on load).
+describe("persistence round-trip — immersiveMode (silent mode)", () => {
+  test("regression: /silent on survives bridge restart (multi-user shape)", () => {
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      immersiveMode: true,
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.immersiveMode).toBe(true);
+    // Bridge's startup restore (bridge.ts) must see this defined so it
+    // can call `sessionManager.setImmersiveMode(true)` before the first
+    // turn starts.
+    expect(loaded?.immersiveMode).toBeDefined();
+  });
+
+  test("regression: /silent off survives bridge restart (multi-user shape)", () => {
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      immersiveMode: false,
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.immersiveMode).toBe(false);
+  });
+
+  test("regression: missing immersiveMode field (pre-silent-mode state) loads as undefined", () => {
+    // Old state files (pre-silent-mode feature) have no immersiveMode key.
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      showThoughts: true,
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.immersiveMode).toBeUndefined();
+  });
+
+  test("round-trip: handler mutates immersiveMode then save preserves the new value", () => {
+    // Start with immersiveMode=true (user had /silent on previously).
+    writeInitial();
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        users: [{ userId: "test-user", sessionId: "sess-abc", cwd: "C:/work/proj" }],
+        immersiveMode: true,
+      }, null, 2),
+      "utf-8",
+    );
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.immersiveMode).toBe(true);
+
+    // User types /silent off → handler sets immersiveMode=false → save.
+    loaded.immersiveMode = false;
+    saveUserState(stateFile, loaded);
+
+    const reloaded = loadUserState(stateFile);
+    expect(reloaded?.immersiveMode).toBe(false);
+  });
+
+  test("regression: single-user shape (legacy) also carries immersiveMode", () => {
+    // Older state files (and single-user first-run installs) write the
+    // `sessionId`/`cwd`/top-level-flags shape without a `users` array.
+    // bridge.ts:621-632 still accepts this shape on load — verify our
+    // helper mirrors that.
+    const state = {
+      sessionId: "ses-legacy",
+      cwd: "C:/legacy",
+      immersiveMode: true,
+      showThoughts: false,
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+
+    const loaded = loadUserState(stateFile);
+    expect(loaded).not.toBeNull();
+    expect(loaded?.userId).toBe("");
+    expect(loaded?.sessionId).toBe("ses-legacy");
+    expect(loaded?.cwd).toBe("C:/legacy");
+    expect(loaded?.immersiveMode).toBe(true);
+    expect(loaded?.showThoughts).toBe(false);
+  });
+
+  test("undefined immersiveMode is omitted on save (no clobbering of siblings)", () => {
+    // Old state file has no immersiveMode. User toggles another flag.
+    const state = {
+      users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      showThoughts: true,
+      autoPermissionMode: "once",
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf-8");
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.immersiveMode).toBeUndefined();
+
+    // User types /silent on → handler saves; existing sibling flags
+    // (showThoughts, autoPermissionMode) must NOT be wiped.
+    loaded.immersiveMode = true;
+    saveUserState(stateFile, loaded);
+
+    const raw = fs.readFileSync(stateFile, "utf-8");
+    const reparsed = JSON.parse(raw);
+    expect(reparsed.immersiveMode).toBe(true);
+    expect(reparsed.showThoughts).toBe(true);
+    expect(reparsed.autoPermissionMode).toBe("once");
+  });
+
+  test("user toggles immersiveMode multiple times — only the latest value persists", () => {
+    writeInitial();
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        users: [{ userId: "u", sessionId: "s", cwd: "C:/x" }],
+      }, null, 2),
+      "utf-8",
+    );
+    const loaded = loadUserState(stateFile);
+    expect(loaded?.immersiveMode).toBeUndefined();
+
+    loaded.immersiveMode = true;
+    saveUserState(stateFile, loaded);
+    expect(JSON.parse(fs.readFileSync(stateFile, "utf-8")).immersiveMode).toBe(true);
+
+    loaded.immersiveMode = false;
+    saveUserState(stateFile, loaded);
+    expect(JSON.parse(fs.readFileSync(stateFile, "utf-8")).immersiveMode).toBe(false);
+
+    // undefined → field is omitted on next save
+    loaded.immersiveMode = undefined;
+    saveUserState(stateFile, loaded);
+    expect(JSON.parse(fs.readFileSync(stateFile, "utf-8")).immersiveMode).toBeUndefined();
   });
 });
 

@@ -44,6 +44,7 @@ import {
   parseRejectPermissionCommand,
   parseAutoPermissionCommand,
   parseNotifyCommand,
+  parseSilentCommand,
   parseVersionCommand,
   parseHelpCommand,
   parseHistoryCommand,
@@ -161,6 +162,14 @@ interface UserState {
   cwd: string;
   showThoughts?: boolean;
   showTools?: boolean;
+  /**
+   * Silent / immersive mode. When true, the bridge suppresses the
+   * agent's incremental working output (reasoning, tool summaries,
+   * incremental text parts) and only sends the LAST text part at turn
+   * completion. Questions and permission requests are unaffected.
+   * Persisted across bridge restarts.
+   */
+  immersiveMode?: boolean;
   /**
    * Auto-accept mode for OpenCode permission requests. Persisted across
    * bridge restarts. See `AutoPermissionMode` in
@@ -458,6 +467,14 @@ export class WeChatOpencodeBridge {
       });
     }
 
+    // Restore persisted silent / immersive mode (only if defined to
+    // avoid clobbering the server-side default of `false`). When true,
+    // the SessionManager suppresses incremental working output and only
+    // emits the final text reply at turn completion.
+    if (this.userState?.immersiveMode !== undefined) {
+      this.sessionManager.setImmersiveMode(this.userState.immersiveMode);
+    }
+
     // Restore persisted auto-permission mode (same partial-update
     // principle: default to `off` when absent). The sessionManager
     // consults this on every `permission.asked` event — `off` shows
@@ -577,6 +594,7 @@ export class WeChatOpencodeBridge {
             cwd: string;
             showThoughts?: boolean;
             showTools?: boolean;
+            immersiveMode?: boolean;
             autoPermissionMode?: "off" | "once" | "always";
             notify?: NotifySettings;
           }
@@ -584,6 +602,7 @@ export class WeChatOpencodeBridge {
             users?: Array<{ userId: string; sessionId?: string; cwd: string }>;
             showThoughts?: boolean;
             showTools?: boolean;
+            immersiveMode?: boolean;
             autoPermissionMode?: "off" | "once" | "always";
             notify?: NotifySettings;
           };
@@ -595,6 +614,7 @@ export class WeChatOpencodeBridge {
           cwd: u.cwd,
           showThoughts: state.showThoughts,
           showTools: state.showTools,
+          immersiveMode: state.immersiveMode,
           autoPermissionMode: state.autoPermissionMode,
           notify: state.notify,
         };
@@ -605,6 +625,7 @@ export class WeChatOpencodeBridge {
           cwd: (state as { cwd: string }).cwd,
           showThoughts: state.showThoughts,
           showTools: state.showTools,
+          immersiveMode: (state as { immersiveMode?: boolean }).immersiveMode,
           autoPermissionMode: (state as { autoPermissionMode?: "off" | "once" | "always" }).autoPermissionMode,
           notify: (state as { notify?: NotifySettings }).notify,
         };
@@ -630,6 +651,7 @@ export class WeChatOpencodeBridge {
       };
       if (this.userState.showThoughts !== undefined) payload.showThoughts = this.userState.showThoughts;
       if (this.userState.showTools !== undefined) payload.showTools = this.userState.showTools;
+      if (this.userState.immersiveMode !== undefined) payload.immersiveMode = this.userState.immersiveMode;
       if (this.userState.autoPermissionMode !== undefined) payload.autoPermissionMode = this.userState.autoPermissionMode;
       if (this.userState.notify !== undefined) payload.notify = this.userState.notify;
       fs.writeFileSync(stateFile, JSON.stringify(payload, null, 2));
@@ -939,6 +961,14 @@ export class WeChatOpencodeBridge {
       if (tldCmd) {
         this.handleToolDisplayCommand(contextToken, tldCmd).catch((err) => {
           this.log(`Tool-display command error: ${String(err)}`);
+        });
+        return;
+      }
+
+      const silentCmd = parseSilentCommand(textContent);
+      if (silentCmd) {
+        this.handleSilentCommand(contextToken, silentCmd).catch((err) => {
+          this.log(`Silent command error: ${String(err)}`);
         });
         return;
       }
@@ -1954,6 +1984,7 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         agentStatus,
         otherBusySessions,
         notifySettings: this.notifier?.getSettings() ?? null,
+        immersiveMode: this.sessionManager?.getImmersiveMode() ?? null,
         vcs,
       });
 
@@ -2059,6 +2090,42 @@ const apCmd = parseAutoPermissionCommand(trimmed);
         if (this.userState) this.userState.showTools = false;
         this.saveUserState();
         await this.sendReply(contextToken, "❌ Tool display off");
+        break;
+      }
+    }
+  }
+
+  // ─── Silent mode command (/silent) ───
+
+  private async handleSilentCommand(
+    contextToken: string,
+    cmd: ReturnType<typeof parseSilentCommand>,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    switch (cmd!.kind) {
+      case "status": {
+        const on = this.sessionManager.getImmersiveMode();
+        await this.sendReply(
+          contextToken,
+          `🤫 静默模式: ${on ? "✅ On" : "❌ Off"}\n   /silent on|off|status   开关（默认 Off）\n   /sl on|off|status       简写`,
+        );
+        break;
+      }
+
+      case "on": {
+        this.sessionManager.setImmersiveMode(true);
+        if (this.userState) this.userState.immersiveMode = true;
+        this.saveUserState();
+        await this.sendReply(contextToken, "🤫 静默模式已开启 — 下一轮起将仅在完成时显示最后一条回复");
+        break;
+      }
+
+      case "off": {
+        this.sessionManager.setImmersiveMode(false);
+        if (this.userState) this.userState.immersiveMode = false;
+        this.saveUserState();
+        await this.sendReply(contextToken, "🤫 静默模式已关闭 — 恢复实时显示思考/工具/增量文本");
         break;
       }
     }
@@ -2530,6 +2597,10 @@ const apCmd = parseAutoPermissionCommand(trimmed);
       // "unknown slash command" hint doesn't fire when the user
       // mistypes a subcommand.
       "notify", "n",
+      // Silent / immersive mode command. Recognized by the bridge so
+      // the "unknown slash command" hint doesn't fire when the user
+      // mistypes `/slent` etc.
+      "silent", "sl",
     ];
     if (bridgeCommands.includes(cmdName)) return null;
 

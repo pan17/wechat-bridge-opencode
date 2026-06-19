@@ -315,6 +315,16 @@ export class SessionManager {
   // choice restored at startup (see `bridge.ts:350-355`).
   private showThoughts = true;
   private showTools = true;
+  // Immersive (silent) mode: when enabled, incremental working output
+  // (reasoning, tool summaries, incremental text parts) is hidden from
+  // WeChat during a turn, and only the LAST text part is delivered at
+  // turn completion via the `finalizeTurn` fallback path. Questions and
+  // permission requests are unaffected (they go through their own event
+  // handlers). Toggled via `/silent` (alias `/sl`); default is off.
+  // Same snapshot semantics as `showThoughts` / `showTools`: the per-turn
+  // snapshot is captured at `beginTurn`, so mid-turn toggles only take
+  // effect on the next turn.
+  private immersiveMode = false;
 
   // Context usage
   private totalTokens = 0;
@@ -1827,6 +1837,13 @@ export class SessionManager {
       // rationale. Consumers read these via `getShowFlagsForTurn`.
       showThoughtsSnapshot: this.showThoughts,
       showToolsSnapshot: this.showTools,
+      // Immersive (silent) mode snapshot — same semantics as the show*
+      // snapshots above: captured once at turn-start, mid-turn toggles
+      // via `setImmersiveMode` do NOT update it. When true, the turn
+      // hides reasoning/tool/incremental-text from WeChat and defers
+      // the final text part to the fallback in `finalizeTurn`.
+      immersiveSnapshot: this.immersiveMode,
+      immersiveLastText: "",
       // Reasoning accumulation starts empty. Task 6's `handleReasoningPart`
       // mutates `reasoningCharCount`, `reasoningStartMs`, `reasoningEndMs`,
       // and `sentReasoningPartIds` as reasoning parts arrive. The dedup set
@@ -2195,6 +2212,11 @@ export class SessionManager {
           // streaming, so `finalizeTurn`'s bridge-log summary line
           // continues to work.
           if (!turn.showThoughtsSnapshot) break;
+          // Immersive (silent) mode suppresses reasoning output during the
+          // turn. Metrics (`reasoningCharCount` / `reasoningStartMs` /
+          // `reasoningEndMs`) are still updated by `accumulateReasoningDelta`
+          // for any off-mode log lines, so this is purely a display gate.
+          if (turn.immersiveSnapshot) break;
 
           const now = Date.now();
           const startMs = turn.currentReasoningStartMs ?? now;
@@ -2230,6 +2252,17 @@ export class SessionManager {
           // or legacy path).
           if (turn.sentTextPartIds.has(partID)) break;
           if (!turn.currentText.trim()) break;
+
+          // Immersive (silent) mode: do NOT call onReply during the turn.
+          // Instead, OVERWRITE `immersiveLastText` with the current part's
+          // text so the LAST text part wins, and skip adding to
+          // `sentTextPartIds` so that `anyTextSent` in `finalizeTurn`
+          // stays false and the existing fallback path delivers the
+          // immersive text. Only the final text part survives to the user.
+          if (turn.immersiveSnapshot) {
+            turn.immersiveLastText = turn.currentText;
+            break;
+          }
 
           turn.sentTextPartIds.add(partID);
           this.log(`[text-part] sending part ${partID.slice(0, 8)}… (${turn.currentText.length}ch)`);
@@ -2933,11 +2966,18 @@ export class SessionManager {
     // to the user. Priority:
     //   1. overrideText (session error message)
     //   2. turn.hint (if any)
-    //   3. textBuffer fallback (deltas arrived but no part.updated)
+    //   3. immersiveLastText (immersive-mode turn — last text part hidden
+    //      during streaming, deferred to here so the user gets a single
+    //      final reply instead of incremental parts) OR textBuffer
+    //      fallback (non-immersive deltas arrived but no part.updated)
     if (!anyTextSent && contextToken) {
       let fallback = overrideText ?? turn.hint ?? "";
-      if (!fallback.trim() && turn.textBuffer.trim()) {
-        fallback = turn.textBuffer;
+      if (!fallback.trim()) {
+        if (turn.immersiveSnapshot && turn.immersiveLastText.trim()) {
+          fallback = turn.immersiveLastText;
+        } else if (!turn.immersiveSnapshot && turn.textBuffer.trim()) {
+          fallback = turn.textBuffer;
+        }
       }
       if (fallback.trim()) {
         this.onReply(contextToken, fallback).catch((err) => {
@@ -3164,6 +3204,11 @@ export class SessionManager {
     if (turn.toolCalls.size === 0) return;
     if (!turn.showToolsSnapshot) return;
     if (!turn.contextToken) return;
+    // Immersive (silent) mode suppresses tool summaries during the turn,
+    // matching the user-stated rule that only the last text part is
+    // delivered to WeChat. Mirrors the `if (turn.immersiveSnapshot)
+    // break;` gate added in `flushCurrentPart`'s reasoning/text cases.
+    if (turn.immersiveSnapshot) return;
     // Find tools whose CURRENT status differs from the last status we
     // sent to WeChat. A brand-new callID (not in the map) is always
     // included regardless of status. Same-status repeats are skipped.
@@ -3695,6 +3740,28 @@ export class SessionManager {
 
   getShowFlags(): { showThoughts: boolean; showTools: boolean } {
     return { showThoughts: this.showThoughts, showTools: this.showTools };
+  }
+
+  /**
+   * Update the SessionManager's immersive (silent) mode flag.
+   *
+   * **Snapshot semantics (intentional):** mirrors `setShowFlags` — this
+   * method deliberately does NOT propagate the new value into the
+   * in-flight turn's `immersiveSnapshot`. The snapshot is captured once,
+   * at the start of each turn (see `beginTurn`), and held stable for the
+   * lifetime of that turn. A mid-turn toggle only takes effect on the
+   * NEXT turn. This avoids "flash" behavior where a turn would start
+   * showing incremental output and then suddenly stop halfway through.
+   *
+   * Partial-update safe: only mutates when `value` is defined. Calling
+   * `setImmersiveMode(undefined)` is a no-op.
+   */
+  setImmersiveMode(value: boolean | undefined): void {
+    if (value !== undefined) this.immersiveMode = value;
+  }
+
+  getImmersiveMode(): boolean {
+    return this.immersiveMode;
   }
 
   /**

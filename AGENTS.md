@@ -239,6 +239,16 @@ Settings persist independently across bridge restarts (~/.wechat-bridge-opencode
 
 Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
 
+### Silent Mode (/silent)
+| Command | Description |
+|---------|-------------|
+| `/silent on` (default off) | Enable silent mode (沉浸模式) — hide reasoning, tool summaries, and incremental text parts during a turn; only send the final text reply at turn completion. Questions and permission requests are unaffected. |
+| `/silent off` | Disable silent mode — resume real-time display of reasoning/tool/incremental text |
+| `/silent status` | Show current silent mode state |
+| `/sl` (alias) | Short alias for `/silent` |
+
+Settings persist independently across bridge restarts (~/.wechat-bridge-opencode/.wechat-bridge-state.json).
+
 ### System
 | Command | Description |
 |---------|-------------|

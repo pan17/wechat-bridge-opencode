@@ -356,6 +356,26 @@ export interface AccumulatedTurn {
   showThoughtsSnapshot: boolean;
   showToolsSnapshot: boolean;
   /**
+   * Display flag snapshot — captured at `beginTurn` from the SessionManager's
+   * current `immersiveMode`. Mirrors the snapshot semantics of
+   * `showThoughtsSnapshot` / `showToolsSnapshot`: mid-turn toggles via
+   * `setImmersiveMode` do NOT update this snapshot; the in-flight turn
+   * keeps whatever flag was active when it started. When `true`, the
+   * turn hides reasoning, tool summaries, and incremental text parts
+   * from WeChat, deferring the last text part to `finalizeTurn`'s
+   * fallback path (see `immersiveLastText`).
+   */
+  immersiveSnapshot: boolean;
+  /**
+   * Holds the LAST text part seen during an immersive-mode turn. Set
+   * by `flushCurrentPart`'s `case "text"` whenever `immersiveSnapshot`
+   * is true (overwrite, NOT append — only the final text part is kept).
+   * Read by `finalizeTurn`'s fallback path to deliver the final reply
+   * when no other `onReply` was emitted during the turn. Empty string
+   * when immersive mode is off or no text part arrived.
+   */
+  immersiveLastText: string;
+  /**
    * Total characters of reasoning text accumulated across all reasoning
    * parts in this turn. Used for the "off-mode" log line emitted by
    * `finalizeTurn` when `showThoughtsSnapshot` is false but reasoning was

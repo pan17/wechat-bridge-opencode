@@ -443,3 +443,38 @@ describe("formatStatus with notifySettings", () => {
     expect(out).not.toContain("🔔 Notify");
   });
 });
+
+// ─── formatStatus — immersiveMode integration ───
+
+describe("formatStatus with immersiveMode", () => {
+  const baseOpts = {
+    session: { id: "ses_test", cwd: "/test", title: "Test" },
+    workspace: "/test",
+    agent: "build",
+    model: "anthropic/claude-sonnet-4-5",
+    reasoning: "medium",
+    contextUsage: null,
+  };
+
+  test("immersiveMode: true → '🤫 静默模式: ✅ On'", () => {
+    const out = formatStatus({ ...baseOpts, immersiveMode: true });
+    expect(out).toContain("🤫 静默模式: ✅ On");
+    expect(out).toContain("/silent off to disable");
+  });
+
+  test("immersiveMode: false → '🤫 静默模式: ❌ Off'", () => {
+    const out = formatStatus({ ...baseOpts, immersiveMode: false });
+    expect(out).toContain("🤫 静默模式: ❌ Off");
+    expect(out).toContain("/silent on to enable");
+  });
+
+  test("null immersiveMode → no immersive line (backwards compat)", () => {
+    const out = formatStatus({ ...baseOpts, immersiveMode: null });
+    expect(out).not.toContain("🤫 静默模式");
+  });
+
+  test("undefined immersiveMode → no immersive line (backwards compat)", () => {
+    const out = formatStatus({ ...baseOpts });
+    expect(out).not.toContain("🤫 静默模式");
+  });
+});

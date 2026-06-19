@@ -25,6 +25,7 @@ import {
   parseToolDisplayCommand,
   parseCompactCommand,
   parseHistoryCommand,
+  parseSilentCommand,
   formatStatus,
 } from "../../dist/src/adapter/workspace-cmd.js";
 
@@ -112,6 +113,46 @@ describe("parseHistoryCommand", () => {
   for (const c of historyCases) {
     test(`${c.label}: ${JSON.stringify(c.input)} → ${JSON.stringify(c.expected)}`, () => {
       expect(parseHistoryCommand(c.input)).toEqual(c.expected);
+    });
+  }
+});
+
+// 16 cases for parseSilentCommand (`/silent` / `/sl` — 沉浸模式):
+//   - bare command defaults to status (most common entry point: "what's
+//     my silent mode?") for BOTH the long form and the alias
+//   - on / off / status subcommands for BOTH the long form and the alias
+//   - case-insensitivity
+//   - surrounding whitespace tolerated
+//   - trailing newline tolerated
+//   - strict rejection: invalid subcommand, extra args, numeric arg,
+//     different word, empty input
+//
+// Like the other display parsers, parseSilentCommand returns `null` on
+// any unrecognized input so the dispatcher can fall through to the
+// regular "unknown slash command" hint.
+const silentCases = [
+  { input: "/silent",         expected: { kind: "status" }, label: "bare /silent → status" },
+  { input: "/sl",             expected: { kind: "status" }, label: "bare /sl alias → status" },
+  { input: "/silent on",      expected: { kind: "on" },     label: "/silent on" },
+  { input: "/silent off",     expected: { kind: "off" },    label: "/silent off" },
+  { input: "/silent status",  expected: { kind: "status" }, label: "/silent status" },
+  { input: "/sl on",          expected: { kind: "on" },     label: "/sl on (alias)" },
+  { input: "/sl off",         expected: { kind: "off" },    label: "/sl off (alias)" },
+  { input: "/sl status",      expected: { kind: "status" }, label: "/sl status (alias)" },
+  { input: "/SILENT ON",      expected: { kind: "on" },     label: "case-insensitive /SILENT ON" },
+  { input: "/silent  on",     expected: { kind: "on" },     label: "extra spaces around subcommand" },
+  { input: "/silent foo",     expected: null,               label: "invalid subcommand → null" },
+  { input: "/silent on extra", expected: null,              label: "extra args rejected → null" },
+  { input: "/silent 5",       expected: null,               label: "numeric arg rejected → null" },
+  { input: "/not-silent",     expected: null,               label: "different word /not-silent rejected" },
+  { input: "",                expected: null,               label: "empty string → null" },
+  { input: "/silent\n",       expected: { kind: "status" }, label: "trailing newline tolerated" },
+];
+
+describe("parseSilentCommand", () => {
+  for (const c of silentCases) {
+    test(`${c.label}: ${JSON.stringify(c.input)} → ${JSON.stringify(c.expected)}`, () => {
+      expect(parseSilentCommand(c.input)).toEqual(c.expected);
     });
   }
 });

@@ -61,6 +61,10 @@ export interface ToolDisplayCommand {
   kind: "status" | "on" | "off";
 }
 
+export interface SilentCommand {
+  kind: "status" | "on" | "off";
+}
+
 export interface StopCommand {
   kind: "stop";
 }
@@ -403,6 +407,35 @@ export function parseToolDisplayCommand(text: string): ToolDisplayCommand | null
   }
 }
 
+/**
+ * Parse `/silent` (or short alias `/sl`) to query or toggle silent mode
+ * (沉浸模式). When enabled, the bridge hides the agent's incremental
+ * working output (reasoning, tool summaries, incremental text parts)
+ * during a turn, and only sends the LAST text part at turn completion.
+ * Questions and permission requests are unaffected.
+ *
+ * Two sub-shapes:
+ *
+ *   `/silent`                  → { kind: "status" }  (default: show current state)
+ *   `/silent on|off|status`    → { kind: … }
+ *
+ * The bare `/silent` defaults to `status` so users get a readout of
+ * their current configuration without having to type the subcommand.
+ * Returns null for unrecognized input so the dispatcher can fall
+ * through to the regular "unknown slash command" hint.
+ */
+export function parseSilentCommand(text: string): SilentCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  // Bare command → status (most common entry point: "what's my silent mode?")
+  if (trimmed === "/silent" || trimmed === "/sl") {
+    return { kind: "status" };
+  }
+  // /silent on|off|status
+  const m = trimmed.match(/^\/(?:silent|sl)\s+(on|off|status)\s*$/);
+  if (!m) return null;
+  return { kind: m[1] as "on" | "off" | "status" };
+}
+
 export function parseStopCommand(text: string): StopCommand | null {
   const trimmed = text.trim().toLowerCase();
   if (trimmed === "/stop") {
@@ -680,6 +713,17 @@ export function formatStatus(opts: {
    */
   notifySettings?: NotifySettings | null;
   /**
+   * Silent / immersive mode flag — when true, the bridge hides the agent's
+   * incremental working output (reasoning, tool summaries, incremental
+   * text parts) and only sends the LAST text part at turn completion.
+   * Rendered as a single compact `🤫 静默模式: ✅ On / ❌ Off` line, placed
+   * right after the `🔔 Notify` line for consistency with `/notify` /
+   * `/silent` being a related "display mode" pair. `null` / `undefined`
+   * → omit the line (backwards compat for callers that don't supply it).
+   * See `src/server/session.ts#setImmersiveMode` for the source of truth.
+   */
+  immersiveMode?: boolean | null;
+  /**
    * VCS (git) info for the current workspace, fetched via
    * `GET /vcs?directory=<workspace>` on the OpenCode Server. Rendered
    * as a single `🌿 Branch: <branch> (default: <defaultBranch>)` line
@@ -782,6 +826,17 @@ export function formatStatus(opts: {
       lines.push("  🔔 Notify: ❌ Off   (use /notify on to enable)");
     }
   }
+
+  // Silent / immersive mode — single compact line, mirrors the `/silent`
+  // command's own status output. Placed right after `🔔 Notify` since
+  // both are display-mode toggles the user typically scans together.
+  if (opts.immersiveMode === true) {
+    lines.push("  🤫 静默模式: ✅ On     (use /silent off to disable)");
+  } else if (opts.immersiveMode === false) {
+    lines.push("  🤫 静默模式: ❌ Off    (use /silent on to enable)");
+  }
+  // `null` / `undefined` → omit (backwards compat with callers that
+  // haven't been updated to read the new SessionManager flag yet).
 
   // MCP servers (show all so the user can see what's loaded, with failures
   // surfaced prominently). Disabled servers are skipped — they're off by
@@ -1122,6 +1177,10 @@ export function formatHelp(): string {
     "  /tool-display off       关闭工具调用摘要",
     "  /tool-display status    查看当前显示设置",
     "",
+    "── 静默模式 ──",
+    "  /silent on|off|status   开关/查看沉浸模式（隐藏思考/工具/增量文本，仅在轮次结束时显示最终回复）",
+    "  （简写: /sl ...）",
+    "",
     "── 消息计数 ──",
     "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
     "",
@@ -1216,6 +1275,10 @@ export function formatHelpWithNativeCommands(nativeCommands: Array<{ name: strin
     "  /tool-display on        开启工具调用摘要（默认）",
     "  /tool-display off       关闭工具调用摘要",
     "  /tool-display status    查看当前显示设置",
+    "",
+    "── 静默模式 ──",
+    "  /silent on|off|status   开关/查看沉浸模式（隐藏思考/工具/增量文本，仅在轮次结束时显示最终回复）",
+    "  （简写: /sl ...）",
     "",
     "── 消息计数 ──",
     "  /next                    重置微信连续发送消息计数（不转发给 Agent）",
