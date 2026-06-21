@@ -18,7 +18,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import os from "node:os";
 import qrcodeTerminal from "qrcode-terminal";
 import { WeChatOpencodeBridge } from "../src/bridge.js";
@@ -275,6 +275,115 @@ async function killProcessTree(pid: number, log: (msg: string) => void): Promise
   }
 }
 
+/**
+ * Wait for the OpenCode Server to be ready to serve real requests.
+ *
+ * Two-phase probe:
+ *   1. `GET /global/health` — cheap liveness check that tells us the
+ *      server is accepting connections at all.
+ *   2. `GET /config` — exercises the same routing layer as `/session`,
+ *      so a 200 here means the session/SSE subsystem is also up. (On
+ *      Windows + npx + `opencode-ai.exe`, `/global/health` returns 200
+ *      ~1-3 seconds BEFORE the session subsystem is actually ready —
+ *      this is the source of the original "TypeError: fetch failed"
+ *      race during restart.)
+ *
+ * Error semantics:
+ *   - 200 from `/config` → ready, return.
+ *   - 401 / 403 from `/config` → config error (auth mismatch), log and
+ *      return early. The bridge will surface its own 401 the next time
+ *      it tries to use the client; we don't want a misleading "server
+ *      not ready" message.
+ *   - 5xx or fetch failure → still initializing, keep retrying within
+ *      the budget.
+ *   - Budget exhausted → log a warning and return. The bridge will
+ *      fail loudly if the server is actually broken.
+ *
+ * Exported for unit testing; the CLI script's default invocation
+ * ignores the export.
+ */
+export async function waitForServerReady(
+  serverUrl: string,
+  authHeader: string | undefined,
+  timeoutMs: number,
+  log: (msg: string) => void,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let configAttempts = 0;
+  while (Date.now() < deadline) {
+    // Phase 1: cheap liveness check.
+    let healthOk = false;
+    try {
+      const res = await fetch(`${serverUrl}/global/health`, {
+        signal: AbortSignal.timeout(2_000),
+      });
+      healthOk = res.ok;
+    } catch {
+      healthOk = false;
+    }
+    if (healthOk) {
+      // Phase 2: probe a "real" endpoint that exercises session routing.
+      try {
+        const headers: Record<string, string> = {};
+        if (authHeader) headers["Authorization"] = authHeader;
+        const res = await fetch(`${serverUrl}/config`, {
+          method: "GET",
+          headers,
+          signal: AbortSignal.timeout(2_000),
+        });
+        if (res.ok) {
+          log("Server is ready");
+          return;
+        }
+        if (res.status === 401 || res.status === 403) {
+          // Config error, not a race. Log and bail — the bridge's
+          // first authenticated call will surface the real error.
+          log(
+            `Server responded ${res.status} to /config — auth mismatch or forbidden. ` +
+              `Continuing; the bridge will surface the error on first use.`,
+          );
+          return;
+        }
+        // 5xx and other non-2xx: still initializing. Fall through to
+        // the wait-and-retry loop.
+        configAttempts++;
+      } catch {
+        // Fetch failure (connection refused, timeout, etc.) — server
+        // not yet accepting real requests. Fall through to retry.
+        configAttempts++;
+      }
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, 1_000));
+  }
+  log(
+    `Warning: server may not be ready yet after ${timeoutMs}ms ` +
+      `(probed /config ${configAttempts} time${configAttempts === 1 ? "" : "s"}), continuing...`,
+  );
+}
+
+/**
+ * Build the `Authorization` header value for the opencode server from
+ * CLI / config / env-resolved `WeChatOpencodeConfig["server"]` fields.
+ * Returns `undefined` when no credentials are configured.
+ *
+ * Precedence: Bearer token > Basic auth. Basic auth requires BOTH
+ * `username` and `password` — if only one is provided we return
+ * `undefined` rather than sending a malformed header. Mirrors the
+ * logic in `src/server/client.ts:buildAuthHeader`.
+ */
+export function buildServerAuthHeader(server: {
+  username?: string;
+  password?: string;
+  token?: string;
+}): string | undefined {
+  if (server.token) return `Bearer ${server.token}`;
+  if (server.username && server.password) {
+    return `Basic ${btoa(`${server.username}:${server.password}`)}`;
+  }
+  return undefined;
+}
+
 async function startServer(config: WeChatOpencodeConfig): Promise<void> {
   const cmd = config.server.command ?? "npx";
   const args = config.server.args ?? ["opencode-ai", "serve", "--port", "4096"];
@@ -316,19 +425,8 @@ async function startServer(config: WeChatOpencodeConfig): Promise<void> {
 
   // Wait for server to be ready
   const serverUrl = config.server.url;
-  for (let i = 0; i < 30; i++) {
-    try {
-      const res = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
-      if (res.ok) {
-        log("Server is ready");
-        return;
-      }
-    } catch {
-      // Not ready yet
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  log("Warning: server may not be ready yet, continuing...");
+  const authHeader = buildServerAuthHeader(config.server);
+  await waitForServerReady(serverUrl, authHeader, 30_000, log);
 }
 
 async function stopServer(config: WeChatOpencodeConfig): Promise<void> {
@@ -511,7 +609,21 @@ process.on("uncaughtException", (err) => {
   console.error(`[${ts}] uncaughtException: ${err.stack ?? err.message}`);
 });
 
-main().catch((err) => {
-  console.error(`Fatal: ${String(err)}`);
-  process.exit(1);
-});
+// Only invoke main() when this file is run directly as a CLI
+// (`node dist/bin/wechat-opencode.js`). When the test suite imports
+// the named exports `waitForServerReady` / `buildServerAuthHeader`,
+// the module is loaded as a library — invoking main() here would
+// kick off the bridge in the same process and OOM the test worker
+// (npx + opencode-ai.exe + accumulating logs blow past the heap).
+// The standard "am I the entry point?" check uses
+// `import.meta.url === pathToFileURL(process.argv[1])`; on Windows
+// the URL round-trips cleanly so the comparison works.
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  main().catch((err) => {
+    console.error(`Fatal: ${String(err)}`);
+    process.exit(1);
+  });
+}

@@ -9,6 +9,20 @@ import type { MessagePart, MessageResponse, ServerSessionInfo, ServerProjectInfo
 import type { QuestionRequest } from "../types/question.js";
 import type { PermissionReply, PermissionRequest } from "../types/permission.js";
 import type { SessionStatus } from "../types/events.js";
+import { isRetryableNetworkError } from "../utils/network.js";
+
+/** Default per-attempt timeout applied to every call through `fetch()`. */
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+/** Default number of retries on transient network failures. */
+const DEFAULT_RETRIES = 2;
+
+/** Base delay (ms) for exponential backoff between retries. */
+const RETRY_BASE_DELAY_MS = 1_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export interface OpenCodeServerClientOpts {
   baseUrl: string;
@@ -754,9 +768,24 @@ export class OpenCodeServerClient {
    *
    * Per-method timeout policy:
    *   - Pass `timeoutMs` in `init` to apply an AbortSignal timeout for this call.
-   *   - By default NO timeout is applied. sendMessage() and the SSE event
-   *     pipeline need unbounded time; short probes (health/list) should pass
-   *     an explicit `timeoutMs`.
+   *   - By default a 15s timeout is applied to each attempt — prevents
+   *     indefinite hangs on a wedged server. Callers that need a longer
+   *     window (e.g. `sendMessage` for long agent turns, `compactSession`
+   *     for a server-side LLM call) pass an explicit `timeoutMs`.
+   *   - `timeoutMs: 0` opts out of the default entirely (unbounded).
+   *
+   * Retry policy:
+   *   - Retries transient network failures (via the shared
+   *     `isRetryableNetworkError` classifier) up to `retries` times
+   *     (default: 2 → 3 total attempts). Backoff: `1000ms * 2^attempt`.
+   *   - Does NOT retry on HTTP 4xx / 5xx (the `Response` is returned
+   *     to the caller, which checks `res.ok`).
+   *   - Does NOT retry on `AbortError` — the per-attempt timeout fired,
+   *     meaning the call is too slow to recover from. The error is
+   *     surfaced to the caller.
+   *   - After all retries exhausted, throws the LAST error with its
+   *     `.cause` chain preserved.
+   *   - Pass `retries: 0` to disable retry entirely.
    *
    * Auth: when an `Authorization` header was pre-computed from constructor
    * options, it is injected on every request. Caller-supplied `headers`
@@ -765,26 +794,83 @@ export class OpenCodeServerClient {
    */
   private async fetch(
     path: string,
-    init: RequestInit & { timeoutMs?: number } = {},
+    init: RequestInit & { timeoutMs?: number; retries?: number } = {},
   ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
-    this.log(`[server] ${init.method ?? "GET"} ${url}`);
+    const method = init.method ?? "GET";
+    this.log(`[server] ${method} ${url}`);
 
-    const { timeoutMs, ...rest } = init;
-    const finalInit: RequestInit = { ...rest };
-    if (timeoutMs !== undefined && timeoutMs > 0) {
-      finalInit.signal = AbortSignal.timeout(timeoutMs);
-    }
-    if (this.authHeader) {
-      const existing = (finalInit.headers ?? {}) as Record<string, string>;
-      // Caller-provided Authorization always wins over the client's default.
-      if (!existing["Authorization"] && !existing["authorization"]) {
-        finalInit.headers = { ...existing, Authorization: this.authHeader };
-      } else {
-        finalInit.headers = existing;
+    const { timeoutMs, retries, ...rest } = init;
+    // Per-attempt timeout: explicit value wins, then 0 means "off",
+    // otherwise the 15s default prevents indefinite hangs on a wedged
+    // server.
+    const effectiveTimeoutMs = timeoutMs !== undefined ? timeoutMs : DEFAULT_TIMEOUT_MS;
+    const maxRetries = retries ?? DEFAULT_RETRIES;
+    // retries=0 → 1 total attempt; retries=2 → 3 total attempts.
+    const maxAttempts = maxRetries + 1;
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const finalInit: RequestInit = { ...rest };
+      // Fresh AbortSignal per attempt so the timeout resets on retry
+      // (shared signal would short-circuit the second attempt the
+      // moment the first one timed out).
+      if (effectiveTimeoutMs > 0) {
+        finalInit.signal = AbortSignal.timeout(effectiveTimeoutMs);
+      }
+      if (this.authHeader) {
+        const existing = (finalInit.headers ?? {}) as Record<string, string>;
+        // Caller-provided Authorization always wins over the client's default.
+        if (!existing["Authorization"] && !existing["authorization"]) {
+          finalInit.headers = { ...existing, Authorization: this.authHeader };
+        } else {
+          finalInit.headers = existing;
+        }
+      }
+
+      try {
+        return await fetch(url, finalInit);
+      } catch (err) {
+        lastError = err;
+
+        // AbortError means the per-attempt timeout fired. The call is
+        // too slow to recover from — surface immediately so callers
+        // can decide whether to fall back. This is intentional: the
+        // OpenCode Server's `/session/:id/message` handler can take
+        // minutes for a long agent turn, and callers that need that
+        // opt into a longer `timeoutMs`. Retrying an already-timed-out
+        // request would just triple the wait.
+        if ((err as { name?: unknown }).name === "AbortError") {
+          throw err;
+        }
+
+        const isLastAttempt = attempt >= maxRetries;
+        if (isLastAttempt || !isRetryableNetworkError(err)) {
+          // Either out of retries, or non-transient (parse error,
+          // unknown failure mode). Break out and re-throw below.
+          break;
+        }
+
+        const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        this.log(
+          `fetch ${method} ${path} failed (attempt ${attempt + 1}/${maxAttempts}), ` +
+            `retrying in ${delayMs}ms: ${String(err)}`,
+        );
+        await sleep(delayMs);
       }
     }
 
-    return fetch(url, finalInit);
+    // Throw the LAST error, preserving the cause-unwrapping behaviour
+    // shared with `apiPost` in `src/weixin/api.ts` — attach `.cause` to
+    // the wrapped Error so downstream log inspection can still walk it.
+    const cause = (lastError as Error & { cause?: unknown })?.cause;
+    if (cause !== undefined) {
+      const wrapped = new Error(
+        `${(lastError as Error).message}: ${String(cause)}`,
+      );
+      (wrapped as Error & { cause?: unknown }).cause = cause;
+      throw wrapped;
+    }
+    throw lastError;
   }
 }

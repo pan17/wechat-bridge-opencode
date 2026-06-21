@@ -14,51 +14,14 @@ import type {
   SendTypingReq,
   GetConfigResp,
 } from "./types.js";
+import { isRetryableNetworkError } from "../utils/network.js";
 
 const CHANNEL_VERSION = "1.0.2";
 
-/**
- * Transient-network-error codes we retry on. The classifier walks the
- * cause chain looking for any of these — undici-style names
- * (`UND_ERR_*`) and Node `errno`-style codes both appear depending on
- * the platform / Node version. Sourced from undici's `errors` module
- * and Node's `libuv` error table.
- */
-const RETRYABLE_NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
-  // undici (Node fetch's default backend in Node 18+)
-  "UND_ERR_CONNECT_TIMEOUT",
-  "UND_ERR_SOCKET",
-  // Node libuv errno-style codes
-  "ECONNRESET",
-  "ECONNREFUSED",
-  "ETIMEDOUT",
-  "EAI_AGAIN",
-  "ENETUNREACH",
-  "EHOSTUNREACH",
-]);
-
-/**
- * Walk the cause chain looking for any `code` matching a known transient
- * network-failure code. Returns false for `AbortError` (the
- * `getUpdates` long-poll sentinel path is handled separately inside
- * `apiPost`), for plain non-Error values, and for any error without a
- * recognised code in its chain.
- */
-export function isRetryableNetworkError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  let current: unknown = err;
-  const seen = new Set<unknown>();
-  while (current && typeof current === "object" && !seen.has(current)) {
-    seen.add(current);
-    const obj = current as { name?: unknown; code?: unknown; cause?: unknown };
-    if (obj.name === "AbortError") return false;
-    if (typeof obj.code === "string" && RETRYABLE_NETWORK_ERROR_CODES.has(obj.code)) {
-      return true;
-    }
-    current = obj.cause;
-  }
-  return false;
-}
+// Re-export so existing imports (e.g. the retry test suite) keep
+// working — the canonical definition now lives in `src/utils/network.ts`
+// and is shared with `src/server/client.ts`.
+export { isRetryableNetworkError };
 
 export interface ApiPostOptions {
   /** How many retries to attempt on transient network failures. Default: 2. */
