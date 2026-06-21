@@ -204,6 +204,41 @@ function daemonize(config: WeChatOpencodeConfig): void {
 let serverProcess: ChildProcess | null = null;
 
 /**
+ * Default budget for `waitForServerReady` — covers the npx-first-install
+ * case where `npx opencode-ai serve` has to download the package
+ * (~10s–2min typical, 3–5min on slow networks) before the binary
+ * actually starts listening.
+ */
+const DEFAULT_STARTUP_TIMEOUT_MS = 180_000; // 3 minutes
+
+/** Env var to override the default startup budget (milliseconds). */
+const STARTUP_TIMEOUT_ENV = "WECHAT_OPENCODE_STARTUP_TIMEOUT_MS";
+
+/** How often to log a progress message while the server is still starting up. */
+const PROGRESS_LOG_INTERVAL_MS = 20_000;
+
+/**
+ * Read the startup timeout from the env var, falling back to the default.
+ * Exported for unit testing.
+ *
+ * Accepts any non-negative integer. Negative or non-numeric values log a
+ * warning and fall back to the default. `0` is valid (immediate-fail path,
+ * useful for tests / smoke checks).
+ */
+export function readStartupTimeoutMs(): number {
+  const raw = process.env[STARTUP_TIMEOUT_ENV];
+  if (!raw) return DEFAULT_STARTUP_TIMEOUT_MS;
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    console.warn(
+      `[server] Invalid ${STARTUP_TIMEOUT_ENV}=${raw}; using default ${DEFAULT_STARTUP_TIMEOUT_MS}ms`,
+    );
+    return DEFAULT_STARTUP_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
+/**
  * Wait for the server's TCP port to actually be free. After a process tree
  * kill, the OS may briefly keep the listening socket in TIME_WAIT before
  * releasing it; polling the health endpoint (which will refuse connections
@@ -308,8 +343,15 @@ export async function waitForServerReady(
   timeoutMs: number,
   log: (msg: string) => void,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const startMs = Date.now();
+  const deadline = startMs + timeoutMs;
   let configAttempts = 0;
+  // Track when we last logged a progress message. We log at fixed
+  // intervals (PROGRESS_LOG_INTERVAL_MS) so a slow first-time npx
+  // install doesn't go silent for 3 minutes while the admin wonders
+  // whether the bridge is wedged.
+  let nextProgressLogAt = startMs + PROGRESS_LOG_INTERVAL_MS;
+
   while (Date.now() < deadline) {
     // Phase 1: cheap liveness check.
     let healthOk = false;
@@ -353,12 +395,32 @@ export async function waitForServerReady(
         configAttempts++;
       }
     }
-    if (Date.now() >= deadline) break;
+
+    // Progress log: fire on the first threshold and every interval
+    // after. First one (at ~20s) is terse; later ones include the
+    // npx-download hint because by 20s the most likely cause is a
+    // first-time install of the opencode-ai package.
+    const now = Date.now();
+    if (now >= nextProgressLogAt) {
+      const elapsedSec = Math.floor((now - startMs) / 1000);
+      const remainingSec = Math.max(0, Math.ceil((deadline - now) / 1000));
+      log(
+        `Still waiting for server... ${elapsedSec}s elapsed, ${remainingSec}s remaining. ` +
+          `May be downloading opencode-ai via npx on first install; ` +
+          `set ${STARTUP_TIMEOUT_ENV} to increase the budget if needed.`,
+      );
+      nextProgressLogAt = now + PROGRESS_LOG_INTERVAL_MS;
+    }
+
+    if (now >= deadline) break;
     await new Promise((r) => setTimeout(r, 1_000));
   }
+
+  const totalSec = Math.floor((Date.now() - startMs) / 1000);
   log(
     `Warning: server may not be ready yet after ${timeoutMs}ms ` +
-      `(probed /config ${configAttempts} time${configAttempts === 1 ? "" : "s"}), continuing...`,
+      `(probed /config ${configAttempts} time${configAttempts === 1 ? "" : "s"}, ${totalSec}s elapsed). ` +
+      `If this is a first-time npx download of opencode-ai, set ${STARTUP_TIMEOUT_ENV}=600000 and retry.`,
   );
 }
 
@@ -423,10 +485,18 @@ async function startServer(config: WeChatOpencodeConfig): Promise<void> {
     log(`Error: ${String(err)}`);
   });
 
-  // Wait for server to be ready
+  // Wait for server to be ready. The 3-minute default covers first-time
+  // `npx opencode-ai` downloads; `WECHAT_OPENCODE_STARTUP_TIMEOUT_MS`
+  // can raise it (e.g. on slow networks where the package fetch alone
+  // takes 3+ minutes).
   const serverUrl = config.server.url;
   const authHeader = buildServerAuthHeader(config.server);
-  await waitForServerReady(serverUrl, authHeader, 30_000, log);
+  const startupTimeoutMs = readStartupTimeoutMs();
+  log(
+    `Waiting up to ${startupTimeoutMs}ms (${(startupTimeoutMs / 1000).toFixed(0)}s) for server to be ready ` +
+      `(${STARTUP_TIMEOUT_ENV}=${process.env[STARTUP_TIMEOUT_ENV] ?? "(unset, using default)"})`,
+  );
+  await waitForServerReady(serverUrl, authHeader, startupTimeoutMs, log);
 }
 
 async function stopServer(config: WeChatOpencodeConfig): Promise<void> {

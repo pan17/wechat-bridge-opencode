@@ -15,11 +15,13 @@ import { describe, test, expect, vi, afterEach } from "vitest";
 import {
   waitForServerReady,
   buildServerAuthHeader,
+  readStartupTimeoutMs,
 } from "../../dist/bin/wechat-opencode.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
+  delete process.env.WECHAT_OPENCODE_STARTUP_TIMEOUT_MS;
 });
 
 // ─── Helpers ───
@@ -225,6 +227,116 @@ describe("waitForServerReady", () => {
     // no auth configured.
     const auth = capturedInit.headers?.["Authorization"] ?? capturedInit.headers?.["authorization"];
     expect(auth).toBeUndefined();
+  });
+
+  // ─── Progress logging (npx-download hint) ───
+  // These tests need a way to advance wall-clock time without actually
+  // sleeping. The cleanest path is vi.useFakeTimers + vi.advanceTimersByTime
+  // so the inner setTimeout(resolve, 1000) sleep inside the wait loop
+  // resolves in microseconds rather than wall-clock seconds.
+  test("T6: logs a progress message with npx hint after 20s of waiting", async () => {
+    vi.useFakeTimers();
+    const log = vi.fn();
+    const fetchMock = makeMockFetch((u) => {
+      if (u.pathname === "/global/health") return jsonResponse(200, { ok: true });
+      if (u.pathname === "/config") return emptyResponse(503);
+      return emptyResponse(404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // 90s budget — long enough to fire at least 3 progress logs
+    // (at 20s, 40s, 60s) before the deadline at 90s.
+    const promise = waitForServerReady(SERVER_URL, undefined, 90_000, log);
+    // Advance through the first progress log threshold.
+    await vi.advanceTimersByTimeAsync(21_000);
+    // Advance through the second and third thresholds.
+    await vi.advanceTimersByTimeAsync(40_000);
+    // Advance past the deadline.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await promise;
+
+    const calls = log.mock.calls.map((c) => c[0]).join("\n");
+    // At least one progress log mentioning elapsed + remaining.
+    expect(calls).toMatch(/Still waiting for server/);
+    // The npx-download hint should be included in progress logs.
+    expect(calls).toMatch(/npx/i);
+    expect(calls).toMatch(/opencode-ai/);
+    // Final warning still mentions the env var override path.
+    expect(calls).toMatch(/Warning: server may not be ready yet/);
+    expect(calls).toMatch(/WECHAT_OPENCODE_STARTUP_TIMEOUT_MS/);
+  });
+
+  test("T7: progress log does NOT fire if server comes up in <20s", async () => {
+    // Real timers here — the function should resolve in <1s and never
+    // hit the 20s progress-log threshold.
+    const log = vi.fn();
+    const fetchMock = makeMockFetch((u) => {
+      if (u.pathname === "/global/health") return jsonResponse(200, { ok: true });
+      if (u.pathname === "/config") return jsonResponse(200, { model: "anthropic/claude" });
+      return emptyResponse(404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await waitForServerReady(SERVER_URL, undefined, 5_000, log);
+    const calls = log.mock.calls.map((c) => c[0]).join("\n");
+    // "Server is ready" fires, but no progress log.
+    expect(calls).toMatch(/Server is ready/);
+    expect(calls).not.toMatch(/Still waiting for server/);
+  });
+
+  test("T8: final warning message includes env var override hint", async () => {
+    // Real timer with a tiny budget — server is broken, so we hit the
+    // final warning quickly.
+    const log = vi.fn();
+    const fetchMock = makeMockFetch((u) => {
+      if (u.pathname === "/global/health") return jsonResponse(200, { ok: true });
+      if (u.pathname === "/config") return emptyResponse(503);
+      return emptyResponse(404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await waitForServerReady(SERVER_URL, undefined, 250, log);
+    const calls = log.mock.calls.map((c) => c[0]).join("\n");
+    expect(calls).toMatch(/Warning: server may not be ready yet/);
+    expect(calls).toMatch(/first-time npx download/);
+    expect(calls).toMatch(/WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=600000/);
+  });
+});
+
+// ─── readStartupTimeoutMs ───
+
+describe("readStartupTimeoutMs", () => {
+  test("returns 180000 (3 min) when env var is unset", () => {
+    delete process.env.WECHAT_OPENCODE_STARTUP_TIMEOUT_MS;
+    expect(readStartupTimeoutMs()).toBe(180_000);
+  });
+
+  test("returns the env var value when set to a valid positive integer", () => {
+    process.env.WECHAT_OPENCODE_STARTUP_TIMEOUT_MS = "300000";
+    expect(readStartupTimeoutMs()).toBe(300_000);
+  });
+
+  test("returns 0 when env var is set to '0' (immediate-fail path)", () => {
+    process.env.WECHAT_OPENCODE_STARTUP_TIMEOUT_MS = "0";
+    expect(readStartupTimeoutMs()).toBe(0);
+  });
+
+  test("falls back to default and warns when env var is non-numeric", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.WECHAT_OPENCODE_STARTUP_TIMEOUT_MS = "forever";
+    expect(readStartupTimeoutMs()).toBe(180_000);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/Invalid WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=forever/),
+    );
+  });
+
+  test("falls back to default and warns when env var is negative", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.WECHAT_OPENCODE_STARTUP_TIMEOUT_MS = "-1";
+    expect(readStartupTimeoutMs()).toBe(180_000);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/Invalid WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=-1/),
+    );
   });
 });
 
