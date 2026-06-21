@@ -17,6 +17,63 @@ import type {
 
 const CHANNEL_VERSION = "1.0.2";
 
+/**
+ * Transient-network-error codes we retry on. The classifier walks the
+ * cause chain looking for any of these — undici-style names
+ * (`UND_ERR_*`) and Node `errno`-style codes both appear depending on
+ * the platform / Node version. Sourced from undici's `errors` module
+ * and Node's `libuv` error table.
+ */
+const RETRYABLE_NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
+  // undici (Node fetch's default backend in Node 18+)
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+  // Node libuv errno-style codes
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+]);
+
+/**
+ * Walk the cause chain looking for any `code` matching a known transient
+ * network-failure code. Returns false for `AbortError` (the
+ * `getUpdates` long-poll sentinel path is handled separately inside
+ * `apiPost`), for plain non-Error values, and for any error without a
+ * recognised code in its chain.
+ */
+export function isRetryableNetworkError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const obj = current as { name?: unknown; code?: unknown; cause?: unknown };
+    if (obj.name === "AbortError") return false;
+    if (typeof obj.code === "string" && RETRYABLE_NETWORK_ERROR_CODES.has(obj.code)) {
+      return true;
+    }
+    current = obj.cause;
+  }
+  return false;
+}
+
+export interface ApiPostOptions {
+  /** How many retries to attempt on transient network failures. Default: 2. */
+  retries?: number;
+  /** Base delay in ms for exponential backoff. Default: 1000 (so 1s, 2s, 4s, ...). */
+  baseDelayMs?: number;
+  /**
+   * Optional external abort signal — when aborted, the current fetch
+   * rejects immediately. Useful for caller-driven cancellation (the
+   * bridge doesn't currently use this, but it's exposed for future
+   * use). Per-attempt timeouts still apply independently.
+   */
+  abortSignal?: AbortSignal;
+}
+
 function randomWechatUin(): string {
   const uint32 = crypto.randomBytes(4).readUInt32BE(0);
   return Buffer.from(String(uint32), "utf-8").toString("base64");
@@ -49,45 +106,102 @@ async function apiGet<T>(baseUrl: string, path: string, token?: string): Promise
   return JSON.parse(text) as T;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function apiPost<T>(
   baseUrl: string,
   endpoint: string,
   body: Record<string, unknown>,
   token?: string,
   timeoutMs = 15_000,
+  options?: ApiPostOptions,
 ): Promise<T> {
   const url = `${baseUrl.replace(/\/$/, "")}/${endpoint}`;
   const payload = { ...body, base_info: buildBaseInfo() };
   const bodyStr = JSON.stringify(payload);
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const retries = options?.retries ?? 2;
+  const baseDelayMs = options?.baseDelayMs ?? 1000;
+  // retries=0 means "no retry, single attempt"; retries=2 means "up to
+  // three total attempts (initial + 2 retries)".
+  const maxAttempts = retries + 1;
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: buildHeaders({ token, body: bodyStr }),
-      body: bodyStr,
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
-    return JSON.parse(text) as T;
-  } catch (err) {
-    clearTimeout(timer);
-    if ((err as Error).name === "AbortError") {
-      return { ret: 0, msgs: [] } as T;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // Link the caller's abort signal (if any) to this attempt's
+    // controller so an external cancel interrupts the current fetch.
+    // Listener is removed via `signal` AbortController teardown at
+    // end of attempt — `{ once: true }` is defense-in-depth.
+    let externalAbortListener: (() => void) | undefined;
+    if (options?.abortSignal) {
+      if (options.abortSignal.aborted) {
+        controller.abort();
+      } else {
+        externalAbortListener = () => controller.abort();
+        options.abortSignal.addEventListener("abort", externalAbortListener, { once: true });
+      }
     }
-    // Unwrap undici's underlying network error (ECONNRESET, ETIMEDOUT, etc.)
-    // so bridge logs surface the real socket-level cause instead of the
-    // generic "TypeError: fetch failed" wrapper.
-    const cause = (err as Error & { cause?: unknown }).cause;
-    if (cause) {
-      throw new Error(`${(err as Error).message}: ${String(cause)}`);
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: buildHeaders({ token, body: bodyStr }),
+        body: bodyStr,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const text = await res.text();
+      if (!res.ok) {
+        // HTTP 4xx/5xx — server rejected, retrying won't help.
+        throw new Error(`HTTP ${res.status}: ${text}`);
+      }
+      return JSON.parse(text) as T;
+    } catch (err) {
+      clearTimeout(timer);
+      // AbortError sentinel: getUpdates long-poll timed out, no
+      // messages. Preserved as the documented long-poll contract;
+      // do NOT retry.
+      if ((err as Error).name === "AbortError") {
+        return { ret: 0, msgs: [] } as T;
+      }
+      lastError = err;
+
+      const isLastAttempt = attempt >= retries;
+      if (isLastAttempt || !isRetryableNetworkError(err)) {
+        // Either out of retries, or non-transient (4xx/5xx is already
+        // thrown above; this path covers parse errors and any other
+        // non-classified failure). Break out and re-throw below.
+        break;
+      }
+
+      const delayMs = baseDelayMs * Math.pow(2, attempt);
+      // eslint-disable-next-line no-console
+      console.error(
+        `apiPost ${endpoint} failed (attempt ${attempt + 1}/${maxAttempts}), ` +
+          `retrying in ${delayMs}ms: ${String(err)}`,
+      );
+      await sleep(delayMs);
+    } finally {
+      if (externalAbortListener && options?.abortSignal) {
+        options.abortSignal.removeEventListener("abort", externalAbortListener);
+      }
     }
-    throw err;
   }
+
+  // Throw the LAST error, preserving the pre-retry cause-unwrapping
+  // behavior. We attach `.cause` to the wrapped Error so downstream
+  // classifiers (and bridge log inspection) can still walk the chain.
+  const cause = (lastError as Error & { cause?: unknown })?.cause;
+  if (cause !== undefined) {
+    const wrapped = new Error(`${(lastError as Error).message}: ${String(cause)}`);
+    (wrapped as Error & { cause?: unknown }).cause = cause;
+    throw wrapped;
+  }
+  throw lastError;
 }
 
 export async function getUpdates(params: {
@@ -96,12 +210,18 @@ export async function getUpdates(params: {
   get_updates_buf: string;
   timeoutMs?: number;
 }): Promise<GetUpdatesResp> {
+  // Long-poll: do NOT retry on transient network errors here — the
+  // monitor loop already has its own retry/backoff (3 attempts, 30s).
+  // Double-retrying would multiply the delay and risk hitting the
+  // WeChat gateway's own rate-limit window. Use `retries: 0` for a
+  // single attempt; the monitor handles recovery.
   return apiPost<GetUpdatesResp>(
     params.baseUrl,
     "ilink/bot/getupdates",
     { get_updates_buf: params.get_updates_buf },
     params.token,
     params.timeoutMs ?? 38_000,
+    { retries: 0 },
   );
 }
 
@@ -109,8 +229,17 @@ export async function sendMessage(params: {
   baseUrl: string;
   token?: string;
   body: SendMessageReq;
+  /** Number of retries on transient network failures. Default: 2. */
+  retries?: number;
 }): Promise<void> {
-  await apiPost(params.baseUrl, "ilink/bot/sendmessage", params.body as unknown as Record<string, unknown>, params.token);
+  await apiPost(
+    params.baseUrl,
+    "ilink/bot/sendmessage",
+    params.body as unknown as Record<string, unknown>,
+    params.token,
+    undefined,
+    { retries: params.retries ?? 2 },
+  );
 }
 
 export async function getUploadUrl(params: {

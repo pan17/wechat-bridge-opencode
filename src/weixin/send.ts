@@ -18,6 +18,14 @@ export interface WeixinSendOpts {
   baseUrl: string;
   token?: string;
   contextToken?: string;
+  /**
+   * Number of retries on transient network failures for the underlying
+   * `sendMessage` API call. Default: 2 (3 total attempts: 1 initial + 2
+   * retries with 1s/2s exponential backoff). Set to 0 to disable retry
+   * for paths that are already best-effort (e.g. the bridge's failure
+   * warning send).
+   */
+  retries?: number;
 }
 
 export async function sendTextMessage(
@@ -33,6 +41,7 @@ export async function sendTextMessage(
   await sendMessage({
     baseUrl: opts.baseUrl,
     token: opts.token,
+    retries: opts.retries ?? 2,
     body: {
       msg: {
         from_user_id: "",
@@ -202,6 +211,7 @@ export async function sendMediaMessage(
   await sendMessage({
     baseUrl: opts.baseUrl,
     token: opts.token,
+    retries: opts.retries ?? 2,
     body: {
       msg: {
         from_user_id: "",

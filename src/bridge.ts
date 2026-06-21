@@ -318,6 +318,17 @@ export class WeChatOpencodeBridge {
       cwd: this.config.agent.cwd,
       log: this.log,
       onReply: (contextToken, text) => this.sendReply(contextToken, text),
+      // Best-effort failure-notice path: when an `onReply` (or any
+      // sub-type like text part / reasoning summary / tool summary /
+      // fallback / error notice) exhausts its retries, the
+      // SessionManager invokes `onSendWarning` so we can tell the user
+      // "⚠️ 上一条<label>发送失败…" instead of silently losing the
+      // message. The bridge wires this to `sendWarningReply`, which
+      // is a single-shot, NO-retry, catch-all best-effort send — if
+      // even the warning fails, we just log and move on (there is no
+      // further escalation available when the WeChat gateway itself
+      // is unreachable).
+      onSendWarning: (contextToken, text) => this.sendWarningReply(contextToken, text),
       onMediaReply: (contextToken, blocks) => this.sendMediaReply(contextToken, blocks),
       sendTyping: (contextToken) => this.sendTypingIndicator(contextToken),
       cancelTyping: (contextToken) => this.cancelTypingIndicator(contextToken),
@@ -2763,6 +2774,33 @@ const apCmd = parseAutoPermissionCommand(trimmed);
 
   private sendMediaReply(contextToken: string, blocks: MediaContent[]): Promise<void> {
     return this.enqueueOutbound(contextToken, () => this.sendMediaReplyImpl(contextToken, blocks));
+  }
+
+  /**
+   * Best-effort, single-shot warning sender used by the SessionManager
+   * when an `onReply` call exhausts its retries. Sends a single short
+   * `⚠️ 上一条<label>发送失败…` notice with NO retry (`retries: 0`) so
+   * we don't compound network failures, and swallows any error — if
+   * the warning itself fails (network fully down), the bridge just
+   * logs and moves on; there is no further escalation possible when
+   * the WeChat gateway itself is unreachable. Unlike `sendReply`,
+   * this also does NOT go through the outbound queue — we want the
+   * warning to land ASAP without waiting for any queued message, and
+   * we don't want a queued-but-blocked outbound segment to delay the
+   * user's visibility into the failure.
+   */
+  private async sendWarningReply(contextToken: string, text: string): Promise<void> {
+    try {
+      await sendTextMessage(this.userState?.userId ?? "", text, {
+        baseUrl: this.tokenData!.baseUrl,
+        token: this.tokenData!.token,
+        contextToken,
+        retries: 0,
+      });
+      this.log(`Sent send-failure warning (${text.length} chars)`);
+    } catch (err) {
+      this.log(`sendWarningReply ALSO failed (network fully down?): ${String(err)}`);
+    }
   }
 
   private async sendMediaReplyImpl(contextToken: string, blocks: MediaContent[]): Promise<void> {

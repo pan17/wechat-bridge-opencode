@@ -223,6 +223,19 @@ export interface SessionManagerOpts {
    * SSE pipeline.
    */
   onOtherSessionEvent?: (event: OpenCodeEvent) => void | Promise<void>;
+  /**
+   * Invoked when an `onReply` call exhausts its retries and the user
+   * needs to be told that a particular kind of reply (text part,
+   * reasoning summary, tool summary, fallback, error notice) failed to
+   * reach WeChat. The bridge should send a short, user-visible
+   * `⚠️ 上一条<label>发送失败…` message. Best-effort: if the warning
+   * send itself fails, the bridge logs loudly but does NOT throw —
+   * we cannot recover further from a fully-down WeChat gateway.
+   *
+   * Optional — when omitted, the SessionManager only logs the failure
+   * (the pre-retry behavior).
+   */
+  onSendWarning?: (contextToken: string, text: string) => Promise<void>;
 }
 
 interface QueueItem {
@@ -521,6 +534,13 @@ export class SessionManager {
    */
   private onOtherSessionEvent?: (event: OpenCodeEvent) => void | Promise<void>;
   /**
+   * Optional callback invoked when an `onReply` call fails to reach
+   * WeChat (after the underlying apiPost's retries are exhausted).
+   * The bridge wires this to a best-effort warning send so the user
+   * sees `⚠️ 上一条<label>发送失败…` instead of a silent loss.
+   */
+  private onSendWarning?: (contextToken: string, text: string) => Promise<void>;
+  /**
    * Client-side preference for auto-accepting permission requests. When
    * `off` (default), every `permission.asked` event surfaces a WeChat
    * card. When `once` or `always`, the SessionManager auto-replies
@@ -548,6 +568,7 @@ export class SessionManager {
     this.onPermissionAsked = opts.onPermissionAsked;
     this.onPermissionTimedOut = opts.onPermissionTimedOut;
     this.onOtherSessionEvent = opts.onOtherSessionEvent;
+    this.onSendWarning = opts.onSendWarning;
   }
 
   /** Current session ID, or null if not yet created. */
@@ -1143,7 +1164,12 @@ export class SessionManager {
         replyText += `\n\n${item.hint}`;
       }
       if (replyText.trim()) {
-        await this.onReply(item.contextToken, replyText);
+        try {
+          await this.onReply(item.contextToken, replyText);
+        } catch (replyErr) {
+          this.log(`onReply error for sync reply: ${String(replyErr)}`);
+          void this.notifySendFailure(item.contextToken, "错误提示");
+        }
       }
       if (mediaBlocks.length > 0) {
         await this.onMediaReply(item.contextToken, mediaBlocks);
@@ -1153,8 +1179,9 @@ export class SessionManager {
       this.log(`Agent error (sync): ${String(err)}`);
       try {
         await this.onReply(item.contextToken, `⚠️ Agent error: ${String(err)}`);
-      } catch {
-        // best effort
+      } catch (replyErr) {
+        this.log(`onReply error for sync error reply: ${String(replyErr)}`);
+        void this.notifySendFailure(item.contextToken, "错误提示");
       }
     }
   }
@@ -2237,6 +2264,7 @@ export class SessionManager {
           );
           this.onReply(turn.contextToken, line).catch((err) => {
             this.log(`onReply error for reasoning summary: ${String(err)}`);
+            void this.notifySendFailure(turn.contextToken ?? "", "推理摘要");
           });
           break;
         }
@@ -2273,6 +2301,7 @@ export class SessionManager {
           this.log(`[text-part] sending part ${partID.slice(0, 8)}… (${turn.currentText.length}ch)`);
           this.onReply(turn.contextToken, turn.currentText).catch((err) => {
             this.log(`onReply error for text part: ${String(err)}`);
+            void this.notifySendFailure(turn.contextToken ?? "", "文本回复");
           });
           break;
         }
@@ -2382,6 +2411,7 @@ export class SessionManager {
     this.log(`[text-part] sending part ${part.id.slice(0, 8)}… (${part.text.length}ch)`);
     this.onReply(turn.contextToken, part.text).catch((err) => {
       this.log(`onReply error for text part: ${String(err)}`);
+      void this.notifySendFailure(turn.contextToken ?? "", "文本回复");
     });
   }
 
@@ -2617,6 +2647,7 @@ export class SessionManager {
       if (!turn.contextToken) return;
       this.onReply(turn.contextToken, line).catch((err) => {
         this.log(`onReply error for reasoning summary: ${String(err)}`);
+        void this.notifySendFailure(turn.contextToken ?? "", "推理摘要");
       });
 
       // Mark the part as sent AFTER dispatching the single message
@@ -2987,6 +3018,7 @@ export class SessionManager {
       if (fallback.trim()) {
         this.onReply(contextToken, fallback).catch((err) => {
           this.log(`onReply error for fallback reply: ${String(err)}`);
+          void this.notifySendFailure(contextToken, "兜底回复");
         });
       } else {
         this.log(`[turn] no text to send (reason=${reason})`);
@@ -3233,6 +3265,7 @@ export class SessionManager {
     this.log(`[tool-summary] flushing ${newTools.size} tool(s) with new status at non-tool boundary (total tracked: ${turn.toolCalls.size})`);
     this.onReply(turn.contextToken, toolSummary).catch((err) => {
       this.log(`onReply error for tool summary: ${String(err)}`);
+      void this.notifySendFailure(turn.contextToken ?? "", "工具摘要");
     });
   }
 
@@ -3275,6 +3308,30 @@ export class SessionManager {
    */
   private currentContextToken(): string {
     return this.lastEnqueuedContextToken ?? "";
+  }
+
+  /**
+   * Tell the user via WeChat that a particular kind of reply failed to
+   * send after exhausting retries. `label` is a short Chinese noun
+   * phrase describing what was being sent (e.g. "文本回复",
+   * "推理摘要", "工具摘要", "兜底回复", "错误提示"). Best-effort:
+   * if the warning send itself fails (network fully down), we just
+   * log loudly — there's nothing else to recover.
+   *
+   * Called from every `onReply(...).catch(...)` site in this file.
+   * Empty contextToken is a no-op (avoids notifying a phantom user).
+   */
+  private async notifySendFailure(contextToken: string, label: string): Promise<void> {
+    if (!contextToken) return;
+    if (!this.onSendWarning) return;
+    try {
+      await this.onSendWarning(
+        contextToken,
+        `⚠️ 上一条${label}发送失败（可能是网络问题）。请查看 bridge 日志获取详情。`,
+      );
+    } catch (err) {
+      this.log(`warning send also failed for ${label} (contextToken=${contextToken.slice(0, 12)}…): ${String(err)}`);
+    }
   }
 
   // ─── Cancel ───
