@@ -1927,14 +1927,14 @@ const apCmd = parseAutoPermissionCommand(trimmed);
 
       const currentMode = sessionManager.getActiveMode();
       const currentModel = sessionManager.getCurrentModel() ?? "(not set)";
-      let currentReasoning = sessionManager.getCurrentReasoningDisplay();
-      if (currentReasoning === "(not set)") {
-        // Default to the first reasoning level of the current model
-        const levels = sessionManager.getReasoningLevels();
-        if (levels.length > 0) {
-          currentReasoning = levels[0].name;
-        }
-      }
+      // `getCurrentReasoningDisplay` already returns "Default" (matching
+      // the synthetic entry in /reasoning list and OpenCode TUI's
+      // dialog-variant.tsx) when `currentReasoning === undefined`, so
+      // no client-side fallback is needed here — the previous
+      // "first level's name" fallback that this block used to carry
+      // would have produced a DIFFERENT string than the synthetic
+      // "Default" entry and silently disagreed with `/reasoning list`.
+      const currentReasoning = sessionManager.getCurrentReasoningDisplay();
       const contextUsage = sessionManager.getContextUsage();
       const sid = sessionManager.getSessionId();
 

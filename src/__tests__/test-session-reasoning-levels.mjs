@@ -64,7 +64,7 @@ function makeManager() {
 // ─── Tests ───
 
 describe("SessionManager.getReasoningLevels — OpenAI-style variants", () => {
-  test("surfaces all variants with reasoningEffort", () => {
+  test("surfaces all variants with reasoningEffort, plus synthetic Default", () => {
     const sm = makeManager();
     sm.currentModelId = "opencode-go/deepseek-v4-flash";
     sm.availableModels = [
@@ -82,14 +82,32 @@ describe("SessionManager.getReasoningLevels — OpenAI-style variants", () => {
     ];
 
     const levels = sm.getReasoningLevels();
-    expect(levels.map((l) => l.value)).toEqual(["low", "medium", "high", "max"]);
-    expect(levels.map((l) => l.name)).toEqual(["Low", "Medium", "High", "Max"]);
-    expect(levels.every((l) => l.current === false)).toBe(true);
+    // Synthetic "Default" entry is prepended to mirror OpenCode TUI's
+    // dialog-variant.tsx (where "Default" sets variant to undefined,
+    // i.e. "let the server pick"). The four real variants follow.
+    expect(levels.map((l) => l.value)).toEqual([
+      "default",
+      "low",
+      "medium",
+      "high",
+      "max",
+    ]);
+    expect(levels.map((l) => l.name)).toEqual([
+      "Default",
+      "Low",
+      "Medium",
+      "High",
+      "Max",
+    ]);
+    // currentReasoning is undefined (fresh start), so the synthetic
+    // "Default" entry is the one marked current.
+    expect(levels.find((l) => l.value === "default")?.current).toBe(true);
+    expect(levels.filter((l) => l.value !== "default").every((l) => l.current === false)).toBe(true);
   });
 });
 
 describe("SessionManager.getReasoningLevels — Anthropic-style variants (regression)", () => {
-  test("surfaces variants that only have `thinking` (MiniMax-M3 shape)", () => {
+  test("surfaces variants that only have `thinking` (MiniMax-M3 shape), plus Default", () => {
     const sm = makeManager();
     sm.currentModelId = "minimax-cn-coding-plan/MiniMax-M3";
     sm.availableModels = [
@@ -105,14 +123,17 @@ describe("SessionManager.getReasoningLevels — Anthropic-style variants (regres
     ];
 
     const levels = sm.getReasoningLevels();
-    // Both variants must show up — the whole point of the fix.
-    expect(levels.map((l) => l.value)).toEqual(["none", "thinking"]);
+    // Both real variants show up — the whole point of the original
+    // Anthropic-style fix — plus the synthetic "Default" entry at
+    // position 0 (TUI parity).
+    expect(levels.map((l) => l.value)).toEqual(["default", "none", "thinking"]);
     // No reasoningEffort → fall back to capitalised variant key.
-    expect(levels.map((l) => l.name)).toEqual(["None", "Thinking"]);
-    expect(levels.every((l) => l.current === false)).toBe(true);
+    expect(levels.map((l) => l.name)).toEqual(["Default", "None", "Thinking"]);
+    // currentReasoning is undefined → "Default" is current.
+    expect(levels.find((l) => l.value === "default")?.current).toBe(true);
   });
 
-  test("accepts a single Anthropic-style variant", () => {
+  test("accepts a single Anthropic-style variant, plus Default", () => {
     const sm = makeManager();
     sm.currentModelId = "anthropic/claude-sonnet-4-5";
     sm.availableModels = [
@@ -127,10 +148,13 @@ describe("SessionManager.getReasoningLevels — Anthropic-style variants (regres
     ];
 
     const levels = sm.getReasoningLevels();
-    expect(levels).toEqual([{ value: "thinking", name: "Thinking", current: false }]);
+    expect(levels).toEqual([
+      { value: "default", name: "Default", current: true },
+      { value: "thinking", name: "Thinking", current: false },
+    ]);
   });
 
-  test("mixed variant set — keeps both shapes, drops unrecognised keys", () => {
+  test("mixed variant set — keeps both shapes, drops unrecognised keys, plus Default", () => {
     const sm = makeManager();
     sm.currentModelId = "future/model";
     sm.availableModels = [
@@ -152,7 +176,11 @@ describe("SessionManager.getReasoningLevels — Anthropic-style variants (regres
     ];
 
     const levels = sm.getReasoningLevels();
-    expect(levels.map((l) => l.value).sort()).toEqual(["high", "thinking"]);
+    // Set comparison — synthetic "Default" entry is always prepended,
+    // but the rest are object-key order so we don't pin exact ordering.
+    const values = levels.map((l) => l.value);
+    expect(values).toContain("default");
+    expect(values.filter((v) => v !== "default").sort()).toEqual(["high", "thinking"]);
   });
 });
 

@@ -3579,6 +3579,15 @@ export class SessionManager {
       if (this.currentModelId) {
         const m = this.availableModels.find((mod) => mod.modelId === this.currentModelId);
         if (m?.contextSize) this.contextWindowSize = m.contextSize;
+        // Clear `currentReasoning` only if the freshly-populated model
+        // exposes no reasoning variants. Critically, we do NOT snap a
+        // missing `currentReasoning` to the first variant — `undefined`
+        // is the legitimate "Default" state meaning "let the server
+        // pick" (matches OpenCode TUI's dialog-variant.tsx where the
+        // synthetic "Default" entry sets variant to undefined). The
+        // helper is shared with `setModel` via
+        // `clearReasoningIfModelHasNoVariants`.
+        this.clearReasoningIfModelHasNoVariants();
       }
       this.log(`Fetched ${this.availableModels.length} models across ${providers.length} providers (default: ${this.currentModelId})`);
     } catch (err) {
@@ -3602,34 +3611,60 @@ export class SessionManager {
     if (model?.contextSize) {
       this.contextWindowSize = model.contextSize;
     }
-
-    // Reasoning levels are model-scoped: the previous variant may not be
-    // valid for the new model. Reconcile before the next prompt goes out
-    // so we don't ship a `variant` the server can't honour, and so /status
-    // reflects what will actually be sent.
-    const previous = this.currentReasoning;
-    const newLevels = this.getReasoningLevels();
-    let note: string | undefined;
-    if (newLevels.length === 0) {
-      // New model exposes no reasoning variants (either `reasoning: false`
-      // or no `variants` table). Clear so the outgoing prompt omits
-      // `variant` entirely and the server picks its default.
-      if (previous !== undefined) {
-        this.log(`Clearing reasoning: ${modelId} exposes no variants (was "${previous}")`);
-        note = `Reasoning cleared (was "${previous}"); ${modelId} exposes no reasoning levels`;
-      }
-      this.currentReasoning = undefined;
-    } else if (!newLevels.some((lv) => lv.value === previous)) {
-      // Current variant isn't valid for the new model — snap to the first
-      // available level so /reasoning list shows a usable value.
-      const next = newLevels[0].value;
-      this.log(`Resetting reasoning: "${previous}" not available on ${modelId}, using "${next}"`);
-      this.currentReasoning = next;
-      note = previous !== undefined
-        ? `Reasoning reset from "${previous}" to "${next}" (first level on ${modelId})`
-        : `Reasoning set to "${next}"`;
-    }
+    // If the new model exposes NO reasoning variants (e.g. switched from
+    // a thinking-capable model to a non-reasoning one), clear the
+    // previous reasoning value so the next prompt omits `variant` and
+    // the server uses its own default. When the new model DOES expose
+    // variants, leave `currentReasoning` alone — even if its current
+    // value isn't in the new table — so the user keeps their explicit
+    // "Default" / "None" choice instead of having us silently override
+    // it with the first variant key. The next prompt will surface the
+    // mismatch (server rejects unknown variants) and the user can
+    // `/reasoning switch` to fix.
+    const note = this.clearReasoningIfModelHasNoVariants();
     return { modelId, ...(note !== undefined ? { note } : {}) };
+  }
+
+  /**
+   * Clear `currentReasoning` when the current model has no reasoning
+   * variants in its table. Shared by `setModel` (explicit model
+   * switch) and `refreshProviders` (initial population) so both paths
+   * converge: a non-reasoning model never carries a stale `variant`
+   * from a previous reasoning-capable session.
+   *
+   * **Does NOT snap when `currentReasoning` is undefined or invalid.**
+   * `undefined` is a meaningful state — it means "let the server
+   * pick its default reasoning level" (the synthetic "Default"
+   * option in `/reasoning list`, mirroring the OpenCode TUI's
+   * dialog-variant.tsx behaviour). Auto-snapping to the first
+   * variant key would override this with whichever key happens to be
+   * first in `Object.keys(variants)` (often `"none"` for Anthropic-
+   * style models like `MiniMax-M3`), silently changing the user's
+   * effective reasoning behaviour without their consent.
+   *
+   * **Bail-out**: no model, OR model not in `availableModels` yet →
+   * no-op. A previous caller (typically `syncStateFromServer` reading
+   * the resumed session's last assistant message) may have already
+   * set `currentReasoning` from authoritative server metadata, and we
+   * don't want to clobber that with a cache-cold inference.
+   *
+   * Returns a human-readable note describing the change, or undefined
+   * when nothing changed. `setModel` passes the note to its caller;
+   * `refreshProviders` ignores it.
+   */
+  private clearReasoningIfModelHasNoVariants(): string | undefined {
+    if (!this.currentModelId) return undefined;
+    if (!this.availableModels.some((m) => m.modelId === this.currentModelId)) {
+      return undefined;
+    }
+    const modelId = this.currentModelId;
+    const newLevels = this.getReasoningLevels();
+    if (newLevels.length > 0) return undefined;
+    if (this.currentReasoning === undefined) return undefined;
+    this.log(`Clearing reasoning: ${modelId} exposes no variants (was "${this.currentReasoning}")`);
+    const previous = this.currentReasoning;
+    this.currentReasoning = undefined;
+    return `Reasoning cleared (was "${previous}"); ${modelId} exposes no reasoning levels`;
   }
 
   // ─── Reasoning ───
@@ -3685,7 +3720,16 @@ export class SessionManager {
    * through the model's `reasoningEffort`. Falls back to the raw value.
    */
   getCurrentReasoningDisplay(): string {
-    if (!this.currentReasoning) return "(not set)";
+    if (!this.currentReasoning) {
+      // `undefined` means "let the server pick" — display as "Default"
+      // to match the synthetic entry in `/reasoning list` and the
+      // OpenCode TUI's `dialog-variant.tsx` "Default" option. The
+      // previous "(not set)" string made /status look like an
+      // unconfigured state, which contradicts the user's intent when
+      // they had explicitly chosen the server's default reasoning
+      // behaviour (e.g. in a TUI session).
+      return "Default";
+    }
     return this.resolveReasoningName(this.currentReasoning, this.getCurrentReasoningModel());
   }
 
@@ -3708,11 +3752,29 @@ export class SessionManager {
     // and switch can never disagree.
     const levels = Object.keys(variants).filter((k) => isReasoningVariant(variants[k]));
 
-    return levels.map((v) => ({
-      value: v,
-      name: this.resolveReasoningName(v, currentModel),
-      current: v === this.currentReasoning,
-    }));
+    if (levels.length === 0) return [];
+
+    // Prepend a synthetic "Default" entry. `undefined` currentReasoning
+    // means "let the server pick" — the OpenCode TUI surfaces this as
+    // an explicit "Default" option in its variant dialog (see
+    // packages/tui/src/component/dialog-variant.tsx). Mirroring it
+    // here gives `/reasoning list` TUI parity AND makes the choice
+    // reversible: the user can switch back to "Default" via
+    // `/reasoning switch default` (handled by `setReasoning`'s
+    // sentinel branch) without us silently picking the first variant
+    // key on their behalf.
+    return [
+      {
+        value: "default",
+        name: "Default",
+        current: this.currentReasoning === undefined,
+      },
+      ...levels.map((v) => ({
+        value: v,
+        name: this.resolveReasoningName(v, currentModel),
+        current: v === this.currentReasoning,
+      })),
+    ];
   }
 
   async setReasoning(level: string): Promise<void> {
