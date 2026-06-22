@@ -79,6 +79,17 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 > Basic auth requires BOTH `username` and `password` — supplying only one is a fatal startup error. When both Basic and Bearer are configured, the Bearer token wins. `password` and `token` are treated as secrets: never logged and never echoed back by `/status`.
 
+**Startup timeout**
+
+In sidecar mode the bridge waits for `opencode serve` to become ready before continuing (so subsequent session creation doesn't fail because the server isn't listening yet). Default is 180 seconds (3 minutes) — enough to cover first-time `npx opencode-ai` installs where npx has to download the package; warm restarts are typically <1s. To override:
+
+```bash
+export WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=300000   # 5 minutes
+export WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=600000   # 10 minutes (very slow networks)
+```
+
+Valid values: non-negative integer in milliseconds. `0` means fail immediately (for tests); non-numeric or negative values log a warning and fall back to the default. While waiting past the first 20 seconds the daemon log fires a progress line every 20 seconds (with an npx-download hint) so admins watching the log can recognise a long first-install scenario.
+
 ## WeChat Commands
 
 ### Help (`/help`)
@@ -133,7 +144,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | Command | Description |
 |---------|-------------|
-| `/reasoning list` | List actual reasoning levels for the current model (from model variants) |
+| `/reasoning list` | List actual reasoning levels for the current model (from model variants), with a synthetic `Default` entry at position 0 that mirrors the OpenCode TUI's variant dialog — selecting it (or `/reasoning switch default`) sets `currentReasoning` to `undefined` so the next prompt omits `variant` and the server applies its model default |
 | `/reasoning switch <level>` | Switch reasoning level |
 | `/reasoning status` | Show current reasoning level |
 

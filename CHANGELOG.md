@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.8] - 2026-06-22
+
+### Added
+- **`WECHAT_OPENCODE_STARTUP_TIMEOUT_MS` env var** to override the sidecar-server readiness-wait budget. Default raised from 30s to 180s (3min) to cover first-time `npx opencode-ai` installs where npx has to download the package before the binary starts listening (typical 10s–2min, can hit 3–5min on slow networks). Set the env var to a non-negative integer in milliseconds (`0` = immediate-fail path for tests; non-numeric or negative → warn and fall back to the default). A progress log fires every 20s while the server is still starting up, including an npx-download hint after the first 20s, so an admin watching the daemon log gets a clear signal during a long first install. Warm restarts (<20s) stay silent. The final timeout warning now includes the elapsed seconds and points admins at the env var.
+- **`/reasoning list` shows a synthetic "Default" entry at position 0** when the current model exposes any reasoning variants, matching the OpenCode TUI's variant dialog (`packages/tui/src/component/dialog-variant.tsx`). Picking "Default" — or sending `/reasoning switch default` — sets `currentReasoning` to `undefined`, so the next prompt omits `variant` and the server applies its own model default. `/status` reads `Reasoning: Default` for the same state (no more `(not set)` string that looked like unconfigured behaviour).
+
+### Changed
+- **Transient-network-error retry is now centralised in `src/utils/network.ts`** (new file) and shared between the WeChat iLink client and the OpenCode HTTP client. Both previously had near-identical inline retry loops; now `isRetryableNetworkError` and the exponential-backoff constants live in one place. `OpenCodeServerClient.fetch()` now retries on transient errors (`ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EPIPE`, `EAI_AGAIN`, abort-after-connection) with exponential backoff (1s base, doubles per attempt), capped at 3 attempts by default. The WeChat `apiPost` path retries iLink sends on transient network failures (default 3 attempts, configurable per-call).
+- **OpenCode Server readiness wait** now defaults to 180s instead of 30s (see env var above). Also extracted into two named helpers in the CLI entry — `waitForServerReady` (the poll loop with progress logging) and `readStartupTimeoutMs` (env var parser) — for unit-testability.
+
+### Fixed
+- **`/status` showed the OLD session's cumulative context size after `/session switch` or `/workspace switch`** (e.g. `69.5k / 512k (14%)` after switching from a 1M-context session that had 69.5k of context — the numerator stayed stale while the denominator updated correctly via `refreshProviders`). `SessionManager.switchSession` and `switchWorkspace` now clear `totalTokens = 0` alongside the existing agent/model/reasoning clear. `syncStateFromServer` was also enriched to read `info.tokens?.total` from the last assistant message, so a resumed/switched-into session shows its REAL context count on `/status` immediately instead of `0 / <size>` until the next prompt's SSE event.
+- **`/reasoning list` was off-by-one with the OpenCode TUI**: TUI shows 3 entries for `minimax-cn-coding-plan/MiniMax-M3` (Default, None, Thinking) while the bridge showed only 2. An earlier draft of this fix tried to bridge the gap by auto-snapping `currentReasoning === undefined` → first variant key on `refreshProviders`; that was wrong (for M3 the dict is `{none, thinking}`, so the snap silently forced `"none"` — opposite of the server's default for M3, which is `"thinking"`). The final fix treats `undefined` as a first-class "Default" state meaning "let the server pick" and mirrors the TUI's synthetic entry exactly. `setModel` and `refreshProviders` no longer snap; the shared helper now ONLY clears a stale `currentReasoning` when the freshly-populated model genuinely has no reasoning variants.
+
 ## [1.3.7] - 2026-06-20
 
 ### Added

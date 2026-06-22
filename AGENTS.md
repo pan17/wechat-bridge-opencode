@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-- **Package**: `wechat-bridge-opencode` v1.3.7 — ESM-only (`"type": "module"`)
+- **Package**: `wechat-bridge-opencode` v1.3.8 — ESM-only (`"type": "module"`)
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript, compiled to JS via `tsc`
 - **Package manager**: npm (use `package-lock.json`)
@@ -18,11 +18,11 @@ npm run build        # Compile TypeScript → dist/
 npm run dev          # Watch mode: tsc --watch
 npm start            # Run compiled CLI: node dist/bin/wechat-opencode.js
 npm run prepack      # Runs build before npm publish
-npm test             # Run vitest unit tests (278 tests across 14 files)
+npm test             # Run vitest unit tests (568 tests across 28 files)
 npm run test:watch   # Vitest in watch mode
 ```
 
-**Tests:** Vitest 4.1.8 unit tests live in `src/__tests__/` (278 tests across 14 files). No linter is configured.
+**Tests:** Vitest 4.1.8 unit tests live in `src/__tests__/` (568 tests across 28 files). No linter is configured.
 
 ### Running the CLI locally
 
@@ -50,7 +50,7 @@ src/server/
   client.ts                     — OpenCode Server HTTP client (fetch wrapper)
   session.ts                    — Simplified SessionManager (no subprocess, just HTTP)
   event-pipeline.ts             — Persistent /global/event SSE connection with reconnect
-src/__tests__/                  — Vitest unit tests (14 files, 278 tests)
+src/__tests__/                  — Vitest unit tests (28 files, 568 tests)
 src/adapter/
   inbound.ts                    — WeChat message → MessagePart[] (text, image, file)
   outbound.ts                   — Server reply → WeChat text (formatting, splitting)
@@ -65,6 +65,8 @@ src/weixin/
   api.ts                        — WeChat iLink API (typing indicator, config)
   media.ts                      — CDN download + AES decryption
   types.ts                      — WeChat iLink types (MessageType, UploadMediaType, etc.)
+src/utils/
+  network.ts                    — Shared transient-network-error classifier + retry helpers
 ```
 
 ### Key flows
@@ -201,7 +203,7 @@ src/weixin/
 ### Reasoning (/reasoning)
 | Command | Description |
 |---------|-------------|
-| `/reasoning list` | List actual reasoning levels for the current model (from model variants) |
+| `/reasoning list` | List reasoning levels for the current model (from model variants), plus a synthetic `Default` entry at position 0 that mirrors the OpenCode TUI — selecting it (or `/reasoning switch default`) sets `currentReasoning` to `undefined` so the next prompt omits `variant` and the server applies its model default |
 | `/reasoning switch <level>` | Switch reasoning level |
 | `/reasoning status` | Show current reasoning level |
 

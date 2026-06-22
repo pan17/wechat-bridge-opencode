@@ -79,6 +79,17 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 > Basic 认证要求用户名和密码**同时**配置；只设一个会启动失败并报错。Bearer Token 与 Basic 同时配置时，Token 生效。`password` / `token` 视为敏感字段，永远不会写入日志或 `/status` 命令的输出。
 
+**启动超时**
+
+sidecar 模式下 bridge 会等待 `opencode serve` 就绪后再继续（避免后续 session 创建因 server 还没监听而失败）。默认 180 秒（3 分钟），足以覆盖首次 `npx opencode-ai` 安装时 npx 下载包的时间；暖启动通常 <1s。如需调整：
+
+```bash
+export WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=300000   # 5 分钟
+export WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=600000   # 10 分钟（极慢网络）
+```
+
+合法值：非负整数（毫秒）。`0` 表示立即失败（用于测试）；非数字或负数会报警告并回退到默认值。等待超过 20 秒时日志会每 20 秒输出一次进度提示（含 npx 下载提示），方便管理员识别首次安装场景。
+
 ## 微信命令
 
 ### 帮助（`/help`）
@@ -133,7 +144,7 @@ export WECHAT_OPENCODE_SERVER_PASSWORD=secret
 
 | 命令 | 说明 |
 |------|------|
-| `/reasoning list` | 列出当前模型支持的实际推理等级（从模型 variants 获取） |
+| `/reasoning list` | 列出当前模型支持的实际推理等级（从模型 variants 获取），并在首位显示一个合成的 `Default` 选项（对齐 OpenCode TUI 行为）；选择它（或 `/reasoning switch default`）会将 `currentReasoning` 设为 undefined，使下一条 prompt 不带 `variant` 参数，服务器应用其模型默认 |
 | `/reasoning switch <level>` | 切换推理级别 |
 | `/reasoning status` | 显示当前推理级别 |
 
