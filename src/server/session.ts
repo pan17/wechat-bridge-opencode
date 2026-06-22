@@ -892,6 +892,14 @@ export class SessionManager {
     // sessionId assignment below so the assignment is the LAST thing in this
     // function — anything after this synchronous block runs in the same tick.
     this.discardInFlightTurn();
+    // Clear stale totalTokens from the PREVIOUS workspace/session. Same
+    // rationale as the agent/model/reasoning clear below: without this,
+    // /status would show the OLD session's cumulative context size until
+    // the next SSE event lands. For the resume path, `syncStateFromServer`
+    // (below) repopulates `totalTokens` from the resumed session's last
+    // assistant message. For the new-session path, it stays at 0 (correct
+    // — fresh session has no tokens).
+    this.totalTokens = 0;
     this.sessionId = targetSessionId;
     this.cwd = cwd;
 
@@ -969,20 +977,27 @@ export class SessionManager {
     // synchronous block — events arriving in the next tick see the new
     // sessionId AND an empty currentTurn.
     this.discardInFlightTurn();
-    // Clear stale agent/model/reasoning from the previous session/workspace
-    // so the sync below (or the post-switch refresh) repopulates from the
-    // NEW context. Without this clear, switching to a brand-new session in
-    // a workspace whose default agent differs from the previous one would
-    // carry the OLD agent name forward and fail with `Agent not found`.
+    // Clear stale agent/model/reasoning/tokens from the previous session/
+    // workspace so the sync below (or the post-switch refresh) repopulates
+    // from the NEW context. Without this clear, switching to a brand-new
+    // session in a workspace whose default agent differs from the previous
+    // one would carry the OLD agent name forward and fail with
+    // `Agent not found`; without `totalTokens = 0` the OLD session's
+    // cumulative context size would leak into /status for the NEW session
+    // (the denominator updates correctly via refreshProviders, but the
+    // numerator would stay stale until the next prompt's SSE event).
     this.currentMode = undefined;
     this.currentModelId = undefined;
     this.currentReasoning = undefined;
+    this.totalTokens = 0;
     this.sessionId = sessionId;
     this.cwd = cwd;
     this.onSessionReady?.(sessionId);
     // Sync agent/model from the session's last message (overwrites the
     // undefineds above when the target session has messages; falls back to
-    // server config for empty sessions).
+    // server config for empty sessions). Also repopulates `totalTokens`
+    // from the last assistant message's `tokens.total` so an existing
+    // session shows its real context count immediately on /status.
     await this.syncStateFromServer(sessionId);
     // Same reasoning as switchWorkspace: the new session lives in a
     // different workspace than the one whose agents/providers are cached.
@@ -3874,18 +3889,41 @@ export class SessionManager {
     }
   }
 
-  /** Sync local agent/model/reasoning state from the server's last message metadata. */
+  /** Sync local agent/model/reasoning/tokens state from the server's last message metadata. */
   async syncStateFromServer(sessionId: string): Promise<void> {
     try {
       const messages = await this.client.getSessionMessages(sessionId, 1);
       if (messages.length > 0) {
-        const lastMsg = messages[0] as unknown as { info?: { mode?: string; modelID?: string; providerID?: string; variant?: string; role?: string } };
+        const lastMsg = messages[0] as unknown as {
+          info?: {
+            mode?: string;
+            modelID?: string;
+            providerID?: string;
+            variant?: string;
+            role?: string;
+            tokens?: { input?: number; output?: number; total?: number; reasoning?: number };
+          };
+        };
         if (lastMsg.info?.role === "assistant" || lastMsg.info?.mode) {
           if (lastMsg.info.mode) this.currentMode = lastMsg.info.mode;
           if (lastMsg.info.modelID && lastMsg.info.providerID) {
             this.currentModelId = `${lastMsg.info.providerID}/${lastMsg.info.modelID}`;
           }
           if (lastMsg.info.variant) this.currentReasoning = lastMsg.info.variant;
+          // Populate totalTokens from the resumed session's last assistant
+          // message so /status shows the real context count immediately
+          // (instead of the 0 set by switchSession/switchWorkspace right
+          // before this call). Without this, switching to a session that
+          // already had 69.5k of context would show "0 / 512k (0%)" until
+          // the next prompt's SSE event lands. The truthy check matches
+          // the same pattern in sendPromptSync (line ~1135) and
+          // handleMessageUpdated (~line 2679) — `0` is treated as
+          // "no data" for safety, which is fine because a non-empty
+          // assistant message always has a positive token count.
+          if (lastMsg.info.tokens?.total) {
+            this.totalTokens = lastMsg.info.tokens.total;
+            this.log(`Synced totalTokens=${this.totalTokens} from session ${sessionId.slice(0, 8)}…`);
+          }
           return;
         }
       }

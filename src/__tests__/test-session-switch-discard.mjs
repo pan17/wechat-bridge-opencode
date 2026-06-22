@@ -259,3 +259,139 @@ describe("SessionManager — discard clears finalize timers", () => {
     }
   });
 });
+
+// ─── Tests: switchSession resets totalTokens (no stale context count leak) ───
+//
+// Regression: switching sessions used to leave `totalTokens` populated from
+// the PREVIOUS session. `/status` would then render the OLD session's
+// cumulative context size for the NEW session (with the NEW session's
+// context window as denominator) — e.g. "69.5k / 512k" after switching
+// from a 1M-context session that had 69.5k of context. The fix resets
+// `totalTokens = 0` before `syncStateFromServer` repopulates it from the
+// target session's last assistant message.
+
+describe("SessionManager.switchSession — totalTokens reset on switch", () => {
+  test("clears stale totalTokens so OLD session's count does not leak", async () => {
+    const m = makeManager();
+    // Simulate the OLD session having a populated token count.
+    const internal = /** @type {any} */ (m);
+    internal.totalTokens = 69500;
+    clientMock.getSession.mockResolvedValue({ id: "ses_target", title: "Target" });
+    // Target session has NO messages — syncStateFromServer can't repopulate.
+    clientMock.getSessionMessages.mockResolvedValue([]);
+
+    await m.switchSession("ses_target", "/some/workspace");
+
+    expect(internal.totalTokens).toBe(0);
+  });
+
+  test("repopulates totalTokens from the NEW session's last assistant message", async () => {
+    const m = makeManager();
+    const internal = /** @type {any} */ (m);
+    internal.totalTokens = 999999; // OLD session's huge count
+    clientMock.getSession.mockResolvedValue({ id: "ses_target", title: "Target" });
+    clientMock.getSessionMessages.mockResolvedValueOnce([
+      {
+        info: {
+          role: "assistant",
+          mode: "build",
+          modelID: "claude-sonnet-4-5",
+          providerID: "anthropic",
+          variant: "high",
+          tokens: { input: 500, output: 200, total: 12345 },
+        },
+        parts: [],
+      },
+    ]);
+
+    await m.switchSession("ses_target", "/some/workspace");
+
+    // After the switch, totalTokens must reflect the NEW session's
+    // last assistant message — NOT the stale 999999 from the OLD session.
+    expect(internal.totalTokens).toBe(12345);
+  });
+
+  test("leaves totalTokens at 0 when target session's last message has no tokens", async () => {
+    // Edge case: brand-new session that has been created on the server but
+    // never had a prompt sent. Last "message" may exist but carry no token
+    // info yet. /status must show 0 / <model-size> rather than leaking the
+    // OLD session's count.
+    const m = makeManager();
+    const internal = /** @type {any} */ (m);
+    internal.totalTokens = 42000;
+    clientMock.getSession.mockResolvedValue({ id: "ses_empty", title: "Empty" });
+    clientMock.getSessionMessages.mockResolvedValueOnce([
+      { info: { role: "assistant", mode: "build" }, parts: [] }, // no tokens field
+    ]);
+
+    await m.switchSession("ses_empty", "/some/workspace");
+
+    expect(internal.totalTokens).toBe(0);
+  });
+});
+
+// ─── Tests: switchWorkspace resets totalTokens on BOTH branches ───
+//
+// `switchWorkspace` is called by the bridge with `existingSessionId=undefined`
+// (see bridge.ts:1438,1467). In that path, it auto-resumes the most recent
+// session in the target cwd (calling `syncStateFromServer`) or creates a new
+// session. Both branches must reset `totalTokens` so /status after
+// `/workspace switch` doesn't leak the previous workspace's count.
+
+describe("SessionManager.switchWorkspace — totalTokens reset on workspace switch", () => {
+  test("auto-resume path: clears OLD count, repopulates from resumed session", async () => {
+    const m = makeManager();
+    const internal = /** @type {any} */ (m);
+    internal.totalTokens = 50000;
+    internal.sessionId = "ses_old_workspace";
+    internal.cwd = "/old/workspace";
+    // findRecentSessionInCwd → listServerSessions → listSessionsV2 → finds
+    // a recent session in the TARGET cwd.
+    clientMock.listSessionsV2.mockResolvedValue([
+      {
+        id: "ses_resumed",
+        title: "Resumed",
+        directory: "/new/workspace",
+        updatedAt: Date.now(),
+      },
+    ]);
+    // getSession() is called to verify the resumed session still exists.
+    clientMock.getSession.mockResolvedValue({ id: "ses_resumed", title: "Resumed" });
+    // syncStateFromServer pulls the last message's tokens.total.
+    clientMock.getSessionMessages.mockResolvedValueOnce([
+      {
+        info: {
+          role: "assistant",
+          mode: "build",
+          modelID: "claude-sonnet-4-5",
+          providerID: "anthropic",
+          tokens: { input: 100, output: 50, total: 7777 },
+        },
+        parts: [],
+      },
+    ]);
+
+    await m.switchWorkspace("/new/workspace");
+
+    expect(internal.totalTokens).toBe(7777);
+    expect(m.getSessionId()).toBe("ses_resumed");
+  });
+
+  test("new-session path: clears OLD count, leaves totalTokens at 0", async () => {
+    // No recent session in target workspace → createNewSession branch.
+    const m = makeManager();
+    const internal = /** @type {any} */ (m);
+    internal.totalTokens = 88000;
+    internal.sessionId = "ses_old_workspace";
+    // listServerSessions finds nothing in the target cwd → resume fails,
+    // switchWorkspace falls through to createNewSession branch.
+    clientMock.listSessionsV2.mockResolvedValue([]);
+
+    await m.switchWorkspace("/brand-new/workspace");
+
+    expect(internal.totalTokens).toBe(0);
+    // sessionId should have changed to a freshly-created one (NOT the old).
+    expect(m.getSessionId()).not.toBe("ses_old_workspace");
+    expect(m.getSessionId()).toBeTruthy();
+  });
+});
