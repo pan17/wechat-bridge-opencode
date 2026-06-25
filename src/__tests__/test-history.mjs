@@ -360,4 +360,53 @@ describe("fetchAndFormatHistory", () => {
     expect(out).toContain("build / anthropic/claude-sonnet-4-5");
     expect(out).not.toContain("(model unknown)");
   });
+
+  test("long message body (>500 chars) is NOT truncated — full text is forwarded", async () => {
+    // Regression for the "no-truncation" behaviour: each message's
+    // concatenated text is forwarded in full. The previous 500-char
+    // per-message cap produced a `…` suffix on long replies; the
+    // outbound queue now handles WeChat's per-message 4000-char cap
+    // by splitting the reply into multiple sends, so the user gets
+    // the complete message instead of a clipped stub.
+    //
+    // Build a 1200-char body whose tail is unique so we can assert
+    // it's present (would not survive the old 500-char cap).
+    const TAIL_MARKER = "<<<UNIQUE-TAIL-7Q3R>>>";
+    const head = "x".repeat(1100);
+    const longText = `${head}${TAIL_MARKER}`;
+    expect(longText.length).toBeGreaterThan(500);
+
+    const fetched = [
+      makeMsg({
+        info: { id: "m1", role: "user", time: { created: 1_700_000_010_000, completed: 1_700_000_010_100 } },
+        parts: [{ id: "p1", sessionID: "ses-test", messageID: "m1", type: "text", text: longText }],
+      }),
+    ];
+    const fetch = vi.fn().mockResolvedValue(fetched);
+
+    const out = await fetchAndFormatHistory({
+      sessionId: "ses-test",
+      count: 5,
+      cwd: CWD,
+      fetch,
+    });
+
+    // The full text is present — the unique tail marker proves the
+    // tail wasn't chopped by a 500-char cap.
+    expect(out).toContain(TAIL_MARKER);
+    expect(out).toContain(head);
+    // No "…" truncation suffix attached to the body itself. (The
+    // header `─` divider uses a different character and is unrelated;
+    // we look for the body-line context: a body line should not end
+    // mid-text with a horizontal-ellipsis character.)
+    // Simpler check: the helper no longer emits the 500-char
+    // truncation pattern (a `…` directly preceded by a non-whitespace
+    // character on a body line). Outbound-queue splits live elsewhere
+    // and are not the formatter's concern.
+    const bodyLine = out
+      .split("\n")
+      .find((l) => l.includes(TAIL_MARKER));
+    expect(bodyLine).toBeDefined();
+    expect(bodyLine).not.toMatch(/…\s*$/);
+  });
 });

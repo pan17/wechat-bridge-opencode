@@ -946,9 +946,12 @@ function truncate(s: string, max: number): string {
  *   - All messages are empty (every turn was tool-only) → returns a
  *     "no text-bearing messages" notice instead of an empty header.
  *   - Each message's text parts are concatenated (a single assistant
- *     turn can have multiple text parts when a tool interrupts);
- *     truncation per-message keeps the total reply under the 4000-char
- *     WeChat budget.
+ *     turn can have multiple text parts when a tool interrupts). The
+ *     full concatenated text is forwarded with no per-message
+ *     truncation — long messages are split into multiple WeChat sends
+ *     by the outbound queue (which honours the 4000-char / 10-msg
+ *     budget) so the user sees the complete reply rather than a
+ *     `…`-truncated stub.
  */
 export function formatHistoryForWeChat(opts: {
   sessionId: string | null;
@@ -981,8 +984,9 @@ export function formatHistoryForWeChat(opts: {
 
   // Filter to messages that actually carry visible text. We deliberately
   // skip the header + divider for a fully-empty turn — see the "history =
-  // chat log" contract above. The 500-char truncation is per-message so
-  // a single huge message can't blow the WeChat 4000-char budget.
+  // chat log" contract above. The full concatenated text is forwarded
+  // without truncation; the outbound queue handles WeChat's per-message
+  // 4000-char cap by splitting long replies into multiple sends.
   const rendered: Array<{ meta: string; body: string }> = [];
   for (const m of opts.messages) {
     const text = m.parts
@@ -990,7 +994,6 @@ export function formatHistoryForWeChat(opts: {
       .map((p) => p.text)
       .join("");
     if (text.length === 0) continue;
-    const truncated = text.length > 500 ? text.slice(0, 499) + "…" : text;
     if (m.info.role === "assistant") {
       // Assistant line carries the agent + model so the user can tell
       // which model produced each reply (a single session can switch
@@ -1002,10 +1005,10 @@ export function formatHistoryForWeChat(opts: {
         m.info.providerID,
       );
       const time = formatTime(m.info.time?.completed ?? m.info.time?.created);
-      rendered.push({ meta: `🤖 [${time}] ${meta}:`, body: truncated });
+      rendered.push({ meta: `🤖 [${time}] ${meta}:`, body: text });
     } else {
       const time = formatTime(m.info.time?.created);
-      rendered.push({ meta: `👤 [${time}] 你:`, body: truncated });
+      rendered.push({ meta: `👤 [${time}] 你:`, body: text });
     }
   }
 
