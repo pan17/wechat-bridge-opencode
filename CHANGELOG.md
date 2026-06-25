@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`/status` `Other running sessions` count got stuck after a non-current session finished.** Root cause: `SessionManager.handleEvent` early-returned for ALL events whose `sessionID` did not match `this.sessionId`, so non-current `session.status` events never reached `handleSessionStatus` and the server-wide `allSessionStatuses` map was never updated to reflect busy→idle transitions on other sessions. A `busy` entry that landed in the map (e.g. during bridge startup when `this.sessionId` was briefly null) stayed there forever, and the count never dropped. Fix: `handleEvent` now has a carve-out for `session.status` and `session.idle` events that lets them flow through to the dispatch switch; the handlers themselves gate the per-session side effects (`isSessionBusy`, `lastAgentStatus`, finalize debounce) on `sid === this.sessionId`, so the map stays in sync without leaking other sessions' state into the current session's turn-finalization gate. Regression tests in `test-session-agent-status.mjs` drive the real `handleEvent` path (not the previously-bypassed `handleSessionStatus` direct call) and assert both directions: busy→idle for other sessions, and that `isSessionBusy` / `lastAgentStatus` are not touched by other-session events.
+
 ## [1.3.8] - 2026-06-22
 
 ### Added

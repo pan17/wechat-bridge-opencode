@@ -515,3 +515,143 @@ describe("SessionManager — status reset on switch", () => {
     await expect(m.getAgentStatus()).resolves.toEqual({ type: "retry", attempt: 2 });
   });
 });
+
+// ─── allSessionStatuses sync via handleEvent (other-session events) ───
+//
+// Regression for: `/status` showed `Other running sessions: N` stuck at
+// a stale count after a session finished. Root cause: `handleEvent`
+// early-returned for ALL events whose `sessionID` did not match
+// `this.sessionId`, so non-current `session.status` events never
+// reached `handleSessionStatus` and `allSessionStatuses` was never
+// updated to reflect busy→idle transitions on other sessions. Any
+// stale `busy` entry in the map stayed there forever, and the count
+// got stuck.
+//
+// Fix: `handleEvent` has a carve-out for `session.status` and
+// `session.idle` events that lets them flow through to the dispatch
+// switch; the handlers themselves gate the per-session side effects
+// (isSessionBusy, lastAgentStatus, finalize debounce) on
+// `sid === this.sessionId`. These tests drive the REAL production path
+// (`m["handleEvent"](event)`), unlike the older tests above which
+// call `m["handleSessionStatus"](...)` directly and thus bypass the
+// fix.
+
+describe("SessionManager.handleEvent — allSessionStatuses sync for other sessions", () => {
+  test("non-current session.status: busy populates allSessionStatuses", () => {
+    const m = makeManager("ses_current");
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_other", status: { type: "busy" } },
+    });
+    expect(m["allSessionStatuses"].get("ses_other")).toEqual({ type: "busy" });
+  });
+
+  test("non-current session.status: idle overwrites the busy entry", () => {
+    const m = makeManager("ses_current");
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_other", status: { type: "busy" } },
+    });
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_other", status: { type: "idle" } },
+    });
+    expect(m["allSessionStatuses"].get("ses_other")).toEqual({ type: "idle" });
+  });
+
+  test("non-current session.status: retry writes the full payload (attempt) to allSessionStatuses", () => {
+    const m = makeManager("ses_current");
+    m["handleEvent"]({
+      type: "session.status",
+      properties: {
+        sessionID: "ses_other",
+        status: { type: "retry", attempt: 3, message: "rate-limited" },
+      },
+    });
+    expect(m["allSessionStatuses"].get("ses_other")).toEqual({
+      type: "retry",
+      attempt: 3,
+      message: "rate-limited",
+    });
+  });
+
+  test("non-current session.status does NOT touch isSessionBusy", () => {
+    // The other session going busy must not poison the current
+    // session's turn-finalization gate.
+    const m = makeManager("ses_current");
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_other", status: { type: "busy" } },
+    });
+    expect(m.isAgentBusy()).toBe(false);
+  });
+
+  test("non-current session.status does NOT overwrite lastAgentStatus", () => {
+    // The other session's status must not leak into the API-failure
+    // fallback in getAgentStatus. Drive current busy first, then other
+    // idle — the cache must still reflect the current session's state.
+    const m = makeManager("ses_current");
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_current", status: { type: "busy" } },
+    });
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_other", status: { type: "idle" } },
+    });
+    expect(m["lastAgentStatus"]).toEqual({ type: "busy" });
+  });
+
+  test("non-current session.idle populates allSessionStatuses and does NOT touch isSessionBusy", () => {
+    const m = makeManager("ses_current");
+    m["handleEvent"]({
+      type: "session.idle",
+      properties: { sessionID: "ses_other" },
+    });
+    expect(m["allSessionStatuses"].get("ses_other")).toEqual({ type: "idle" });
+    expect(m.isAgentBusy()).toBe(false);
+  });
+
+  test("current session.idle sets isSessionBusy=false (unchanged behavior)", () => {
+    // Sanity check that the gate on the CURRENT path still works after
+    // the carve-out — the carve-out for session.idle must not break
+    // the original current-session side effect.
+    const m = makeManager("ses_current");
+    m["handleSessionStatus"]({
+      type: "session.status",
+      properties: { sessionID: "ses_current", status: { type: "busy" } },
+    });
+    expect(m.isAgentBusy()).toBe(true);
+    m["handleEvent"]({
+      type: "session.idle",
+      properties: { sessionID: "ses_current" },
+    });
+    expect(m.isAgentBusy()).toBe(false);
+  });
+
+  test("getOtherRunningSessionCount reflects busy→idle on another session (end-to-end)", async () => {
+    // End-to-end regression for the user-reported bug: drive the full
+    // path the original fix targets. Other session goes busy, count
+    // goes to 1; other session goes idle, count drops back to 0.
+    // Before the fix, the second count was still 1 because
+    // allSessionStatuses was frozen — exactly what the user saw in
+    // the `/status` output.
+    const m = makeManager("ses_current");
+    clientMock.listSessionsV2.mockResolvedValue([
+      root("ses_current"),
+      root("ses_other"),
+    ]);
+
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_other", status: { type: "busy" } },
+    });
+    expect(await m.getOtherRunningSessionCount()).toBe(1);
+
+    m["handleEvent"]({
+      type: "session.status",
+      properties: { sessionID: "ses_other", status: { type: "idle" } },
+    });
+    expect(await m.getOtherRunningSessionCount()).toBe(0);
+  });
+});

@@ -1789,8 +1789,7 @@ export class SessionManager {
       const sid = (event.properties as { sessionID?: string }).sessionID;
       if (sid && sid !== this.sessionId) {
         // Event for a different session — forward to the
-        // cross-session notifier (if wired) and DROP from the
-        // current-session dispatch path. The notifier decides
+        // cross-session notifier (if wired). The notifier decides
         // whether to surface the event as a WeChat notification
         // (gated by `/notify` settings + dedup). It must be
         // non-throwing — but we wrap in try/catch defensively
@@ -1807,7 +1806,20 @@ export class SessionManager {
             this.log(`[session] onOtherSessionEvent sync error: ${String(err)}`);
           }
         }
-        return;
+        // Status events for OTHER sessions must still flow through
+        // the dispatch switch so the server-wide `allSessionStatuses`
+        // map (feeding `getOtherRunningSessionCount`) stays in sync.
+        // Without this carve-out, a busy→idle transition on another
+        // session is never observed and the `/status` "Other running
+        // sessions: N" line gets stuck at the last observed count.
+        // `handleSessionStatus` / `handleSessionIdle` gate their
+        // per-session side effects (isSessionBusy, lastAgentStatus,
+        // finalize debounce) on `sid === this.sessionId`, so letting
+        // the event through is safe. All other non-current event
+        // types remain dropped here.
+        if (event.type !== "session.status" && event.type !== "session.idle") {
+          return;
+        }
       }
     }
     switch (event.type) {
@@ -2774,12 +2786,21 @@ export class SessionManager {
     const sid = event.properties.sessionID;
     this.log(`[event] session.status sessionID=${sid.slice(0, 8)}… status=${event.properties.status.type}`);
     // Server-wide accumulation: every session's status, regardless of
-    // workspace. Feeds `getOtherRunningSessionCount`.
+    // workspace. Feeds `getOtherRunningSessionCount`. Updated for ALL
+    // session.status events — `handleEvent` has a carve-out that lets
+    // non-current session.status events flow through to here so the
+    // map stays in sync with the server's true state. Without that
+    // carve-out, a busy→idle transition on another session is never
+    // observed and the count gets stuck.
     this.allSessionStatuses.set(sid, event.properties.status);
-    // Per-session state for /status display + turn-finalization gating.
-    // `handleEvent` already filters by sessionID upstream (lines 1621-1646),
-    // so every event reaching this method belongs to the current session
-    // when this.sessionId is set.
+    // Per-session side effects (turn-finalization gate, /status display
+    // + API-failure fallback) only apply to the CURRENT session.
+    // Other sessions' busy/idle transitions must NOT touch
+    // `isSessionBusy` (would leak the other session's state into the
+    // current turn's finalization gate) or `lastAgentStatus` (would
+    // corrupt the /status display and the API-failure fallback in
+    // `getAgentStatus`).
+    if (sid !== this.sessionId) return;
     this.lastAgentStatus = event.properties.status;
     if (event.properties.status.type === "busy") {
       this.isSessionBusy = true;
@@ -2791,6 +2812,18 @@ export class SessionManager {
 
   private handleSessionIdle(sessionId: string): void {
     this.log(`[event] session.idle ${sessionId.slice(0, 8)}…`);
+    // Server-wide accumulation — mirrors `handleSessionStatus`.
+    // `session.idle` is emitted by some servers as a backup signal
+    // for the idle transition (see `SessionIdleEvent` JSDoc). Writing
+    // the map ensures `getOtherRunningSessionCount` reflects the true
+    // state even when no `session.status = idle` event was observed
+    // for that session. `handleEvent` has a carve-out that lets
+    // non-current session.idle events reach this method, so this
+    // write covers other-session idle transitions too.
+    this.allSessionStatuses.set(sessionId, { type: "idle" });
+    // Per-session side effects only for the CURRENT session — see
+    // `handleSessionStatus` for the full rationale.
+    if (sessionId !== this.sessionId) return;
     this.isSessionBusy = false;
     this.armFinalizeDebounce();
   }
