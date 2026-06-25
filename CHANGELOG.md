@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.9] - 2026-06-25
+
 ### Changed
 - **`/history` no longer truncates message bodies to 500 chars.** `formatHistoryForWeChat` now forwards the full concatenated text of each message. The previous 500-char cap produced a `…` stub on long LLM replies, hiding the actual content. WeChat's per-message 4000-char / 10-msg budget is now handled by the outbound queue (which splits long replies into multiple sends), so the user sees the complete message instead of a clipped stub. The 40-char session-title truncation in the header is unchanged (cosmetic, keeps the header line from blowing up). Regression test in `test-history.mjs` builds a 1200-char body with a unique tail marker and asserts the full text is forwarded (the marker would not survive the old 500-char cap).
 

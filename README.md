@@ -165,7 +165,7 @@ export WECHAT_OPENCODE_STARTUP_TIMEOUT_MS=600000   # 10 分钟（极慢网络）
 
 | 命令 | 说明 |
 |------|------|
-| `/history`（`/hist`） | 显示当前会话最近 N 条**含文本的**消息，按时间正序排列（最早的在最上，最新的在最下）。可选尾部正整数 N（默认 5，范围 1-20；0 / 负数 / >20 直接拒绝，不会被静默截断到 20）。**只读**——Agent 正在运行时也能用，不会打断 turn。展示规则：仅显示文本 part；整轮都是 tool / reasoning / file / step-* 的消息（Sisyphus ultraworker 风格的纯工具调度轮）会被**完全过滤掉**，不会以 `(空消息)` 占位符出现。user 消息以 👤 + 时间戳开头，assistant 消息以 🤖 + 时间戳 + agent / model 开头；每条消息文本最多 500 字符。Header 包含会话标题（best-effort 通过 `GET /session/:id` 拉取，失败时省略）和工作区；当 over-fetch 窗口里没有 N 条文本消息时追加 `(实际显示 X 条)` 提示。Bridge over-fetch 3 倍（cap 60）并从中挑出最近的 N 条文本消息，保证 header 数字 = 你输入的 N。底层走 `GET /session/:id/message?limit=N`，server 的 `MessageV2.page` 自己 `items.reverse()` 一次返回**正序**（最旧在前），bridge 不再 reverse。 |
+| `/history`（`/hist`） | 显示当前会话最近 N 条**含文本的**消息，按时间正序排列（最早的在最上，最新的在最下）。可选尾部正整数 N（默认 5，范围 1-20；0 / 负数 / >20 直接拒绝，不会被静默截断到 20）。**只读**——Agent 正在运行时也能用，不会打断 turn。展示规则：仅显示文本 part；整轮都是 tool / reasoning / file / step-* 的消息（Sisyphus ultraworker 风格的纯工具调度轮）会被**完全过滤掉**，不会以 `(空消息)` 占位符出现。user 消息以 👤 + 时间戳开头，assistant 消息以 🤖 + 时间戳 + agent / model 开头；每条消息文本**完整转发**（bridge 不再截断到 500 字符——长消息由 outbound queue 拆成多条微信消息发出，遵守微信 4000 字 / 条上限）。Header 包含会话标题（best-effort 通过 `GET /session/:id` 拉取，失败时省略）和工作区；当 over-fetch 窗口里没有 N 条文本消息时追加 `(实际显示 X 条)` 提示。Bridge over-fetch 3 倍（cap 60）并从中挑出最近的 N 条文本消息，保证 header 数字 = 你输入的 N。底层走 `GET /session/:id/message?limit=N`，server 的 `MessageV2.page` 自己 `items.reverse()` 一次返回**正序**（最旧在前），bridge 不再 reverse。 |
 
 ### 思考显示（`/thought-display`）
 

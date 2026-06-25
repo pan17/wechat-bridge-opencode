@@ -932,11 +932,12 @@ function truncate(s: string, max: number): string {
  *   📜 最近 3 条消息 (会话「xxx」· 工作区: F:\foo):
  *
  *   👤 [10:23:15] 你:
- *   {first 500 chars of concatenated text parts}
+ *   {full concatenated text parts — no per-message truncation}
  *
  *   ───
  *   🤖 [10:23:42] build / anthropic/claude-sonnet-4-5:
- *   {first 500 chars}
+ *   {full concatenated text parts — long bodies are split by
+ *    the outbound queue into multiple WeChat sends}
  *   ───
  *   ...
  *
